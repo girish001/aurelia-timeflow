@@ -26,7 +26,8 @@ export function formatHours(h: number, fmt: TimeFormat = "decimal") {
     const mins = Math.round(h * 60);
     return `${Math.floor(mins / 60)}:${String(mins % 60).padStart(2, "0")}`;
   }
-  return (Math.round(h * 100) / 100).toFixed(h % 1 === 0 ? 0 : 2).replace(/\.?0+$/, (m) => (m.includes(".") ? "" : m)) || "0";
+  const r = Math.round(h * 100) / 100;
+  return Number.isInteger(r) ? String(r) : r.toFixed(2).replace(/0$/, "");
 }
 
 /** Parse one cell of hours. Empty = 0. Rules: number, 0–24, quarter-hour steps. */

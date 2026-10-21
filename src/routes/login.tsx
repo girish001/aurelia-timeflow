@@ -1,4 +1,5 @@
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
+import { useMemo } from "react";
 import { ShieldAlert, Building, FolderKanban, User, ArrowRight } from "lucide-react";
 import { Initials, Logo } from "@/components/app/common";
 import { startDemoSession, useDemo, useSessionId, type Role } from "@/lib/demo-store";
@@ -18,7 +19,11 @@ const roles: { role: Role; icon: typeof User; text: string }[] = [
 ];
 
 function DemoLogin() {
-  const members = useDemo((s) => s.members.filter((m) => m.status === "active"));
+  // Select the store's stable array and derive the filtered list afterwards:
+  // a selector that builds a new array on every call breaks useSyncExternalStore's
+  // cached-snapshot contract and crashes the page with an infinite render loop.
+  const allMembers = useDemo((s) => s.members);
+  const members = useMemo(() => allMembers.filter((m) => m.status === "active"), [allMembers]);
   const current = useSessionId();
   const navigate = useNavigate();
   const choose = (id: string) => {

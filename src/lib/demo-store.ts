@@ -10,7 +10,7 @@ export type Role = "Admin" | "Manager" | "Employee";
 export interface Member { id: string; name: string; email: string; title: string; role: Role; status: "active" | "invited" | "inactive" }
 export interface Entry { id: string; projectId: string; task: string; hours: number[]; billable: boolean; notes: string }
 export type SheetStatus = "draft" | "submitted" | "approved" | "rejected";
-export interface Timesheet { id: string; memberId: string; weekStart: string; entries: Entry[]; status: SheetStatus; submittedAt?: string; reviewedAt?: string; reviewComment?: string }
+export interface Timesheet { id: string; memberId: string; weekStart: string; entries: Entry[]; status: SheetStatus; submittedAt?: string | undefined; reviewedAt?: string | undefined; reviewComment?: string | undefined }
 export interface Settings { companyName: string; companyEmail: string; country: string; timezone: string; weekStart: "monday"; timeFormat: TimeFormat; currency: "INR" | "USD"; dailyTarget: number }
 export interface State { version: number; clients: Client[]; projects: Project[]; members: Member[]; timesheets: Timesheet[]; settings: Settings }
 
@@ -62,7 +62,7 @@ export function createSeed(now = new Date()): State {
   for (const m of members) {
     for (let w = 6; w >= 0; w--) {
       const ws = weekKey(subWeeks(parseISO(thisWeek), w));
-      const lines = plan[m.id];
+      const lines = plan[m.id] ?? [];
       const entries: Entry[] = lines.map((l, i) => {
         const hours = Array.from({ length: 7 }, (_, d) => {
           if (d >= 5) return 0;

@@ -20,7 +20,7 @@ const nav = [
   { to: "/app/settings", label: "Settings", icon: Settings },
 ] as const;
 
-function NavList({ onNavigate }: { onNavigate?: () => void }) {
+function NavList({ onNavigate }: { onNavigate?: (() => void) | undefined }) {
   const path = useRouterState({ select: (r) => r.location.pathname });
   const pending = useDemo((s) => s.timesheets.filter((t) => t.status === "submitted").length);
   return (
@@ -43,7 +43,7 @@ function NavList({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
-function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
+function SidebarBody({ onNavigate }: { onNavigate?: (() => void) | undefined }) {
   return (
     <div className="flex h-full flex-col gap-6 bg-sidebar p-4">
       <div className="px-1 pt-1"><Logo inverted /></div>

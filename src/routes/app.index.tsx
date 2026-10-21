@@ -5,7 +5,7 @@ import { Bar, BarChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxi
 import { Briefcase, CheckSquare, Clock, Gauge, ArrowRight, Inbox } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { EmptyState, Initials, PageHeader, Panel, StatCard, StatusBadge } from "@/components/app/common";
-import { CURRENT_USER_ID, flatten, sheetTotal, useDemo } from "@/lib/demo-store";
+import { useMe, flatten, sheetTotal, useDemo } from "@/lib/demo-store";
 import { formatHours, weekKey, weekLabel } from "@/lib/time";
 import { pageHead } from "@/lib/seo";
 
@@ -15,6 +15,7 @@ export const Route = createFileRoute("/app/")({
 });
 
 function Dashboard() {
+  const CURRENT_USER_ID = useMe().id;
   const s = useDemo((x) => x);
   const fmt = s.settings.timeFormat;
   const thisWeek = weekKey(new Date());

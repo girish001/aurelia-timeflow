@@ -8,7 +8,7 @@ import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { EmptyState, PageHeader, StatusBadge } from "@/components/app/common";
-import { CURRENT_USER_ID, uid, upsertTimesheet, useDemo, type Timesheet, type State } from "@/lib/demo-store";
+import { useMe, uid, upsertTimesheet, useDemo, type Timesheet, type State } from "@/lib/demo-store";
 import { DAYS, formatHours, isoDay, parseHours, weekDates, weekKey, weekLabel } from "@/lib/time";
 import { pageHead } from "@/lib/seo";
 import { cn } from "@/lib/utils";
@@ -21,6 +21,7 @@ export const Route = createFileRoute("/app/timesheet")({
 interface Row { id: string; clientId: string; projectId: string; task: string; hours: string[]; billable: boolean; notes: string }
 
 function TimesheetPage() {
+  const CURRENT_USER_ID = useMe().id;
   const [week, setWeek] = useState(() => weekKey(new Date()));
   const sheet = useDemo((s) => s.timesheets.find((t) => t.memberId === CURRENT_USER_ID && t.weekStart === week));
   const state = useDemo((s) => s);
@@ -40,7 +41,7 @@ function TimesheetPage() {
           </div>
         }
       />
-      <Editor key={`${week}-${sheet?.status ?? "new"}-${sheet?.reviewedAt ?? ""}`} week={week} sheet={sheet} state={state} />
+      <Editor key={`${week}-${sheet?.status ?? "new"}-${sheet?.reviewedAt ?? ""}`} week={week} sheet={sheet} state={state} CURRENT_USER_ID={CURRENT_USER_ID} />
     </>
   );
 }
@@ -57,7 +58,7 @@ function toRows(sheet: Timesheet | undefined, s: State): Row[] {
   }));
 }
 
-function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet | undefined; state: State }) {
+function Editor({ week, sheet, state, CURRENT_USER_ID }: { week: string; sheet?: Timesheet | undefined; state: State; CURRENT_USER_ID: string }) {
   const [rows, setRows] = useState<Row[]>(() => toRows(sheet, state));
   const [dirty, setDirty] = useState(false);
   const [showErrors, setShowErrors] = useState(false);

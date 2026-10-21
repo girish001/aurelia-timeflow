@@ -46,7 +46,7 @@ function Landing() {
             <a href="#pricing" className="hover:text-foreground">Pilot pricing</a>
             <a href="#contact" className="hover:text-foreground">Contact</a>
           </nav>
-          <Button asChild variant="outline" size="sm" className="ml-auto md:ml-0"><Link to="/app">Open demo</Link></Button>
+          <Button asChild variant="outline" size="sm" className="ml-auto md:ml-0"><Link to="/login">Open demo</Link></Button>
         </div>
       </header>
 
@@ -60,7 +60,7 @@ function Landing() {
             <p className="mt-5 max-w-xl text-lg text-muted-foreground">Aurelia TimeFlow makes weekly time entry, manager approvals and utilization reporting simple — so delivery leads spend less time chasing timesheets.</p>
             <div className="mt-8 flex flex-wrap gap-3">
               <Button asChild size="lg"><a href="#contact">Book a demo <ArrowRight /></a></Button>
-              <Button asChild size="lg" variant="outline"><Link to="/app">Explore the demo workspace</Link></Button>
+              <Button asChild size="lg" variant="outline"><Link to="/login">Explore the demo workspace</Link></Button>
             </div>
             <p className="mt-4 text-xs text-muted-foreground">No sign-up needed. The demo uses fictional sample data.</p>
           </div>

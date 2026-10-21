@@ -63,7 +63,7 @@ const statusStyles: Record<string, string> = {
 
 export function StatusBadge({ status }: { status: string }) {
   return (
-    <span className={cn("inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium capitalize", statusStyles[status] ?? statusStyles.draft)}>
+    <span className={cn("inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium capitalize", statusStyles[status] ?? statusStyles["draft"])}>
       {status.replace("-", " ")}
     </span>
   );

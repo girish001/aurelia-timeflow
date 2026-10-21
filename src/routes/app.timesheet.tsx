@@ -57,7 +57,7 @@ function toRows(sheet: Timesheet | undefined, s: State): Row[] {
   }));
 }
 
-function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet; state: State }) {
+function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet | undefined; state: State }) {
   const [rows, setRows] = useState<Row[]>(() => toRows(sheet, state));
   const [dirty, setDirty] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
@@ -71,7 +71,7 @@ function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet; state
 
   const parsed = useMemo(() => rows.map((r) => r.hours.map(parseHours)), [rows]);
   const rowTotals = parsed.map((cells) => cells.reduce((a, c) => a + (c.ok ? c.value : 0), 0));
-  const dayTotals = DAYS.map((_, d) => parsed.reduce((a, cells) => a + (cells[d].ok ? (cells[d] as { value: number }).value : 0), 0));
+  const dayTotals = DAYS.map((_, d) => parsed.reduce((a, cells) => a + (cells[d]?.ok ? cells[d].value : 0), 0));
   const total = dayTotals.reduce((a, b) => a + b, 0);
   const cellErrors = parsed.flat().filter((c) => !c.ok).length;
   const dayOver = dayTotals.some((d) => d > 24);
@@ -87,12 +87,13 @@ function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet; state
     setDirty(true);
   };
 
-  const persist = (status: "draft" | "submitted") => {
+  const persist = (status: "draft" | "submitted"): void => {
     setShowErrors(true);
-    if (cellErrors) return toast.error("Fix the highlighted hour values first");
-    if (dayOver) return toast.error("A day cannot exceed 24 hours in total");
-    if (incomplete.length) return toast.error("Every row needs a project and task");
-    if (status === "submitted" && total <= 0) return toast.error("Add at least some hours before submitting");
+    const fail = (m: string) => { toast.error(m); };
+    if (cellErrors) return fail("Fix the highlighted hour values first");
+    if (dayOver) return fail("A day cannot exceed 24 hours in total");
+    if (incomplete.length) return fail("Every row needs a project and task");
+    if (status === "submitted" && total <= 0) return fail("Add at least some hours before submitting");
     upsertTimesheet({
       id: sheet?.id ?? `t_${CURRENT_USER_ID}_${week}`,
       memberId: CURRENT_USER_ID,
@@ -100,7 +101,7 @@ function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet; state
       status,
       submittedAt: status === "submitted" ? isoDay(new Date()) : sheet?.submittedAt,
       reviewComment: status === "submitted" ? undefined : sheet?.reviewComment,
-      entries: rows.map((r, i) => ({ id: r.id, projectId: r.projectId, task: r.task, billable: r.billable, notes: r.notes.trim(), hours: parsed[i].map((c) => (c.ok ? c.value : 0)) })),
+      entries: rows.map((r, i) => ({ id: r.id, projectId: r.projectId, task: r.task, billable: r.billable, notes: r.notes.trim(), hours: (parsed[i] ?? []).map((c) => (c.ok ? c.value : 0)) })),
     });
     setDirty(false);
     toast.success(status === "submitted" ? "Timesheet submitted for approval" : "Draft saved");
@@ -174,7 +175,7 @@ function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet; state
                     </div>
                   </td>
                   {r.hours.map((h, d) => {
-                    const c = parsed[ri][d];
+                    const c = parsed[ri]?.[d] ?? { ok: true as const, value: 0 };
                     return (
                       <td key={d} className="px-1 py-2.5">
                         <Input
@@ -183,16 +184,16 @@ function Editor({ week, sheet, state }: { week: string; sheet?: Timesheet; state
                           value={h}
                           aria-label={`${project?.name ?? "Row " + (ri + 1)} hours on ${DAYS[d]}`}
                           aria-invalid={!c.ok}
-                          title={!c.ok ? c.error : undefined}
+                          title={c.ok ? undefined : c.error}
                           onChange={(e) => update(r.id, { hours: r.hours.map((x, i) => (i === d ? e.target.value : x)) })}
                           className={cn("h-8 px-1 text-center tabular", !c.ok && "border-destructive bg-destructive/5 text-destructive")}
                           placeholder="–"
                         />
-                        {!c.ok && <p className="mt-1 text-[0.65rem] leading-tight text-destructive">{c.error}</p>}
+                        {c.ok ? null : <p className="mt-1 text-[0.65rem] leading-tight text-destructive">{c.error}</p>}
                       </td>
                     );
                   })}
-                  <td className="px-2 py-4 text-right font-semibold tabular">{formatHours(rowTotals[ri], fmt)}</td>
+                  <td className="px-2 py-4 text-right font-semibold tabular">{formatHours(rowTotals[ri] ?? 0, fmt)}</td>
                   <td className="space-y-1.5 px-3 py-2.5">
                     <label className="flex items-center gap-2 text-xs text-muted-foreground">
                       <Switch disabled={locked} checked={r.billable} onCheckedChange={(v) => update(r.id, { billable: v })} aria-label="Billable" />

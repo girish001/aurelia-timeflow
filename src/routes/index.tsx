@@ -201,8 +201,8 @@ function ContactForm() {
       <div className="grid gap-4 sm:grid-cols-2">{field("company", "Company")}{field("teamSize", "Team size (optional)")}</div>
       <div className="space-y-1.5">
         <Label htmlFor="ct-message">What would you like to see? (optional)</Label>
-        <Textarea id="ct-message" rows={4} value={f.message} onChange={(e) => setF({ ...f, message: e.target.value })} aria-invalid={!!errors.message} />
-        {errors.message && <p className="text-xs text-destructive">{errors.message}</p>}
+        <Textarea id="ct-message" rows={4} value={f.message} onChange={(e) => setF({ ...f, message: e.target.value })} aria-invalid={!!errors["message"]} />
+        {errors["message"] && <p className="text-xs text-destructive">{errors["message"]}</p>}
       </div>
       <Button type="submit" size="lg" className="w-full">Request demo</Button>
       <p className="text-center text-xs text-muted-foreground">Prototype form — submissions are not sent anywhere.</p>

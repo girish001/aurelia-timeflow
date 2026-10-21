@@ -60,7 +60,7 @@ function SettingsPage() {
               <div className="space-y-1.5"><Label>Time zone</Label>
                 <Select value={f.timezone} onValueChange={(v) => setF({ ...f, timezone: v })}><SelectTrigger aria-label="Time zone"><SelectValue /></SelectTrigger>
                   <SelectContent>{["Asia/Kolkata", "Asia/Singapore", "Asia/Dubai", "Europe/London", "America/New_York", "Australia/Sydney"].map((t) => <SelectItem key={t} value={t}>{t}</SelectItem>)}</SelectContent></Select></div>
-              <div className="space-y-1.5"><Label htmlFor="dt">Daily target hours</Label><Input id="dt" inputMode="decimal" value={f.dailyTarget} onChange={(e) => setF({ ...f, dailyTarget: e.target.value })} />{errors.dailyTarget && <p className="text-xs text-destructive">{errors.dailyTarget}</p>}</div>
+              <div className="space-y-1.5"><Label htmlFor="dt">Daily target hours</Label><Input id="dt" inputMode="decimal" value={f.dailyTarget} onChange={(e) => setF({ ...f, dailyTarget: e.target.value })} />{errors["dailyTarget"] && <p className="text-xs text-destructive">{errors["dailyTarget"]}</p>}</div>
             </div>
             <Button type="submit">Save profile</Button>
           </form>

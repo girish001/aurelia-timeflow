@@ -75,8 +75,8 @@ function Team() {
             <Info className="mt-0.5 size-4 shrink-0" /> Demo only: invitations are <strong>not</strong> emailed. The person is added to the list with “invited” status.
           </div>
           <form onSubmit={submit} className="space-y-3" noValidate>
-            <div className="space-y-1.5"><Label htmlFor="iv-name">Full name</Label><Input id="iv-name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} aria-invalid={!!errors.name} />{errors.name && <p className="text-xs text-destructive">{errors.name}</p>}</div>
-            <div className="space-y-1.5"><Label htmlFor="iv-email">Work email</Label><Input id="iv-email" type="email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} aria-invalid={!!errors.email} />{errors.email && <p className="text-xs text-destructive">{errors.email}</p>}</div>
+            <div className="space-y-1.5"><Label htmlFor="iv-name">Full name</Label><Input id="iv-name" value={f.name} onChange={(e) => setF({ ...f, name: e.target.value })} aria-invalid={!!errors["name"]} />{errors["name"] && <p className="text-xs text-destructive">{errors["name"]}</p>}</div>
+            <div className="space-y-1.5"><Label htmlFor="iv-email">Work email</Label><Input id="iv-email" type="email" value={f.email} onChange={(e) => setF({ ...f, email: e.target.value })} aria-invalid={!!errors["email"]} />{errors["email"] && <p className="text-xs text-destructive">{errors["email"]}</p>}</div>
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="space-y-1.5"><Label htmlFor="iv-title">Job title</Label><Input id="iv-title" value={f.title} onChange={(e) => setF({ ...f, title: e.target.value })} /></div>
               <div className="space-y-1.5"><Label>Role</Label>

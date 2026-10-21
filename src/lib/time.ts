@@ -36,7 +36,7 @@ export function parseHours(raw: string): { ok: true; value: number } | { ok: fal
   if (v === "") return { ok: true, value: 0 };
   let n: number;
   if (/^\d{1,2}:\d{2}$/.test(v)) {
-    const [h, m] = v.split(":").map(Number);
+    const [h = 0, m = 0] = v.split(":").map(Number);
     if (m >= 60) return { ok: false, error: "Minutes must be under 60" };
     n = h + m / 60;
   } else if (/^-?\d*\.?\d+$/.test(v)) {

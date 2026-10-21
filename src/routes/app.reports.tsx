@@ -59,7 +59,7 @@ function Reports() {
   const utilization = useMemo(() => {
     const m = new Map<string, { name: string; billable: number; nonBillable: number }>();
     for (const r of rows) {
-      const n = memberName(r.memberId).split(" ")[0];
+      const n = memberName(r.memberId).split(" ")[0] ?? "";
       const e = m.get(n) ?? { name: n, billable: 0, nonBillable: 0 };
       if (r.billable) e.billable += r.hours; else e.nonBillable += r.hours;
       m.set(n, e);
@@ -69,7 +69,7 @@ function Reports() {
   }, [rows, s]);
 
   const exportCsv = () => {
-    if (!rows.length) return toast.error("No data in this range to export");
+    if (!rows.length) { toast.error("No data in this range to export"); return; }
     const csv = toCsv([
       ["Date", "Employee", "Client", "Project", "Task", "Hours", "Billable", "Timesheet status", "Notes"],
       ...[...rows].sort((a, b) => a.date.localeCompare(b.date)).map((r) => [r.date, memberName(r.memberId), clientName(r.projectId), proj(r.projectId)?.name ?? "", r.task, r.hours, r.billable ? "Yes" : "No", r.status, r.notes]),

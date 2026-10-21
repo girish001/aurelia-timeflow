@@ -6,7 +6,8 @@ import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle, AlertDialogTrigger } from "@/components/ui/alert-dialog";
 import { Initials, Logo } from "./common";
-import { CURRENT_USER_ID, resetDemo, useDemo } from "@/lib/demo-store";
+import { endDemoSession, resetDemo, useDemo, useMe } from "@/lib/demo-store";
+import { canAccess, ROLE_LABEL, type Page } from "@/lib/rules";
 import { cn } from "@/lib/utils";
 
 const nav = [
@@ -23,9 +24,10 @@ const nav = [
 function NavList({ onNavigate }: { onNavigate?: (() => void) | undefined }) {
   const path = useRouterState({ select: (r) => r.location.pathname });
   const pending = useDemo((s) => s.timesheets.filter((t) => t.status === "submitted").length);
+  const me = useMe();
   return (
     <nav aria-label="Main" className="flex flex-col gap-0.5">
-      {nav.map((n) => {
+      {nav.filter((n) => canAccess(me.role, (n.to.replace(/^\/app\/?/, "") || "overview") as Page)).map((n) => {
         const active = n.to === "/app" ? path === "/app" || path === "/app/" : path.startsWith(n.to);
         return (
           <Link key={n.to} to={n.to} onClick={onNavigate} aria-current={active ? "page" : undefined}
@@ -59,7 +61,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: (() => void) | undefined }) 
 
 export function AppShell({ children }: { children: ReactNode }) {
   const [open, setOpen] = useState(false);
-  const me = useDemo((s) => s.members.find((m) => m.id === CURRENT_USER_ID));
+  const me = useMe();
   return (
     <div className="flex min-h-screen w-full bg-background">
       <aside className="sticky top-0 hidden h-screen w-64 shrink-0 lg:block"><SidebarBody /></aside>
@@ -97,8 +99,10 @@ export function AppShell({ children }: { children: ReactNode }) {
                 <Initials name={me.name} />
                 <div className="hidden leading-tight sm:block">
                   <p className="text-sm font-semibold">{me.name}</p>
-                  <p className="text-xs text-muted-foreground">{me.role} · demo user</p>
+                  <p className="text-xs text-muted-foreground">{ROLE_LABEL[me.role]} · demo persona</p>
                 </div>
+                <Button asChild variant="ghost" size="sm"><Link to="/login">Switch demo role</Link></Button>
+                <Button variant="ghost" size="sm" onClick={() => endDemoSession()}>Exit</Button>
               </div>
             )}
           </div>

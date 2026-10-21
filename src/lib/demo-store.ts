@@ -12,11 +12,17 @@ export interface Entry { id: string; projectId: string; task: string; hours: num
 export type SheetStatus = "draft" | "submitted" | "approved" | "rejected";
 export interface Timesheet { id: string; memberId: string; weekStart: string; entries: Entry[]; status: SheetStatus; submittedAt?: string | undefined; reviewedAt?: string | undefined; reviewComment?: string | undefined }
 export interface Settings { companyName: string; companyEmail: string; country: string; timezone: string; weekStart: "monday"; timeFormat: TimeFormat; currency: "INR" | "USD"; dailyTarget: number }
-export interface State { version: number; clients: Client[]; projects: Project[]; members: Member[]; timesheets: Timesheet[]; settings: Settings }
+export type LeaveType = "annual" | "sick" | "personal" | "unpaid";
+export type LeaveStatus = "pending" | "approved" | "rejected";
+export type DayPart = "full" | "am" | "pm";
+export interface LeaveRequest { id: string; memberId: string; type: LeaveType; start: string; end: string; partial: DayPart; reason: string; status: LeaveStatus; createdAt: string; reviewedBy?: string | undefined; reviewComment?: string | undefined }
+export type AllocationStatus = "tentative" | "confirmed";
+export interface Allocation { id: string; memberId: string; projectId: string; date: string; hours: number; status: AllocationStatus }
+export interface State { version: number; clients: Client[]; projects: Project[]; members: Member[]; timesheets: Timesheet[]; leaves: LeaveRequest[]; allocations: Allocation[]; settings: Settings }
 
-export const CURRENT_USER_ID = "m1";
-const KEY = "aurelia-timeflow-demo-v1";
-const VERSION = 1;
+const KEY = "aurelia-timeflow-demo-v2";
+const SESSION_KEY = "aurelia-timeflow-demo-session";
+const VERSION = 2;
 
 export function uid(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
@@ -35,7 +41,8 @@ export function createSeed(now = new Date()): State {
     { id: "m3", name: "Kavya Nair", email: "kavya@demo.aurelia.example", title: "UX Designer", role: "Employee", status: "active" },
     { id: "m4", name: "Rahul Verma", email: "rahul@demo.aurelia.example", title: "QA Engineer", role: "Employee", status: "active" },
     { id: "m5", name: "Emily Carter", email: "emily@demo.aurelia.example", title: "Project Manager", role: "Manager", status: "active" },
-    { id: "m6", name: "Vikram Joshi", email: "vikram@demo.aurelia.example", title: "Workspace Admin", role: "Admin", status: "active" },
+    { id: "m6", name: "Vikram Joshi", email: "vikram@demo.aurelia.example", title: "Operations Admin", role: "Admin", status: "active" },
+    { id: "m7", name: "Neha Kapoor", email: "neha@demo.aurelia.example", title: "Founder & Business Owner", role: "Admin", status: "active" },
   ];
   const projects: Project[] = [
     { id: "p1", name: "E-commerce Replatform", clientId: "c1", managerId: "m1", status: "active", budgetHours: 1200, rate: 2800, tasks: ["Development", "Code review", "Meetings"] },
@@ -52,6 +59,7 @@ export function createSeed(now = new Date()): State {
     m4: [{ p: "p3", t: "QA", b: true }, { p: "p2", t: "QA", b: true }, { p: "p6", t: "Admin", b: false }],
     m5: [{ p: "p2", t: "Development", b: true }, { p: "p3", t: "Support", b: true }, { p: "p6", t: "Admin", b: false }],
     m6: [{ p: "p6", t: "Admin", b: false }, { p: "p1", t: "Code review", b: true }],
+    m7: [{ p: "p6", t: "Admin", b: false }],
   };
   const notes: Record<string, string> = { Development: "Feature work and fixes", Design: "Wireframes and UI review", QA: "Regression testing", Meetings: "Client standups", Admin: "Internal coordination", Training: "Learning session", Support: "Production support tickets", Research: "User interviews", "Code review": "PR reviews" };
 
@@ -93,12 +101,41 @@ export function createSeed(now = new Date()): State {
       });
     }
   }
+  // ---- time off ----
+  const mon = parseISO(thisWeek);
+  const d = (n: number) => isoDay(addDays(mon, n));
+  const leaves: LeaveRequest[] = [
+    { id: "l1", memberId: "m2", type: "annual", start: d(9), end: d(11), partial: "full", reason: "Family function (demo)", status: "pending", createdAt: d(-2) },
+    { id: "l2", memberId: "m3", type: "sick", start: d(-6), end: d(-6), partial: "full", reason: "Fever", status: "approved", createdAt: d(-6), reviewedBy: "m1", reviewComment: "Get well soon" },
+    { id: "l3", memberId: "m4", type: "personal", start: d(8), end: d(8), partial: "pm", reason: "Bank appointment", status: "approved", createdAt: d(-3), reviewedBy: "m5" },
+    { id: "l4", memberId: "m1", type: "annual", start: d(15), end: d(18), partial: "full", reason: "Vacation", status: "pending", createdAt: d(-1) },
+    { id: "l5", memberId: "m2", type: "unpaid", start: d(-12), end: d(-11), partial: "full", reason: "Personal travel", status: "rejected", createdAt: d(-16), reviewedBy: "m1", reviewComment: "Release week — please pick other dates." },
+    { id: "l6", memberId: "m3", type: "annual", start: d(3), end: d(3), partial: "full", reason: "Long weekend", status: "approved", createdAt: d(-5), reviewedBy: "m1" },
+  ];
+
+  // ---- allocations: this week + next 3 weeks, weekdays ----
+  const allocPlan: Record<string, [string, number][]> = {
+    m1: [["p1", 4], ["p4", 3]], m2: [["p1", 6], ["p3", 2]], m3: [["p4", 5], ["p2", 3]],
+    m4: [["p3", 5], ["p2", 3]], m5: [["p2", 4], ["p3", 3]], m6: [["p1", 2]],
+  };
+  const allocations: Allocation[] = [];
+  for (let w = 0; w < 4; w++)
+    for (let day = 0; day < 5; day++) {
+      const date = d(w * 7 + day);
+      for (const [mid, list] of Object.entries(allocPlan))
+        list.forEach(([pid, h], i) => allocations.push({ id: `a_${mid}_${date}_${i}`, memberId: mid, projectId: pid, date, hours: h, status: w < 2 ? "confirmed" : "tentative" }));
+    }
+  // a deliberate over-capacity day for the demo
+  allocations.push({ id: "a_conflict_1", memberId: "m2", projectId: "p3", date: d(2), hours: 3, status: "tentative" });
+
   return {
     version: VERSION,
     clients,
     projects,
     members,
     timesheets,
+    leaves,
+    allocations,
     settings: { companyName: "Demo Consulting Pvt Ltd", companyEmail: "ops@demo.aurelia.example", country: "India", timezone: "Asia/Kolkata", weekStart: "monday", timeFormat: "decimal", currency: "INR", dailyTarget: 8 },
   };
 }
@@ -138,6 +175,7 @@ export function setState(fn: (s: State) => State) {
 
 export function resetDemo() {
   state = createSeed();
+  // keep the chosen demo persona; it exists in every seed
   try {
     window.localStorage.removeItem(KEY);
   } catch {
@@ -198,4 +236,54 @@ export function updateMember(id: string, patch: Partial<Member>) {
 }
 export function updateSettings(patch: Partial<Settings>) {
   setState((s) => ({ ...s, settings: { ...s.settings, ...patch } }));
+}
+
+// ---------- time off & allocations ----------
+export function addLeave(l: LeaveRequest) {
+  setState((s) => ({ ...s, leaves: [l, ...s.leaves] }));
+}
+export function setLeave(l: LeaveRequest) {
+  setState((s) => ({ ...s, leaves: s.leaves.map((x) => (x.id === l.id ? l : x)) }));
+}
+export function removeLeave(id: string) {
+  setState((s) => ({ ...s, leaves: s.leaves.filter((x) => x.id !== id) }));
+}
+export function upsertAllocation(a: Allocation) {
+  setState((s) => ({ ...s, allocations: s.allocations.some((x) => x.id === a.id) ? s.allocations.map((x) => (x.id === a.id ? a : x)) : [...s.allocations, a] }));
+}
+export function removeAllocation(id: string) {
+  setState((s) => ({ ...s, allocations: s.allocations.filter((x) => x.id !== id) }));
+}
+
+// ---------- demo role preview session (NOT authentication) ----------
+let session: string | null | undefined;
+function loadSession(): string | null {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage.getItem(SESSION_KEY);
+  } catch {
+    return null;
+  }
+}
+export function getSessionId(): string | null {
+  if (session === undefined) session = loadSession();
+  return session;
+}
+export function startDemoSession(memberId: string) {
+  session = memberId;
+  try { window.localStorage.setItem(SESSION_KEY, memberId); } catch { /* ignore */ }
+  listeners.forEach((l) => l());
+}
+export function endDemoSession() {
+  session = null;
+  try { window.localStorage.removeItem(SESSION_KEY); } catch { /* ignore */ }
+  listeners.forEach((l) => l());
+}
+export function useSessionId() {
+  return useSyncExternalStore(subscribe, getSessionId, () => null);
+}
+/** The active demo persona. Only valid inside the /app layout, which guarantees a session. */
+export function useMe(): Member {
+  const id = useSessionId();
+  const me = useDemo((s) => s.members.find((m) => m.id === id));
+  return me ?? { id: "", name: "Unknown", email: "", title: "", role: "Employee", status: "active" };
 }

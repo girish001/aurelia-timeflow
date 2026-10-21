@@ -9,7 +9,7 @@ import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Initials, PageHeader, StatusBadge } from "@/components/app/common";
-import { addMember, CURRENT_USER_ID, uid, updateMember, useDemo, type Role } from "@/lib/demo-store";
+import { addMember, useMe, uid, updateMember, useDemo, type Role } from "@/lib/demo-store";
 import { pageHead } from "@/lib/seo";
 
 export const Route = createFileRoute("/app/team")({
@@ -25,6 +25,7 @@ const schema = z.object({
 });
 
 function Team() {
+  const CURRENT_USER_ID = useMe().id;
   const s = useDemo((x) => x);
   const [open, setOpen] = useState(false);
   const [f, setF] = useState({ name: "", email: "", title: "", role: "Employee" as Role });

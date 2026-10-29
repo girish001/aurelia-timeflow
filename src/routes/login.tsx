@@ -2,7 +2,7 @@ import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { Building2, FolderKanban, User, ArrowRight, CheckCircle2, ShieldCheck } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Initials, Logo } from "@/components/app/common";
+import { Logo } from "@/components/app/common";
 import { startDemoSession, useDemo, useSessionId, type Member, type Role } from "@/lib/demo-store";
 import { ROLE_LABEL } from "@/lib/rules";
 import { pageHead } from "@/lib/seo";
@@ -56,19 +56,9 @@ export function DemoLogin() {
   const navigate = useNavigate();
 
   const [selectedRole, setSelectedRole] = useState<Role | null>(null);
-  const [selectedMemberByRole, setSelectedMemberByRole] = useState<Partial<Record<Role, string>>>(
-    {},
-  );
-
-  const getRoleMembers = (role: Role): Member[] => members.filter((m) => m.role === role);
 
   const getActiveMemberForRole = (role: Role): Member | undefined => {
-    const roleMembers = getRoleMembers(role);
-    const explicitId = selectedMemberByRole[role];
-    if (explicitId) {
-      const found = roleMembers.find((m) => m.id === explicitId);
-      if (found) return found;
-    }
+    const roleMembers = members.filter((m) => m.role === role);
     if (current) {
       const currentInRole = roleMembers.find((m) => m.id === current);
       if (currentInRole) return currentInRole;
@@ -76,30 +66,13 @@ export function DemoLogin() {
     return roleMembers[0];
   };
 
-  const choose = (id: string) => {
-    startDemoSession(id);
-    void navigate({ to: "/app" });
-  };
-
-  const handleSelectRole = (role: Role) => {
-    setSelectedRole(role);
-    const active = getActiveMemberForRole(role);
-    if (active) {
-      setSelectedMemberByRole((prev) => ({ ...prev, [role]: active.id }));
-    }
-  };
-
-  const handleSelectPersona = (role: Role, memberId: string) => {
-    setSelectedRole(role);
-    setSelectedMemberByRole((prev) => ({ ...prev, [role]: memberId }));
-  };
-
   const selectedMember = selectedRole ? getActiveMemberForRole(selectedRole) : undefined;
   const canContinue = Boolean(selectedRole && selectedMember);
 
   const handleContinue = () => {
     if (!selectedRole || !selectedMember) return;
-    choose(selectedMember.id);
+    startDemoSession(selectedMember.id);
+    void navigate({ to: "/app" });
   };
 
   return (
@@ -133,7 +106,7 @@ export function DemoLogin() {
           </h1>
           <p className="mt-1.5 max-w-2xl text-sm text-muted-foreground">
             Choose a workspace role below to launch Aurelia TimeFlow with pre-populated enterprise
-            data. You can switch personas at any time from the application header.
+            data. You can switch roles at any time from the application header.
           </p>
         </div>
 
@@ -159,109 +132,62 @@ export function DemoLogin() {
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             {roleConfigs.map((r) => {
               const isSelected = selectedRole === r.role;
-              const roleMembers = getRoleMembers(r.role);
-              const activeMember = getActiveMemberForRole(r.role);
 
               return (
-                <article
+                <button
                   key={r.role}
-                  aria-labelledby={`role-${r.role}`}
+                  type="button"
+                  aria-pressed={isSelected}
+                  onClick={() => setSelectedRole(r.role)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      setSelectedRole(r.role);
+                    }
+                  }}
                   className={cn(
-                    "flex flex-col justify-between rounded-xl border p-5 transition-all duration-150",
+                    "group flex flex-col justify-start rounded-xl border p-5 text-left transition-all duration-150 cursor-pointer focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring",
                     isSelected
                       ? "border-primary bg-primary/[0.06] ring-2 ring-primary/20 shadow-sm"
                       : "border-border bg-background/60 hover:border-primary/40 hover:bg-muted/30",
                   )}
                 >
-                  {/* Independent Role Selection Button (no nested buttons inside) */}
-                  <button
-                    type="button"
-                    aria-pressed={isSelected}
-                    onClick={() => handleSelectRole(r.role)}
-                    className="group w-full rounded-lg text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  <span className="flex w-full items-start justify-between gap-3">
+                    <span
+                      className={cn(
+                        "grid size-10 place-items-center rounded-lg transition-colors",
+                        isSelected
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-secondary text-primary group-hover:bg-primary/15",
+                      )}
+                    >
+                      <r.icon className="size-5" aria-hidden />
+                    </span>
+                    <span
+                      className={cn(
+                        "flex size-5 items-center justify-center rounded-full border transition-colors",
+                        isSelected
+                          ? "border-primary bg-primary text-primary-foreground"
+                          : "border-muted-foreground/30 bg-background group-hover:border-primary/50",
+                      )}
+                      aria-hidden
+                    >
+                      {isSelected && <CheckCircle2 className="size-3.5" />}
+                    </span>
+                  </span>
+
+                  <span
+                    id={`role-${r.role}`}
+                    role="heading"
+                    aria-level={2}
+                    className="mt-4 block text-base font-bold tracking-tight text-foreground"
                   >
-                    <div className="flex items-start justify-between gap-3">
-                      <span
-                        className={cn(
-                          "grid size-10 place-items-center rounded-lg transition-colors",
-                          isSelected
-                            ? "bg-primary text-primary-foreground"
-                            : "bg-secondary text-primary group-hover:bg-primary/15",
-                        )}
-                      >
-                        <r.icon className="size-5" aria-hidden />
-                      </span>
-                      <span
-                        className={cn(
-                          "flex size-5 items-center justify-center rounded-full border transition-colors",
-                          isSelected
-                            ? "border-primary bg-primary text-primary-foreground"
-                            : "border-muted-foreground/30 bg-background group-hover:border-primary/50",
-                        )}
-                        aria-hidden
-                      >
-                        {isSelected && <CheckCircle2 className="size-3.5" />}
-                      </span>
-                    </div>
-
-                    <h2
-                      id={`role-${r.role}`}
-                      className="mt-3.5 text-base font-bold tracking-tight text-foreground"
-                    >
-                      {r.title}
-                    </h2>
-                    <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-                      {r.description}
-                    </p>
-                  </button>
-
-                  {/* Independent Sibling Persona Buttons */}
-                  <div className="mt-4 border-t border-border/70 pt-3">
-                    <p className="text-[11px] font-medium text-muted-foreground">
-                      Demo persona ({roleMembers.length})
-                    </p>
-                    <div
-                      role="group"
-                      aria-label={`${r.title} personas`}
-                      className="mt-2 flex flex-col gap-1.5"
-                    >
-                      {roleMembers.map((m) => {
-                        const isPersonaSelected = isSelected && activeMember?.id === m.id;
-                        const isCurrentSession = m.id === current;
-                        return (
-                          <button
-                            key={m.id}
-                            type="button"
-                            aria-pressed={isPersonaSelected}
-                            onClick={() => handleSelectPersona(r.role, m.id)}
-                            className={cn(
-                              "flex w-full items-center gap-2.5 rounded-lg border px-2.5 py-1.5 text-left text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
-                              isPersonaSelected
-                                ? "border-primary/50 bg-background font-semibold text-foreground shadow-2xs"
-                                : "border-transparent bg-muted/40 text-muted-foreground hover:border-border hover:bg-background hover:text-foreground",
-                            )}
-                          >
-                            <Initials name={m.name} size="xs" className="font-bold shrink-0" />
-                            <span className="min-w-0 flex-1 truncate">
-                              <span className="text-foreground font-medium">{m.name}</span>
-                              <span className="ml-1.5 text-[11px] text-muted-foreground">
-                                · {m.title}
-                              </span>
-                            </span>
-                            {isCurrentSession && (
-                              <span className="shrink-0 text-[10px] font-semibold text-primary">
-                                Active
-                              </span>
-                            )}
-                            <span className="sr-only">
-                              Preview as {m.name}, {ROLE_LABEL[r.role]}
-                            </span>
-                          </button>
-                        );
-                      })}
-                    </div>
-                  </div>
-                </article>
+                    {r.title}
+                  </span>
+                  <span className="mt-1.5 block text-xs leading-relaxed text-muted-foreground">
+                    {r.description}
+                  </span>
+                </button>
               );
             })}
           </div>
@@ -269,15 +195,12 @@ export function DemoLogin() {
           {/* Action Footer with Prominent Continue to Demo Button */}
           <div className="mt-6 flex flex-col items-stretch justify-between gap-4 border-t pt-5 sm:flex-row sm:items-center">
             <div className="text-xs text-muted-foreground">
-              {selectedRole && selectedMember ? (
+              {selectedRole ? (
                 <span>
-                  Selected:{" "}
+                  Selected role:{" "}
                   <strong className="font-semibold text-foreground">
                     {ROLE_LABEL[selectedRole]}
-                  </strong>{" "}
-                  as{" "}
-                  <strong className="font-semibold text-foreground">{selectedMember.name}</strong> (
-                  {selectedMember.title})
+                  </strong>
                 </span>
               ) : (
                 <span>Select one of the three roles above to continue to the workspace.</span>
@@ -301,7 +224,7 @@ export function DemoLogin() {
         <footer className="mt-6 flex flex-col items-center justify-between gap-2 text-xs text-muted-foreground sm:flex-row">
           <p>
             Aurelia TimeFlow © {new Date().getFullYear()} Aurelia Business Services. All demo
-            personas and records are fictional.
+            records are fictional.
           </p>
           <Link to="/" className="hover:text-foreground hover:underline">
             Product Overview

@@ -61,29 +61,28 @@ afterEach(() => {
 });
 
 describe("demo role preview flow", () => {
-  it("renders /login with Admin, Manager and Employee role buttons, no nested interactive controls, and disabled Continue button initially", async () => {
+  it("renders /login with Admin, Manager and Employee role cards (without demo user lists), phrasing-only button markup, and disabled Continue button initially", async () => {
     const { container } = mount("/login");
 
     expect(await screen.findByRole("heading", { name: "Demo role preview" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Business Admin" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Project Manager" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Employee" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Preview as Vikram Joshi/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Preview as Priya Sharma/ })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /Preview as Arjun Mehta/ })).toBeInTheDocument();
 
-    // Verify no nested buttons or nested role="button" elements exist
+    // Ensure individual demo user lists are not displayed inside the role cards
+    expect(screen.queryByText(/Demo persona/i)).not.toBeInTheDocument();
+
+    // Verify no nested buttons or block elements inside buttons
     expect(container.querySelectorAll("button button").length).toBe(0);
-    expect(container.querySelectorAll('[role="button"] button').length).toBe(0);
-    expect(container.querySelectorAll('button [role="button"]').length).toBe(0);
+    expect(container.querySelectorAll("button div, button h2, button p").length).toBe(0);
 
     const continueBtn = screen.getByRole("button", { name: /Continue to Demo/i });
     expect(continueBtn).toBeDisabled();
     expect(reactErrors.some((m) => m.includes("getSnapshot should be cached"))).toBe(false);
   });
 
-  it("supports selecting each of the three roles via independent role buttons and switching personas without parent button conflicts", async () => {
-    mount("/login");
+  it("supports selecting each of the three roles via click or keyboard (Enter / Space) and launching the workspace on Continue to Demo", async () => {
+    const { router } = mount("/login");
 
     const adminRoleBtn = await screen.findByRole("button", { name: /^Business Admin/i });
     const managerRoleBtn = screen.getByRole("button", { name: /^Project Manager/i });
@@ -95,69 +94,30 @@ describe("demo role preview flow", () => {
     expect(employeeRoleBtn).toHaveAttribute("aria-pressed", "false");
     expect(continueBtn).toBeDisabled();
 
-    // 1. Select Business Admin role button -> defaults to Vikram Joshi
-    fireEvent.click(adminRoleBtn);
+    // 1. Select Business Admin via Enter key
+    adminRoleBtn.focus();
+    fireEvent.keyDown(adminRoleBtn, { key: "Enter" });
     expect(adminRoleBtn).toHaveAttribute("aria-pressed", "true");
     expect(continueBtn).toBeEnabled();
-    expect(screen.getByRole("button", { name: /Preview as Vikram Joshi/ })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
 
-    // 2. Select secondary Admin persona (Neha Kapoor) directly
-    const nehaBtn = screen.getByRole("button", { name: /Preview as Neha Kapoor/ });
-    fireEvent.click(nehaBtn);
-    expect(nehaBtn).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: /Preview as Vikram Joshi/ })).toHaveAttribute(
-      "aria-pressed",
-      "false",
-    );
-
-    // 3. Select Project Manager role button -> switches role to Manager
-    fireEvent.click(managerRoleBtn);
+    // 2. Select Project Manager via Space key
+    managerRoleBtn.focus();
+    fireEvent.keyDown(managerRoleBtn, { key: " " });
     expect(managerRoleBtn).toHaveAttribute("aria-pressed", "true");
     expect(adminRoleBtn).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByRole("button", { name: /Preview as Priya Sharma/ })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
 
-    // 4. Select Employee role button -> switches role to Employee
+    // 3. Select Employee via click and then switch back to Business Admin
     fireEvent.click(employeeRoleBtn);
     expect(employeeRoleBtn).toHaveAttribute("aria-pressed", "true");
-    expect(managerRoleBtn).toHaveAttribute("aria-pressed", "false");
-    expect(screen.getByRole("button", { name: /Preview as Arjun Mehta/ })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-
-    // 5. Switch back to Business Admin -> preserves previously chosen Neha Kapoor persona
     fireEvent.click(adminRoleBtn);
-    expect(nehaBtn).toHaveAttribute("aria-pressed", "true");
-  });
+    expect(adminRoleBtn).toHaveAttribute("aria-pressed", "true");
 
-  it("supports keyboard focus and launches the selected persona when clicking Continue to Demo", async () => {
-    const { router } = mount("/login");
-
-    const continueBtn = await screen.findByRole("button", { name: /Continue to Demo/i });
-    expect(continueBtn).toBeDisabled();
-
-    // Focus and select a specific persona button (Emily Carter, Project Manager, m5)
-    const emilyBtn = screen.getByRole("button", { name: /Preview as Emily Carter/ });
-    emilyBtn.focus();
-    expect(document.activeElement).toBe(emilyBtn);
-    fireEvent.click(emilyBtn);
-
-    expect(emilyBtn).toHaveAttribute("aria-pressed", "true");
-    expect(continueBtn).toBeEnabled();
-
-    continueBtn.focus();
-    expect(document.activeElement).toBe(continueBtn);
+    // 4. Click Continue to Demo -> launches Business Admin session (m6)
     fireEvent.click(continueBtn);
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/app"));
-    expect(getSessionId()).toBe("m5");
-    expect(window.localStorage.getItem("aurelia-timeflow-demo-session")).toBe("m5");
+    expect(getSessionId()).toBe("m6");
+    expect(window.localStorage.getItem("aurelia-timeflow-demo-session")).toBe("m6");
     expect((await screen.findAllByText("Demo workspace")).length).toBeGreaterThan(0);
   });
 

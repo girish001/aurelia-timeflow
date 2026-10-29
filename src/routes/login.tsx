@@ -81,15 +81,21 @@ export function DemoLogin() {
     void navigate({ to: "/app" });
   };
 
-  const handleSelectRole = (role: Role, memberId?: string) => {
+  const handleSelectRole = (role: Role) => {
     setSelectedRole(role);
-    const targetId = memberId ?? getActiveMemberForRole(role)?.id;
-    if (targetId) {
-      setSelectedMemberByRole((prev) => ({ ...prev, [role]: targetId }));
+    const active = getActiveMemberForRole(role);
+    if (active) {
+      setSelectedMemberByRole((prev) => ({ ...prev, [role]: active.id }));
     }
   };
 
+  const handleSelectPersona = (role: Role, memberId: string) => {
+    setSelectedRole(role);
+    setSelectedMemberByRole((prev) => ({ ...prev, [role]: memberId }));
+  };
+
   const selectedMember = selectedRole ? getActiveMemberForRole(selectedRole) : undefined;
+  const canContinue = Boolean(selectedRole && selectedMember);
 
   const handleContinue = () => {
     if (!selectedRole || !selectedMember) return;
@@ -157,28 +163,23 @@ export function DemoLogin() {
               const activeMember = getActiveMemberForRole(r.role);
 
               return (
-                <div
+                <article
                   key={r.role}
-                  role="button"
-                  tabIndex={0}
-                  aria-pressed={isSelected}
                   aria-labelledby={`role-${r.role}`}
-                  onClick={() => handleSelectRole(r.role)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      handleSelectRole(r.role);
-                    }
-                  }}
                   className={cn(
-                    "group relative flex flex-col justify-between rounded-xl border p-5 text-left transition-all duration-150 cursor-pointer select-none focus-visible:outline-2 focus-visible:outline-ring",
+                    "flex flex-col justify-between rounded-xl border p-5 transition-all duration-150",
                     isSelected
                       ? "border-primary bg-primary/[0.06] ring-2 ring-primary/20 shadow-sm"
-                      : "border-border bg-background/60 hover:border-primary/40 hover:bg-muted/40",
+                      : "border-border bg-background/60 hover:border-primary/40 hover:bg-muted/30",
                   )}
                 >
-                  <div>
-                    {/* Top Row: Icon + Selected Check */}
+                  {/* Independent Role Selection Button (no nested buttons inside) */}
+                  <button
+                    type="button"
+                    aria-pressed={isSelected}
+                    onClick={() => handleSelectRole(r.role)}
+                    className="group w-full rounded-lg text-left transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                  >
                     <div className="flex items-start justify-between gap-3">
                       <span
                         className={cn(
@@ -203,7 +204,6 @@ export function DemoLogin() {
                       </span>
                     </div>
 
-                    {/* Role Title & Short Description */}
                     <h2
                       id={`role-${r.role}`}
                       className="mt-3.5 text-base font-bold tracking-tight text-foreground"
@@ -213,14 +213,18 @@ export function DemoLogin() {
                     <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
                       {r.description}
                     </p>
-                  </div>
+                  </button>
 
-                  {/* Compact Persona Selector */}
+                  {/* Independent Sibling Persona Buttons */}
                   <div className="mt-4 border-t border-border/70 pt-3">
                     <p className="text-[11px] font-medium text-muted-foreground">
                       Demo persona ({roleMembers.length})
                     </p>
-                    <div className="mt-2 flex flex-col gap-1.5">
+                    <div
+                      role="group"
+                      aria-label={`${r.title} personas`}
+                      className="mt-2 flex flex-col gap-1.5"
+                    >
                       {roleMembers.map((m) => {
                         const isPersonaSelected = isSelected && activeMember?.id === m.id;
                         const isCurrentSession = m.id === current;
@@ -228,12 +232,10 @@ export function DemoLogin() {
                           <button
                             key={m.id}
                             type="button"
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              handleSelectRole(r.role, m.id);
-                            }}
+                            aria-pressed={isPersonaSelected}
+                            onClick={() => handleSelectPersona(r.role, m.id)}
                             className={cn(
-                              "flex w-full items-center gap-2.5 rounded-lg border px-2.5 py-1.5 text-left text-xs transition-colors focus-visible:outline-2 focus-visible:outline-ring",
+                              "flex w-full items-center gap-2.5 rounded-lg border px-2.5 py-1.5 text-left text-xs transition-colors focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-ring",
                               isPersonaSelected
                                 ? "border-primary/50 bg-background font-semibold text-foreground shadow-2xs"
                                 : "border-transparent bg-muted/40 text-muted-foreground hover:border-border hover:bg-background hover:text-foreground",
@@ -259,7 +261,7 @@ export function DemoLogin() {
                       })}
                     </div>
                   </div>
-                </div>
+                </article>
               );
             })}
           </div>
@@ -285,7 +287,7 @@ export function DemoLogin() {
             <Button
               type="button"
               size="lg"
-              disabled={!selectedRole}
+              disabled={!canContinue}
               onClick={handleContinue}
               className="sm:min-w-52 font-semibold"
             >

@@ -15,11 +15,6 @@ import { Route as AppRoute } from "@/routes/app";
 import { Route as AppIndexRoute } from "@/routes/app.index";
 import { Route as LoginRoute } from "@/routes/login";
 
-// The real root route renders an <html> shell and a stylesheet <link> that never
-// finishes loading in jsdom, which suspends React forever. So these tests mount the
-// real /login, /app layout and /app index components under a bare root route instead.
-// Route registration itself is covered by app-routing.test.tsx and by `vite build`.
-// Every route imported here defines a component; options.component is typed as optional.
 const component = (r: { options: { component?: RouteComponent | undefined } }) =>
   r.options.component as RouteComponent;
 
@@ -44,8 +39,8 @@ function mount(path: string) {
     routeTree: root.addChildren([login, app.addChildren([appIndex])]),
     history: createMemoryHistory({ initialEntries: [path] }),
   });
-  render(<RouterProvider router={router} />);
-  return router;
+  const view = render(<RouterProvider router={router} />);
+  return { router, container: view.container };
 }
 
 let reactErrors: string[] = [];
@@ -66,8 +61,8 @@ afterEach(() => {
 });
 
 describe("demo role preview flow", () => {
-  it("renders /login with Admin, Manager and Employee role cards, disabled Continue button initially, and no render loop", async () => {
-    mount("/login");
+  it("renders /login with Admin, Manager and Employee role buttons, no nested interactive controls, and disabled Continue button initially", async () => {
+    const { container } = mount("/login");
 
     expect(await screen.findByRole("heading", { name: "Demo role preview" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "Business Admin" })).toBeInTheDocument();
@@ -77,30 +72,97 @@ describe("demo role preview flow", () => {
     expect(screen.getByRole("button", { name: /Preview as Priya Sharma/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Preview as Arjun Mehta/ })).toBeInTheDocument();
 
+    // Verify no nested buttons or nested role="button" elements exist
+    expect(container.querySelectorAll("button button").length).toBe(0);
+    expect(container.querySelectorAll('[role="button"] button').length).toBe(0);
+    expect(container.querySelectorAll('button [role="button"]').length).toBe(0);
+
     const continueBtn = screen.getByRole("button", { name: /Continue to Demo/i });
     expect(continueBtn).toBeDisabled();
     expect(reactErrors.some((m) => m.includes("getSnapshot should be cached"))).toBe(false);
   });
 
-  it("selecting a role enables Continue to Demo, and clicking Continue starts the demo session and opens /app", async () => {
-    const router = mount("/login");
+  it("supports selecting each of the three roles via independent role buttons and switching personas without parent button conflicts", async () => {
+    mount("/login");
+
+    const adminRoleBtn = await screen.findByRole("button", { name: /^Business Admin/i });
+    const managerRoleBtn = screen.getByRole("button", { name: /^Project Manager/i });
+    const employeeRoleBtn = screen.getByRole("button", { name: /^Employee/i });
+    const continueBtn = screen.getByRole("button", { name: /Continue to Demo/i });
+
+    expect(adminRoleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(managerRoleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(employeeRoleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(continueBtn).toBeDisabled();
+
+    // 1. Select Business Admin role button -> defaults to Vikram Joshi
+    fireEvent.click(adminRoleBtn);
+    expect(adminRoleBtn).toHaveAttribute("aria-pressed", "true");
+    expect(continueBtn).toBeEnabled();
+    expect(screen.getByRole("button", { name: /Preview as Vikram Joshi/ })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    // 2. Select secondary Admin persona (Neha Kapoor) directly
+    const nehaBtn = screen.getByRole("button", { name: /Preview as Neha Kapoor/ });
+    fireEvent.click(nehaBtn);
+    expect(nehaBtn).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: /Preview as Vikram Joshi/ })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+
+    // 3. Select Project Manager role button -> switches role to Manager
+    fireEvent.click(managerRoleBtn);
+    expect(managerRoleBtn).toHaveAttribute("aria-pressed", "true");
+    expect(adminRoleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /Preview as Priya Sharma/ })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    // 4. Select Employee role button -> switches role to Employee
+    fireEvent.click(employeeRoleBtn);
+    expect(employeeRoleBtn).toHaveAttribute("aria-pressed", "true");
+    expect(managerRoleBtn).toHaveAttribute("aria-pressed", "false");
+    expect(screen.getByRole("button", { name: /Preview as Arjun Mehta/ })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+
+    // 5. Switch back to Business Admin -> preserves previously chosen Neha Kapoor persona
+    fireEvent.click(adminRoleBtn);
+    expect(nehaBtn).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("supports keyboard focus and launches the selected persona when clicking Continue to Demo", async () => {
+    const { router } = mount("/login");
 
     const continueBtn = await screen.findByRole("button", { name: /Continue to Demo/i });
     expect(continueBtn).toBeDisabled();
 
-    fireEvent.click(screen.getByRole("button", { name: /Preview as Vikram Joshi/ }));
+    // Focus and select a specific persona button (Emily Carter, Project Manager, m5)
+    const emilyBtn = screen.getByRole("button", { name: /Preview as Emily Carter/ });
+    emilyBtn.focus();
+    expect(document.activeElement).toBe(emilyBtn);
+    fireEvent.click(emilyBtn);
+
+    expect(emilyBtn).toHaveAttribute("aria-pressed", "true");
     expect(continueBtn).toBeEnabled();
 
+    continueBtn.focus();
+    expect(document.activeElement).toBe(continueBtn);
     fireEvent.click(continueBtn);
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/app"));
-    expect(getSessionId()).toBe("m6");
-    expect(window.localStorage.getItem("aurelia-timeflow-demo-session")).toBe("m6");
+    expect(getSessionId()).toBe("m5");
+    expect(window.localStorage.getItem("aurelia-timeflow-demo-session")).toBe("m5");
     expect((await screen.findAllByText("Demo workspace")).length).toBeGreaterThan(0);
   });
 
   it("redirects /app to /login when there is no demo session", async () => {
-    const router = mount("/app");
+    const { router } = mount("/app");
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
     expect(await screen.findByRole("heading", { name: "Demo role preview" })).toBeInTheDocument();
@@ -108,7 +170,7 @@ describe("demo role preview flow", () => {
 
   it("redirects /app to /login when the stored session id matches no member", async () => {
     window.localStorage.setItem("aurelia-timeflow-demo-session", "ghost");
-    const router = mount("/app");
+    const { router } = mount("/app");
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/login"));
     expect(await screen.findByRole("heading", { name: "Demo role preview" })).toBeInTheDocument();
@@ -116,7 +178,6 @@ describe("demo role preview flow", () => {
 
   it("restores a stored demo session from localStorage on a fresh page load", async () => {
     window.localStorage.setItem("aurelia-timeflow-demo-session", "m2");
-    // A browser refresh re-evaluates the module with an empty in-memory cache.
     vi.resetModules();
     const fresh = await import("@/lib/demo-store");
 

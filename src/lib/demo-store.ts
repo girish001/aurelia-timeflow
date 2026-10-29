@@ -10,6 +10,9 @@ export interface Client {
   email: string;
   country: string;
   status: Status;
+  phone?: string;
+  billingTerms?: string;
+  taxId?: string;
 }
 export type ProjectStatus = "active" | "on-hold" | "completed";
 export interface Project {
@@ -19,6 +22,7 @@ export interface Project {
   managerId: string;
   status: ProjectStatus;
   budgetHours: number;
+  plannedHours?: number;
   rate: number;
   tasks: string[];
 }
@@ -30,6 +34,9 @@ export interface Member {
   title: string;
   role: Role;
   status: "active" | "invited" | "inactive";
+  department?: string;
+  reportingManagerId?: string;
+  phone?: string;
 }
 export interface Entry {
   id: string;
@@ -49,6 +56,7 @@ export interface Timesheet {
   submittedAt?: string | undefined;
   reviewedAt?: string | undefined;
   reviewComment?: string | undefined;
+  lastAutoSavedAt?: string | undefined;
 }
 export interface Settings {
   companyName: string;
@@ -59,6 +67,10 @@ export interface Settings {
   timeFormat: TimeFormat;
   currency: "INR" | "USD";
   dailyTarget: number;
+  lockApproved?: boolean;
+  allowOvertime?: boolean;
+  roundingStep?: number;
+  requireRejectReason?: boolean;
 }
 export type LeaveType = "annual" | "sick" | "personal" | "unpaid";
 export type LeaveStatus = "pending" | "approved" | "rejected";
@@ -85,6 +97,25 @@ export interface Allocation {
   hours: number;
   status: AllocationStatus;
 }
+export interface AuditLogItem {
+  id: string;
+  actorId: string;
+  actorName: string;
+  action: string;
+  category: "timesheet" | "approval" | "project" | "client" | "member" | "settings" | "auth";
+  details: string;
+  timestamp: string;
+}
+export interface AppNotification {
+  id: string;
+  recipientId: string; // or "all"
+  title: string;
+  message: string;
+  type: "info" | "success" | "warning" | "alert";
+  timestamp: string;
+  read: boolean;
+  link?: string;
+}
 export interface State {
   version: number;
   clients: Client[];
@@ -94,6 +125,8 @@ export interface State {
   leaves: LeaveRequest[];
   allocations: Allocation[];
   settings: Settings;
+  auditLogs: AuditLogItem[];
+  notifications: AppNotification[];
 }
 
 const KEY = "aurelia-timeflow-demo-v2";
@@ -483,6 +516,97 @@ export function createSeed(now = new Date()): State {
     status: "tentative",
   });
 
+  const auditLogs: AuditLogItem[] = [
+    {
+      id: "al_1",
+      actorId: "m1",
+      actorName: "Priya Sharma",
+      action: "Timesheet Approved",
+      category: "approval",
+      details: "Approved timesheet for Vikram Joshi (40.0h)",
+      timestamp: isoDay(addDays(mon, -2)),
+    },
+    {
+      id: "al_2",
+      actorId: "m2",
+      actorName: "Arjun Mehta",
+      action: "Timesheet Submitted",
+      category: "timesheet",
+      details: "Submitted timesheet for Week of " + weekKey(subWeeks(mon, 1)) + " (38.5h)",
+      timestamp: isoDay(addDays(mon, -3)),
+    },
+    {
+      id: "al_3",
+      actorId: "m6",
+      actorName: "Vikram Joshi",
+      action: "Project Created",
+      category: "project",
+      details: "Created project 'E-commerce Replatform' for Northwind Retail",
+      timestamp: isoDay(addDays(mon, -14)),
+    },
+    {
+      id: "al_4",
+      actorId: "m6",
+      actorName: "Vikram Joshi",
+      action: "Settings Updated",
+      category: "settings",
+      details: "Updated daily capacity target to 8.0h",
+      timestamp: isoDay(addDays(mon, -20)),
+    },
+    {
+      id: "al_5",
+      actorId: "m1",
+      actorName: "Priya Sharma",
+      action: "Timesheet Rejected",
+      category: "approval",
+      details: "Returned Rahul Verma's timesheet with note: Please split QA hours.",
+      timestamp: isoDay(addDays(mon, -4)),
+    },
+  ];
+
+  const notifications: AppNotification[] = [
+    {
+      id: "notif_1",
+      recipientId: "all",
+      title: "Timesheet Review Due",
+      message: "End-of-week timesheet submission deadline is Friday 6:00 PM.",
+      type: "info",
+      timestamp: isoDay(mon),
+      read: false,
+      link: "/app/timesheet",
+    },
+    {
+      id: "notif_2",
+      recipientId: "m1",
+      title: "New Submissions Awaiting Approval",
+      message: "Arjun Mehta and Kavya Nair submitted weekly timesheets for your review.",
+      type: "warning",
+      timestamp: isoDay(addDays(mon, -1)),
+      read: false,
+      link: "/app/approvals",
+    },
+    {
+      id: "notif_3",
+      recipientId: "m4",
+      title: "Timesheet Returned for Revision",
+      message: "Priya Sharma returned your timesheet with comments. Please review and resubmit.",
+      type: "alert",
+      timestamp: isoDay(addDays(mon, -3)),
+      read: false,
+      link: "/app/timesheet",
+    },
+    {
+      id: "notif_4",
+      recipientId: "m2",
+      title: "Timesheet Approved",
+      message: "Your timesheet for 2 weeks ago has been approved by Priya Sharma.",
+      type: "success",
+      timestamp: isoDay(addDays(mon, -5)),
+      read: true,
+      link: "/app/timesheet",
+    },
+  ];
+
   return {
     version: VERSION,
     clients,
@@ -491,6 +615,8 @@ export function createSeed(now = new Date()): State {
     timesheets,
     leaves,
     allocations,
+    auditLogs,
+    notifications,
     settings: {
       companyName: "Demo Consulting Pvt Ltd",
       companyEmail: "ops@demo.aurelia.example",
@@ -500,6 +626,10 @@ export function createSeed(now = new Date()): State {
       timeFormat: "decimal",
       currency: "INR",
       dailyTarget: 8,
+      lockApproved: true,
+      allowOvertime: true,
+      roundingStep: 0.25,
+      requireRejectReason: true,
     },
   };
 }
@@ -513,7 +643,11 @@ function load(): State {
       const raw = window.localStorage.getItem(KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as State;
-        if (parsed.version === VERSION) return parsed;
+        if (parsed.version === VERSION) {
+          parsed.auditLogs = parsed.auditLogs ?? [];
+          parsed.notifications = parsed.notifications ?? [];
+          return parsed;
+        }
       }
     } catch {
       /* corrupted storage: fall back to seed */
@@ -628,6 +762,101 @@ export function reviewTimesheet(id: string, decision: "approved" | "rejected", c
             reviewedAt: isoDay(new Date()),
           }
         : t,
+    ),
+  }));
+}
+export function bulkReviewTimesheets(
+  ids: string[],
+  decision: "approved" | "rejected",
+  reviewerId: string,
+  reviewerName: string,
+  comment?: string,
+) {
+  const today = isoDay(new Date());
+  setState((s) => {
+    const updated = s.timesheets.map((t) => {
+      if (!ids.includes(t.id)) return t;
+      return {
+        ...t,
+        status: decision,
+        reviewedAt: today,
+        reviewComment: comment || t.reviewComment,
+      };
+    });
+    const newLogs: AuditLogItem[] = ids.map((id) => {
+      const ts = s.timesheets.find((x) => x.id === id);
+      const member = s.members.find((m) => m.id === ts?.memberId)?.name ?? "Member";
+      return {
+        id: uid("al"),
+        actorId: reviewerId,
+        actorName: reviewerName,
+        action: `Timesheet ${decision === "approved" ? "Approved" : "Rejected"}`,
+        category: "approval",
+        details: `${decision === "approved" ? "Approved" : "Returned"} ${member}'s timesheet for week ${ts?.weekStart ?? ""}`,
+        timestamp: today,
+      };
+    });
+    return {
+      ...s,
+      timesheets: updated,
+      auditLogs: [...newLogs, ...(s.auditLogs ?? [])],
+    };
+  });
+}
+export function copyPreviousWeek(currentWeekStart: string, memberId: string): boolean {
+  const prevWeek = weekKey(subWeeks(parseISO(currentWeekStart), 1));
+  const s = getState();
+  const prevSheet = s.timesheets.find((t) => t.memberId === memberId && t.weekStart === prevWeek);
+  if (!prevSheet || prevSheet.entries.length === 0) return false;
+
+  const currentSheet = s.timesheets.find(
+    (t) => t.memberId === memberId && t.weekStart === currentWeekStart,
+  );
+  if (currentSheet && currentSheet.status === "approved") return false;
+
+  const clonedEntries: Entry[] = prevSheet.entries.map((e, idx) => ({
+    id: uid(`e_${memberId}_${idx}`),
+    projectId: e.projectId,
+    task: e.task,
+    hours: [0, 0, 0, 0, 0, 0, 0],
+    billable: e.billable,
+    notes: e.notes || "",
+  }));
+
+  const newSheet: Timesheet = {
+    id: currentSheet ? currentSheet.id : `t_${memberId}_${currentWeekStart}`,
+    memberId,
+    weekStart: currentWeekStart,
+    entries: clonedEntries,
+    status: currentSheet ? currentSheet.status : "draft",
+    lastAutoSavedAt: isoDay(new Date()),
+  };
+
+  upsertTimesheet(newSheet);
+  return true;
+}
+export function addAuditLog(item: Omit<AuditLogItem, "id" | "timestamp">) {
+  const log: AuditLogItem = {
+    id: uid("al"),
+    ...item,
+    timestamp: isoDay(new Date()),
+  };
+  setState((s) => ({
+    ...s,
+    auditLogs: [log, ...(s.auditLogs ?? [])],
+  }));
+}
+export function markNotificationRead(id: string) {
+  setState((s) => ({
+    ...s,
+    notifications: (s.notifications ?? []).map((n) => (n.id === id ? { ...n, read: true } : n)),
+  }));
+}
+export function markAllNotificationsRead(memberId: string) {
+  setState((s) => ({
+    ...s,
+    notifications: (s.notifications ?? []).map((n) =>
+      n.recipientId === memberId || n.recipientId === "all" ? { ...n, read: true } : n,
     ),
   }));
 }

@@ -1,7 +1,18 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useState } from "react";
 import { z } from "zod";
-import { Plus, Search, Pencil, FolderOpen } from "lucide-react";
+import {
+  Plus,
+  Search,
+  Pencil,
+  FolderOpen,
+  AlertTriangle,
+  Briefcase,
+  Clock,
+  TrendingUp,
+  DollarSign,
+  CheckCircle2,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,10 +33,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { EmptyState, PageHeader, StatusBadge } from "@/components/app/common";
+import { EmptyState, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
 import { loggedHours, uid, upsertProject, useDemo, type Project } from "@/lib/demo-store";
 import { formatHours, formatMoney } from "@/lib/time";
 import { pageHead } from "@/lib/seo";
+import { cn } from "@/lib/utils";
 
 export const Route = createFileRoute("/app/projects")({
   head: () => pageHead("Projects", "Track project budgets, logged hours and billable rates."),
@@ -48,13 +60,16 @@ const schema = z.object({
   tasks: z.string().trim().min(1, "Add at least one task"),
 });
 
-function Projects() {
+export function Projects() {
   const s = useDemo((x) => x);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("all");
   const [client, setClient] = useState("all");
   const [editing, setEditing] = useState<Project | "new" | null>(null);
+
   const cur = s.settings.currency;
+  const fmt = s.settings.timeFormat;
+
   const list = s.projects.filter((p) => {
     const c = s.clients.find((x) => x.id === p.clientId)?.name ?? "Internal";
     return (
@@ -64,34 +79,83 @@ function Projects() {
     );
   });
 
+  // Calculate project aggregate metrics
+  const totalBudgetHours = s.projects.reduce((acc, p) => acc + (p.budgetHours || 0), 0);
+  const totalLoggedHours = s.projects.reduce((acc, p) => acc + loggedHours(s, p.id), 0);
+  const totalEstRevenue = s.projects.reduce(
+    (acc, p) => acc + loggedHours(s, p.id) * (p.rate || 0),
+    0,
+  );
+  const overBudgetCount = s.projects.filter(
+    (p) => p.budgetHours > 0 && loggedHours(s, p.id) > p.budgetHours,
+  ).length;
+
   return (
-    <>
+    <div className="space-y-6">
       <PageHeader
         title="Projects"
-        description="Billable rates shown are demo values, per hour."
+        description="Monitor project progress, budget consumption, billable rates and delivery revenue."
         actions={
           <Button onClick={() => setEditing("new")}>
-            <Plus /> New project
+            <Plus className="size-4" />
+            <span>New project</span>
           </Button>
         }
       />
-      <div className="mb-4 flex flex-col gap-2 sm:flex-row">
+
+      {/* KPI Cards */}
+      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <StatCard
+          label="Total projects"
+          value={s.projects.length}
+          hint={`${s.projects.filter((p) => p.status === "active").length} active, ${s.projects.filter((p) => p.status === "completed").length} completed`}
+          icon={Briefcase}
+          tone="primary"
+        />
+        <StatCard
+          label="Logged / Budgeted"
+          value={`${formatHours(totalLoggedHours, fmt)}h`}
+          hint={`Of ${formatHours(totalBudgetHours, fmt)}h allocated capacity`}
+          icon={Clock}
+          tone="teal"
+        />
+        <StatCard
+          label="Estimated Revenue"
+          value={formatMoney(totalEstRevenue, cur)}
+          hint="Logged billable hours × hourly rate"
+          icon={TrendingUp}
+          tone="success"
+        />
+        <StatCard
+          label="Budget Health"
+          value={overBudgetCount === 0 ? "100% On Track" : `${overBudgetCount} Over Budget`}
+          hint={
+            overBudgetCount > 0 ? "Requires manager review" : "All projects within planned hours"
+          }
+          icon={AlertTriangle}
+          tone={overBudgetCount > 0 ? "warning" : "success"}
+        />
+      </div>
+
+      {/* Filter and Search Bar */}
+      <div className="flex flex-col gap-2.5 sm:flex-row">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
           <Input
             value={q}
             onChange={(e) => setQ(e.target.value)}
-            placeholder="Search projects or clients"
+            placeholder="Search projects or clients..."
             className="pl-9"
             aria-label="Search projects"
           />
         </div>
         <Select value={client} onValueChange={setClient}>
-          <SelectTrigger className="sm:w-52" aria-label="Filter by client">
-            <SelectValue />
+          <SelectTrigger className="sm:w-56" aria-label="Filter by client">
+            <SelectValue placeholder="All clients" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All clients</SelectItem>
+            <SelectItem value="internal">Internal only</SelectItem>
             {s.clients.map((c) => (
               <SelectItem key={c.id} value={c.id}>
                 {c.name}
@@ -100,8 +164,8 @@ function Projects() {
           </SelectContent>
         </Select>
         <Select value={status} onValueChange={setStatus}>
-          <SelectTrigger className="sm:w-40" aria-label="Filter by status">
-            <SelectValue />
+          <SelectTrigger className="sm:w-44" aria-label="Filter by status">
+            <SelectValue placeholder="All statuses" />
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">All statuses</SelectItem>
@@ -112,67 +176,94 @@ function Projects() {
         </Select>
       </div>
 
+      {/* Table view */}
       {list.length === 0 ? (
         <EmptyState
           icon={FolderOpen}
           title="No projects found"
-          text="Try a different search or filter."
+          text="Try adjusting your search criteria or create a new project."
+          action={
+            <Button onClick={() => setEditing("new")}>
+              <Plus className="size-4" /> Create project
+            </Button>
+          }
         />
       ) : (
-        <div className="overflow-x-auto rounded-xl border bg-card shadow-card">
-          <table className="w-full min-w-[860px] text-sm">
+        <div className="overflow-x-auto rounded-2xl border bg-card shadow-card">
+          <table className="w-full min-w-[880px] text-sm">
             <thead className="bg-muted/60 text-left text-xs uppercase tracking-wide text-muted-foreground">
               <tr>
-                <th className="px-5 py-3 font-medium">Project</th>
-                <th className="px-5 py-3 font-medium">Manager</th>
-                <th className="px-5 py-3 font-medium">Status</th>
-                <th className="px-5 py-3 font-medium">Logged / budget</th>
-                <th className="px-5 py-3 text-right font-medium">Rate</th>
-                <th className="px-5 py-3" />
+                <th className="px-5 py-3 font-semibold">Project & Client</th>
+                <th className="px-5 py-3 font-semibold">Manager</th>
+                <th className="px-5 py-3 font-semibold">Status</th>
+                <th className="px-5 py-3 font-semibold">Logged / Budget</th>
+                <th className="px-5 py-3 text-right font-semibold">Billable Rate</th>
+                <th className="px-5 py-3 text-right font-semibold">Est. Value</th>
+                <th className="px-5 py-3 text-right font-semibold">Action</th>
               </tr>
             </thead>
             <tbody className="divide-y">
               {list.map((p) => {
                 const logged = loggedHours(s, p.id);
-                const pct = p.budgetHours ? Math.min(100, (logged / p.budgetHours) * 100) : 0;
+                const hasBudget = p.budgetHours > 0;
+                const pct = hasBudget ? Math.min(100, (logged / p.budgetHours) * 100) : 0;
+                const isOver = hasBudget && logged > p.budgetHours;
+                const estValue = logged * (p.rate || 0);
+
                 return (
-                  <tr key={p.id} className="hover:bg-muted/30">
-                    <td className="px-5 py-3">
-                      <p className="font-medium">{p.name}</p>
+                  <tr key={p.id} className="hover:bg-muted/30 transition-colors">
+                    <td className="px-5 py-3.5">
+                      <p className="font-semibold text-foreground">{p.name}</p>
                       <p className="text-xs text-muted-foreground">
                         {s.clients.find((c) => c.id === p.clientId)?.name ?? "Internal"}
                       </p>
                     </td>
-                    <td className="px-5 py-3">
+                    <td className="px-5 py-3.5 text-foreground font-medium">
                       {s.members.find((m) => m.id === p.managerId)?.name ?? "—"}
                     </td>
-                    <td className="px-5 py-3">
+                    <td className="px-5 py-3.5">
                       <StatusBadge status={p.status} />
                     </td>
-                    <td className="w-56 px-5 py-3">
-                      <p className="text-xs tabular">
-                        <span className="font-semibold">{formatHours(logged)}</span> /{" "}
-                        {p.budgetHours ? `${p.budgetHours} h` : "no budget"}
-                      </p>
-                      {p.budgetHours > 0 && (
-                        <Progress
-                          value={pct}
-                          className="mt-1.5 h-1.5"
-                          aria-label={`${pct.toFixed(0)}% of budget used`}
-                        />
+                    <td className="w-64 px-5 py-3.5">
+                      <div className="flex items-center justify-between text-xs tabular mb-1">
+                        <span className="font-semibold text-foreground">
+                          {formatHours(logged, fmt)}h
+                        </span>
+                        <span className="text-muted-foreground">
+                          {hasBudget ? `${p.budgetHours}h` : "No limit"}
+                        </span>
+                        {isOver && (
+                          <span className="rounded bg-destructive/10 px-1.5 py-0.2 text-[10px] font-bold text-destructive">
+                            Over budget
+                          </span>
+                        )}
+                      </div>
+                      {hasBudget && (
+                        <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                          <div
+                            className={cn(
+                              "h-full rounded-full transition-all duration-300",
+                              isOver ? "bg-destructive" : pct >= 80 ? "bg-warning" : "bg-primary",
+                            )}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
                       )}
                     </td>
-                    <td className="px-5 py-3 text-right tabular">
-                      {p.rate ? formatMoney(p.rate, cur) : "—"}
+                    <td className="px-5 py-3.5 text-right tabular font-medium">
+                      {p.rate ? formatMoney(p.rate, cur) : "—"}/h
                     </td>
-                    <td className="px-5 py-3 text-right">
+                    <td className="px-5 py-3.5 text-right tabular font-bold text-foreground">
+                      {estValue > 0 ? formatMoney(estValue, cur) : "—"}
+                    </td>
+                    <td className="px-5 py-3.5 text-right">
                       <Button
                         size="icon"
                         variant="ghost"
                         aria-label={`Edit ${p.name}`}
                         onClick={() => setEditing(p)}
                       >
-                        <Pencil />
+                        <Pencil className="size-4 text-muted-foreground" />
                       </Button>
                     </td>
                   </tr>
@@ -182,70 +273,94 @@ function Projects() {
           </table>
         </div>
       )}
+
+      {/* Edit / Create Dialog */}
       {editing && (
-        <ProjectDialog
+        <ProjectEditor
           project={editing === "new" ? null : editing}
           onClose={() => setEditing(null)}
+          state={s}
         />
       )}
-    </>
+    </div>
   );
 }
 
-function ProjectDialog({ project, onClose }: { project: Project | null; onClose: () => void }) {
-  const s = useDemo((x) => x);
+function ProjectEditor({
+  project,
+  onClose,
+  state,
+}: {
+  project: Project | null;
+  onClose: () => void;
+  state: ReturnType<typeof useDemo>;
+}) {
   const [f, setF] = useState({
     name: project?.name ?? "",
-    clientId: project?.clientId || "internal",
-    managerId: project?.managerId ?? "",
-    status: project?.status ?? "active",
-    budgetHours: String(project?.budgetHours ?? ""),
-    rate: String(project?.rate ?? ""),
-    tasks: (project?.tasks ?? ["Development", "Meetings"]).join(", "),
+    clientId: project?.clientId ?? "",
+    managerId: project?.managerId ?? state.members.find((m) => m.role === "Manager")?.id ?? "",
+    status: project?.status ?? ("active" as const),
+    budgetHours: String(project?.budgetHours ?? 100),
+    rate: String(project?.rate ?? 2500),
+    tasks: project?.tasks.join(", ") ?? "Development, Code review, Meetings",
   });
   const [errors, setErrors] = useState<Record<string, string>>({});
-  const set = (k: keyof typeof f, v: string) => setF((x) => ({ ...x, [k]: v }));
-  const submit = (e: React.FormEvent) => {
+
+  const save = (e: React.FormEvent) => {
     e.preventDefault();
     const r = schema.safeParse(f);
-    if (!r.success)
+    if (!r.success) {
       return setErrors(Object.fromEntries(r.error.issues.map((i) => [i.path[0], i.message])));
+    }
+    const tasks = r.data.tasks
+      .split(",")
+      .map((t) => t.trim())
+      .filter(Boolean);
+
     upsertProject({
       id: project?.id ?? uid("p"),
       ...r.data,
-      clientId: r.data.clientId === "internal" ? "" : r.data.clientId,
-      tasks: r.data.tasks
-        .split(",")
-        .map((t) => t.trim())
-        .filter(Boolean),
+      tasks: tasks.length ? tasks : ["General"],
     });
-    toast.success(project ? "Project updated" : "Project created");
+
+    toast.success(project ? "Project updated" : "Project created successfully");
     onClose();
   };
-  const err = (k: string) => errors[k] && <p className="text-xs text-destructive">{errors[k]}</p>;
+
   return (
     <Dialog open onOpenChange={(o) => !o && onClose()}>
-      <DialogContent>
+      <DialogContent className="max-w-md">
         <DialogHeader>
-          <DialogTitle>{project ? "Edit project" : "New project"}</DialogTitle>
-          <DialogDescription>Stored in this browser's demo workspace only.</DialogDescription>
+          <DialogTitle>{project ? "Edit Project" : "New Project"}</DialogTitle>
+          <DialogDescription>
+            Configure project parameters, manager allocation, hourly rates and tasks.
+          </DialogDescription>
         </DialogHeader>
-        <form onSubmit={submit} className="space-y-3" noValidate>
+        <form onSubmit={save} className="space-y-3.5 py-2" noValidate>
           <div className="space-y-1.5">
-            <Label htmlFor="pn">Project name</Label>
-            <Input id="pn" value={f.name} onChange={(e) => set("name", e.target.value)} />
-            {err("name")}
+            <Label htmlFor="project-name">Project name</Label>
+            <Input
+              id="project-name"
+              value={f.name}
+              onChange={(e) => setF({ ...f, name: e.target.value })}
+              aria-invalid={!!errors["name"]}
+            />
+            {errors["name"] && <p className="text-xs text-destructive">{errors["name"]}</p>}
           </div>
-          <div className="grid gap-3 sm:grid-cols-2">
+
+          <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Client</Label>
-              <Select value={f.clientId} onValueChange={(v) => set("clientId", v)}>
-                <SelectTrigger aria-label="Client">
-                  <SelectValue />
+              <Select
+                value={f.clientId || "internal"}
+                onValueChange={(v) => setF({ ...f, clientId: v === "internal" ? "" : v })}
+              >
+                <SelectTrigger>
+                  <SelectValue placeholder="Select client" />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="internal">Internal</SelectItem>
-                  {s.clients.map((c) => (
+                  <SelectItem value="internal">Internal (no client)</SelectItem>
+                  {state.clients.map((c) => (
                     <SelectItem key={c.id} value={c.id}>
                       {c.name}
                     </SelectItem>
@@ -253,15 +368,16 @@ function ProjectDialog({ project, onClose }: { project: Project | null; onClose:
                 </SelectContent>
               </Select>
             </div>
+
             <div className="space-y-1.5">
-              <Label>Project manager</Label>
-              <Select value={f.managerId} onValueChange={(v) => set("managerId", v)}>
-                <SelectTrigger aria-label="Project manager">
-                  <SelectValue placeholder="Select" />
+              <Label>Project Manager</Label>
+              <Select value={f.managerId} onValueChange={(v) => setF({ ...f, managerId: v })}>
+                <SelectTrigger>
+                  <SelectValue placeholder="Select manager" />
                 </SelectTrigger>
                 <SelectContent>
-                  {s.members
-                    .filter((m) => m.status !== "inactive")
+                  {state.members
+                    .filter((m) => m.role === "Manager" || m.role === "Admin")
                     .map((m) => (
                       <SelectItem key={m.id} value={m.id}>
                         {m.name}
@@ -269,52 +385,62 @@ function ProjectDialog({ project, onClose }: { project: Project | null; onClose:
                     ))}
                 </SelectContent>
               </Select>
-              {err("managerId")}
             </div>
+          </div>
+
+          <div className="grid grid-cols-3 gap-3">
             <div className="space-y-1.5">
-              <Label htmlFor="pb">Budgeted hours</Label>
+              <Label htmlFor="budget">Budget (hrs)</Label>
               <Input
-                id="pb"
-                inputMode="numeric"
+                id="budget"
+                type="number"
                 value={f.budgetHours}
-                onChange={(e) => set("budgetHours", e.target.value)}
+                onChange={(e) => setF({ ...f, budgetHours: e.target.value })}
               />
-              {err("budgetHours")}
             </div>
             <div className="space-y-1.5">
-              <Label htmlFor="pr">Billable rate / hour ({s.settings.currency})</Label>
+              <Label htmlFor="rate">Rate ({state.settings.currency}/h)</Label>
               <Input
-                id="pr"
-                inputMode="numeric"
+                id="rate"
+                type="number"
                 value={f.rate}
-                onChange={(e) => set("rate", e.target.value)}
+                onChange={(e) => setF({ ...f, rate: e.target.value })}
               />
-              {err("rate")}
+            </div>
+            <div className="space-y-1.5">
+              <Label>Status</Label>
+              <Select
+                value={f.status}
+                onValueChange={(v: "active" | "on-hold" | "completed") => setF({ ...f, status: v })}
+              >
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="active">Active</SelectItem>
+                  <SelectItem value="on-hold">On hold</SelectItem>
+                  <SelectItem value="completed">Completed</SelectItem>
+                </SelectContent>
+              </Select>
             </div>
           </div>
+
           <div className="space-y-1.5">
-            <Label>Status</Label>
-            <Select value={f.status} onValueChange={(v) => set("status", v)}>
-              <SelectTrigger aria-label="Status">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="active">Active</SelectItem>
-                <SelectItem value="on-hold">On hold</SelectItem>
-                <SelectItem value="completed">Completed</SelectItem>
-              </SelectContent>
-            </Select>
+            <Label htmlFor="tasks">Tasks (comma-separated)</Label>
+            <Input
+              id="tasks"
+              value={f.tasks}
+              onChange={(e) => setF({ ...f, tasks: e.target.value })}
+              placeholder="Development, Design, Code review, QA"
+            />
+            {errors["tasks"] && <p className="text-xs text-destructive">{errors["tasks"]}</p>}
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="pt">Tasks (comma separated)</Label>
-            <Input id="pt" value={f.tasks} onChange={(e) => set("tasks", e.target.value)} />
-            {err("tasks")}
-          </div>
-          <DialogFooter>
+
+          <DialogFooter className="pt-2">
             <Button type="button" variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button type="submit">{project ? "Save changes" : "Create project"}</Button>
+            <Button type="submit">Save project</Button>
           </DialogFooter>
         </form>
       </DialogContent>

@@ -1,0 +1,6 @@
+{
+  "name": "Aurelia TimeFlow",
+  "description": "Timesheets, approvals and billable-hour reporting for IT services teams.",
+  "requestFramePermissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

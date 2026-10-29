@@ -31,7 +31,9 @@ export function formatHours(h: number, fmt: TimeFormat = "decimal") {
 }
 
 /** Parse one cell of hours. Empty = 0. Rules: number, 0–24, quarter-hour steps. */
-export function parseHours(raw: string): { ok: true; value: number } | { ok: false; error: string } {
+export function parseHours(
+  raw: string,
+): { ok: true; value: number } | { ok: false; error: string } {
   const v = raw.trim();
   if (v === "") return { ok: true, value: 0 };
   let n: number;
@@ -46,7 +48,8 @@ export function parseHours(raw: string): { ok: true; value: number } | { ok: fal
   }
   if (n < 0) return { ok: false, error: "Hours cannot be negative" };
   if (n > 24) return { ok: false, error: "Max 24 hours per day" };
-  if (Math.abs(n * 4 - Math.round(n * 4)) > 1e-6) return { ok: false, error: "Use 15-minute steps (0.25)" };
+  if (Math.abs(n * 4 - Math.round(n * 4)) > 1e-6)
+    return { ok: false, error: "Use 15-minute steps (0.25)" };
   return { ok: true, value: n };
 }
 

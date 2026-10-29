@@ -7,14 +7,15 @@ Product goal: make employee time entry, manager approvals, project/client tracki
 Brand/design: trustworthy modern enterprise SaaS, clean light interface, navy/indigo accents, subtle teal highlights, generous spacing, clear typography, responsive desktop/tablet/mobile. Brand text "Aurelia TimeFlow" with "by Aurelia Business Services". No fake customer logos, fake testimonials, unsupported compliance claims, or claims that the app is production-certified.
 
 Build these pages with a clear left sidebar and top navigation:
-1) Overview dashboard with summary cards (hours this week, pending approvals, billable utilization, active projects), weekly hours chart, recent timesheets, pending approvals, and a clear date range.
-2) My Timesheet: weekly grid with days Monday–Sunday; add/edit/delete time entries; select client, project, task; hours; billable/non-billable; notes; validation to prevent negative or invalid hours; weekly total; save draft and submit for approval. Use realistic sample data.
-3) Approvals: manager view listing submitted timesheets, employee, week, total hours, submitted date and status; open details; approve or reject with comments; status changes visibly in UI.
-4) Projects: searchable/filterable list with client, project, project manager, status, budgeted hours, logged hours, billable rate (only display demo data); create/edit project dialog.
-5) Clients: client list with contact, active projects and status; add/edit client dialog.
-6) Reports: date filter, project/client/employee breakdown, billable vs non-billable hours, utilization chart and export to CSV that actually downloads a CSV.
-7) Team: team members and role/status list; invite member UI with validation and a clear demo-only notice if invitations do not actually send.
-8) Settings: company profile, week starts Monday, time display preferences, currency setting with INR/USD options, and a visible demo mode label.
+
+1. Overview dashboard with summary cards (hours this week, pending approvals, billable utilization, active projects), weekly hours chart, recent timesheets, pending approvals, and a clear date range.
+2. My Timesheet: weekly grid with days Monday–Sunday; add/edit/delete time entries; select client, project, task; hours; billable/non-billable; notes; validation to prevent negative or invalid hours; weekly total; save draft and submit for approval. Use realistic sample data.
+3. Approvals: manager view listing submitted timesheets, employee, week, total hours, submitted date and status; open details; approve or reject with comments; status changes visibly in UI.
+4. Projects: searchable/filterable list with client, project, project manager, status, budgeted hours, logged hours, billable rate (only display demo data); create/edit project dialog.
+5. Clients: client list with contact, active projects and status; add/edit client dialog.
+6. Reports: date filter, project/client/employee breakdown, billable vs non-billable hours, utilization chart and export to CSV that actually downloads a CSV.
+7. Team: team members and role/status list; invite member UI with validation and a clear demo-only notice if invitations do not actually send.
+8. Settings: company profile, week starts Monday, time display preferences, currency setting with INR/USD options, and a visible demo mode label.
 
 Behavior: Make navigation and major interactions work. Use seeded demo data and persistent client-side state/local storage if backend/auth is not configured. The demo should be easy to explore without needing login; include a "Demo workspace" indicator and a reset demo data action. Clearly distinguish demo data from real customer data. No real employee or confidential data. Do not implement fake authentication that appears secure. If real auth/database can be configured safely within the available stack, explain what is configured and what still needs setup; otherwise keep this as a local demo prototype and don't imply multi-tenant production readiness.
 

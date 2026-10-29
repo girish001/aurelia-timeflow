@@ -9,7 +9,9 @@ import { canAccess, pageFromPath, ROLE_LABEL } from "@/lib/rules";
 export const Route = createFileRoute("/app")({
   ssr: false,
   pendingComponent: () => (
-    <div className="grid min-h-screen place-items-center text-sm text-muted-foreground">Loading demo workspace…</div>
+    <div className="grid min-h-screen place-items-center text-sm text-muted-foreground">
+      Loading demo workspace…
+    </div>
   ),
   component: AppLayout,
 });
@@ -24,12 +26,24 @@ function AppLayout() {
   const allowed = !page || canAccess(me.role, page);
   return (
     <AppShell>
-      {allowed ? <Outlet /> : (
-        <div className="mx-auto max-w-md rounded-xl border bg-card p-8 text-center shadow-card" role="alert">
-          <span className="mx-auto grid size-11 place-items-center rounded-full bg-destructive/10 text-destructive"><ShieldOff className="size-5" /></span>
+      {allowed ? (
+        <Outlet />
+      ) : (
+        <div
+          className="mx-auto max-w-md rounded-xl border bg-card p-8 text-center shadow-card"
+          role="alert"
+        >
+          <span className="mx-auto grid size-11 place-items-center rounded-full bg-destructive/10 text-destructive">
+            <ShieldOff className="size-5" />
+          </span>
           <h1 className="mt-3 text-lg font-semibold">Not available for {ROLE_LABEL[me.role]}</h1>
-          <p className="mt-1 text-sm text-muted-foreground">This page is hidden for your demo role. (Demo guard only — real access control must be enforced on the server.)</p>
-          <Button asChild className="mt-5"><Link to="/app">Go to my dashboard</Link></Button>
+          <p className="mt-1 text-sm text-muted-foreground">
+            This page is hidden for your demo role. (Demo guard only — real access control must be
+            enforced on the server.)
+          </p>
+          <Button asChild className="mt-5">
+            <Link to="/app">Go to my dashboard</Link>
+          </Button>
         </div>
       )}
     </AppShell>

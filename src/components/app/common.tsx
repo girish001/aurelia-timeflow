@@ -2,7 +2,15 @@ import type { ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-export function PageHeader({ title, description, actions }: { title: string; description?: string; actions?: ReactNode }) {
+export function PageHeader({
+  title,
+  description,
+  actions,
+}: {
+  title: string;
+  description?: string;
+  actions?: ReactNode;
+}) {
   return (
     <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
       <div>
@@ -14,7 +22,17 @@ export function PageHeader({ title, description, actions }: { title: string; des
   );
 }
 
-export function Panel({ title, action, children, className }: { title?: ReactNode; action?: ReactNode; children: ReactNode; className?: string }) {
+export function Panel({
+  title,
+  action,
+  children,
+  className,
+}: {
+  title?: ReactNode;
+  action?: ReactNode;
+  children: ReactNode;
+  className?: string;
+}) {
   return (
     <section className={cn("rounded-xl border bg-card shadow-card", className)}>
       {title && (
@@ -28,7 +46,19 @@ export function Panel({ title, action, children, className }: { title?: ReactNod
   );
 }
 
-export function StatCard({ label, value, hint, icon: Icon, tone = "primary" }: { label: string; value: ReactNode; hint?: ReactNode; icon: LucideIcon; tone?: "primary" | "teal" | "warning" | "success" }) {
+export function StatCard({
+  label,
+  value,
+  hint,
+  icon: Icon,
+  tone = "primary",
+}: {
+  label: string;
+  value: ReactNode;
+  hint?: ReactNode;
+  icon: LucideIcon;
+  tone?: "primary" | "teal" | "warning" | "success";
+}) {
   const tones = {
     primary: "bg-secondary text-primary",
     teal: "bg-teal-soft text-accent-foreground",
@@ -63,13 +93,28 @@ const statusStyles: Record<string, string> = {
 
 export function StatusBadge({ status }: { status: string }) {
   return (
-    <span className={cn("inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium capitalize", statusStyles[status] ?? statusStyles["draft"])}>
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium capitalize",
+        statusStyles[status] ?? statusStyles["draft"],
+      )}
+    >
       {status.replace("-", " ")}
     </span>
   );
 }
 
-export function EmptyState({ icon: Icon, title, text, action }: { icon: LucideIcon; title: string; text?: string; action?: ReactNode }) {
+export function EmptyState({
+  icon: Icon,
+  title,
+  text,
+  action,
+}: {
+  icon: LucideIcon;
+  title: string;
+  text?: string;
+  action?: ReactNode;
+}) {
   return (
     <div className="flex flex-col items-center justify-center rounded-lg border border-dashed px-6 py-12 text-center">
       <span className="grid size-11 place-items-center rounded-full bg-secondary text-primary">
@@ -83,22 +128,58 @@ export function EmptyState({ icon: Icon, title, text, action }: { icon: LucideIc
 }
 
 export function Initials({ name, className }: { name: string; className?: string }) {
-  const i = name.split(" ").map((p) => p[0]).slice(0, 2).join("");
-  return <span className={cn("grid size-8 shrink-0 place-items-center rounded-full bg-secondary text-xs font-semibold text-primary", className)} aria-hidden>{i}</span>;
+  const i = name
+    .split(" ")
+    .map((p) => p[0])
+    .slice(0, 2)
+    .join("");
+  return (
+    <span
+      className={cn(
+        "grid size-8 shrink-0 place-items-center rounded-full bg-secondary text-xs font-semibold text-primary",
+        className,
+      )}
+      aria-hidden
+    >
+      {i}
+    </span>
+  );
 }
 
 export function Logo({ inverted }: { inverted?: boolean }) {
   return (
     <div className="flex items-center gap-2.5">
       <span className="grid size-8 place-items-center rounded-lg bg-teal text-navy">
-        <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" aria-hidden>
+        <svg
+          viewBox="0 0 24 24"
+          className="size-5"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2.4"
+          strokeLinecap="round"
+          aria-hidden
+        >
           <circle cx="12" cy="12" r="8.5" />
           <path d="M12 7.5V12l3 2" />
         </svg>
       </span>
       <div className="leading-tight">
-        <p className={cn("text-[0.95rem] font-bold", inverted ? "text-sidebar-accent-foreground" : "text-foreground")}>Aurelia TimeFlow</p>
-        <p className={cn("text-[0.65rem]", inverted ? "text-sidebar-foreground/70" : "text-muted-foreground")}>by Aurelia Business Services</p>
+        <p
+          className={cn(
+            "text-[0.95rem] font-bold",
+            inverted ? "text-sidebar-accent-foreground" : "text-foreground",
+          )}
+        >
+          Aurelia TimeFlow
+        </p>
+        <p
+          className={cn(
+            "text-[0.65rem]",
+            inverted ? "text-sidebar-foreground/70" : "text-muted-foreground",
+          )}
+        >
+          by Aurelia Business Services
+        </p>
       </div>
     </div>
   );

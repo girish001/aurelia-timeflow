@@ -109,6 +109,17 @@ export const dayPartEnum = pgEnum("day_part", ["full", "am", "pm"]);
 
 export const allocationStatusEnum = pgEnum("allocation_status", ["tentative", "confirmed"]);
 
+export const approvalTargetTypeEnum = pgEnum("approval_target_type", [
+  "timesheet",
+  "leave_request",
+]);
+
+export const approvalDecisionStatusEnum = pgEnum("approval_decision_status", [
+  "pending",
+  "approved",
+  "rejected",
+]);
+
 // ============================================================================
 // 2. Core Multi-Tenant & Identity Entities
 // ============================================================================
@@ -614,5 +625,31 @@ export const companyHolidays = pgTable(
   (t) => [
     uniqueIndex("company_holidays_tenant_date_uq").on(t.tenantId, t.holidayDate),
     index("company_holidays_tenant_idx").on(t.tenantId),
+  ],
+);
+
+export const approvals = pgTable(
+  "approvals",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    tenantId: uuid("tenant_id")
+      .notNull()
+      .references(() => tenants.id, { onDelete: "cascade" }),
+    targetType: approvalTargetTypeEnum("target_type").notNull(),
+    targetId: uuid("target_id").notNull(),
+    requesterMembershipId: uuid("requester_membership_id")
+      .notNull()
+      .references(() => memberships.id, { onDelete: "cascade" }),
+    approverMembershipId: uuid("approver_membership_id").references(() => memberships.id, {
+      onDelete: "set null",
+    }),
+    status: approvalDecisionStatusEnum("status").default("pending").notNull(),
+    comment: text("comment"),
+    decidedAt: timestamp("decided_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
+  },
+  (t) => [
+    index("approvals_tenant_target_idx").on(t.tenantId, t.targetType, t.targetId),
+    index("approvals_tenant_status_idx").on(t.tenantId, t.status),
   ],
 );

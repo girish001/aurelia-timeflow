@@ -1,12 +1,18 @@
 -- ============================================================================
 -- Aurelia TimeFlow Multi-Tenant SaaS Migration: 0001_initial_multi_tenant.sql
--- Enforces foreign keys, composite unique constraints, tenant indexes, and
--- PostgreSQL Row-Level Security (RLS) tenant isolation safeguards.
+-- Target: Private AWS RDS / Aurora PostgreSQL (ap-south-1, Publicly accessible = No)
+-- Execution: Transactional DDL (BEGIN ... COMMIT). Any failure rolls back atomically.
 -- ============================================================================
+
+BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
--- 1. Core Tenant & Domain Tables
+-- ============================================================================
+-- 1. Core Tenant, Identity & Governance Tables (Ordered by FK Dependencies)
+-- ============================================================================
+
+-- [1/23] tenants
 CREATE TABLE IF NOT EXISTS tenants (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   slug VARCHAR(64) NOT NULL UNIQUE,
@@ -26,6 +32,7 @@ CREATE TABLE IF NOT EXISTS tenants (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- [2/23] tenant_domains
 CREATE TABLE IF NOT EXISTS tenant_domains (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -37,6 +44,7 @@ CREATE TABLE IF NOT EXISTS tenant_domains (
   CONSTRAINT tenant_domains_no_blind_autojoin CHECK (auto_join_policy IN ('never', 'invite_only', 'sso_verified_only'))
 );
 
+-- [3/23] users
 CREATE TABLE IF NOT EXISTS users (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   email VARCHAR(255) NOT NULL UNIQUE,
@@ -51,21 +59,25 @@ CREATE TABLE IF NOT EXISTS users (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- [4/23] departments
 CREATE TABLE IF NOT EXISTS departments (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   name VARCHAR(120) NOT NULL,
   code VARCHAR(32),
-  parent_department_id UUID REFERENCES departments(id) ON DELETE SET NULL,
+  parent_department_id UUID,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  UNIQUE (tenant_id, name)
+  UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, name),
+  FOREIGN KEY (tenant_id, parent_department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL
 );
 
+-- [5/23] memberships
 CREATE TABLE IF NOT EXISTS memberships (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-  department_id UUID REFERENCES departments(id) ON DELETE SET NULL,
+  department_id UUID,
   employee_code VARCHAR(48),
   job_title VARCHAR(120) NOT NULL,
   status VARCHAR(32) NOT NULL DEFAULT 'invited',
@@ -73,9 +85,11 @@ CREATE TABLE IF NOT EXISTS memberships (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (tenant_id, user_id),
-  UNIQUE (tenant_id, id)
+  UNIQUE (tenant_id, id),
+  FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL
 );
 
+-- [6/23] roles
 CREATE TABLE IF NOT EXISTS roles (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
@@ -87,6 +101,7 @@ CREATE TABLE IF NOT EXISTS roles (
   UNIQUE NULLS NOT DISTINCT (tenant_id, key)
 );
 
+-- [7/23] permissions
 CREATE TABLE IF NOT EXISTS permissions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   code VARCHAR(96) NOT NULL UNIQUE,
@@ -94,12 +109,14 @@ CREATE TABLE IF NOT EXISTS permissions (
   description TEXT NOT NULL
 );
 
+-- [8/23] role_permissions
 CREATE TABLE IF NOT EXISTS role_permissions (
   role_id UUID NOT NULL REFERENCES roles(id) ON DELETE CASCADE,
   permission_id UUID NOT NULL REFERENCES permissions(id) ON DELETE CASCADE,
   PRIMARY KEY (role_id, permission_id)
 );
 
+-- [9/23] membership_roles
 CREATE TABLE IF NOT EXISTS membership_roles (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -108,9 +125,11 @@ CREATE TABLE IF NOT EXISTS membership_roles (
   assigned_by_membership_id UUID,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (tenant_id, membership_id, role_id),
-  FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE
+  FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, assigned_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
 );
 
+-- [10/23] reporting_lines
 CREATE TABLE IF NOT EXISTS reporting_lines (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -126,21 +145,26 @@ CREATE TABLE IF NOT EXISTS reporting_lines (
   FOREIGN KEY (tenant_id, manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE
 );
 
+-- [11/23] invitations
 CREATE TABLE IF NOT EXISTS invitations (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   email VARCHAR(255) NOT NULL,
   token_hash VARCHAR(128) NOT NULL UNIQUE,
   role_keys_json JSONB NOT NULL DEFAULT '["employee"]'::jsonb,
-  department_id UUID REFERENCES departments(id) ON DELETE SET NULL,
+  department_id UUID,
   reporting_manager_membership_id UUID,
   invited_by_membership_id UUID,
   status VARCHAR(32) NOT NULL DEFAULT 'pending',
   expires_at TIMESTAMPTZ NOT NULL,
   accepted_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL,
+  FOREIGN KEY (tenant_id, reporting_manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL,
+  FOREIGN KEY (tenant_id, invited_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
 );
 
+-- [12/23] identity_connections
 CREATE TABLE IF NOT EXISTS identity_connections (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -157,6 +181,7 @@ CREATE TABLE IF NOT EXISTS identity_connections (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- [13/23] subscriptions
 CREATE TABLE IF NOT EXISTS subscriptions (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL UNIQUE REFERENCES tenants(id) ON DELETE CASCADE,
@@ -171,6 +196,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- [14/23] audit_logs
 CREATE TABLE IF NOT EXISTS audit_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -184,10 +210,15 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   details_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   ip_address VARCHAR(64),
   user_agent TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (tenant_id, actor_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
 );
 
+-- ============================================================================
 -- 2. Tenant Operational Tables with Composite Tenant Foreign Keys
+-- ============================================================================
+
+-- [15/23] clients
 CREATE TABLE IF NOT EXISTS clients (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -201,6 +232,7 @@ CREATE TABLE IF NOT EXISTS clients (
   UNIQUE (tenant_id, id)
 );
 
+-- [16/23] projects
 CREATE TABLE IF NOT EXISTS projects (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -217,6 +249,7 @@ CREATE TABLE IF NOT EXISTS projects (
   FOREIGN KEY (tenant_id, project_manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE RESTRICT
 );
 
+-- [17/23] project_memberships
 CREATE TABLE IF NOT EXISTS project_memberships (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -231,27 +264,236 @@ CREATE TABLE IF NOT EXISTS project_memberships (
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE
 );
 
--- 3. Row-Level Security (RLS) Defense-in-Depth
-ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+-- [18/23] timesheets
+CREATE TABLE IF NOT EXISTS timesheets (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  membership_id UUID NOT NULL,
+  week_start DATE NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'draft',
+  submitted_at TIMESTAMPTZ,
+  reviewed_at TIMESTAMPTZ,
+  reviewed_by_membership_id UUID,
+  review_comment TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, id),
+  UNIQUE (tenant_id, membership_id, week_start),
+  FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+);
+
+-- [19/23] timesheet_entries
+CREATE TABLE IF NOT EXISTS timesheet_entries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  timesheet_id UUID NOT NULL,
+  project_id UUID NOT NULL,
+  task_name VARCHAR(120) NOT NULL,
+  hours_by_day_json JSONB NOT NULL DEFAULT '[0,0,0,0,0,0,0]'::jsonb,
+  billable BOOLEAN NOT NULL DEFAULT TRUE,
+  notes TEXT NOT NULL DEFAULT '',
+  FOREIGN KEY (tenant_id, timesheet_id) REFERENCES timesheets(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, project_id) REFERENCES projects(tenant_id, id) ON DELETE RESTRICT
+);
+
+-- [20/23] leave_requests
+CREATE TABLE IF NOT EXISTS leave_requests (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  membership_id UUID NOT NULL,
+  type VARCHAR(32) NOT NULL,
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  partial VARCHAR(16) NOT NULL DEFAULT 'full',
+  reason TEXT NOT NULL DEFAULT '',
+  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  reviewed_by_membership_id UUID,
+  review_comment TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tenant_id, id),
+  FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+);
+
+-- [21/23] approvals
+CREATE TABLE IF NOT EXISTS approvals (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  target_type VARCHAR(32) NOT NULL,
+  target_id UUID NOT NULL,
+  requester_membership_id UUID NOT NULL,
+  approver_membership_id UUID,
+  status VARCHAR(32) NOT NULL DEFAULT 'pending',
+  comment TEXT,
+  decided_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (tenant_id, requester_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, approver_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+);
+
+-- [22/23] resource_allocations
+CREATE TABLE IF NOT EXISTS resource_allocations (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  membership_id UUID NOT NULL,
+  project_id UUID NOT NULL,
+  allocation_date DATE NOT NULL,
+  hours NUMERIC(4,2) NOT NULL,
+  status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
+  FOREIGN KEY (tenant_id, project_id) REFERENCES projects(tenant_id, id) ON DELETE CASCADE
+);
+
+-- [23/23] company_holidays
+CREATE TABLE IF NOT EXISTS company_holidays (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+  name VARCHAR(120) NOT NULL,
+  holiday_date DATE NOT NULL,
+  holiday_type VARCHAR(32) NOT NULL DEFAULT 'national',
+  mandatory BOOLEAN NOT NULL DEFAULT TRUE,
+  description TEXT,
+  UNIQUE (tenant_id, holiday_date)
+);
+
+-- ============================================================================
+-- 3. Performance & Tenant Scoping Indexes (22 Indexes)
+-- ============================================================================
+
+CREATE INDEX IF NOT EXISTS tenants_status_idx ON tenants (status);
+CREATE INDEX IF NOT EXISTS tenant_domains_tenant_idx ON tenant_domains (tenant_id);
+CREATE INDEX IF NOT EXISTS departments_tenant_idx ON departments (tenant_id);
+CREATE INDEX IF NOT EXISTS memberships_tenant_status_idx ON memberships (tenant_id, status);
+CREATE INDEX IF NOT EXISTS memberships_user_idx ON memberships (user_id);
+CREATE INDEX IF NOT EXISTS roles_tenant_idx ON roles (tenant_id);
+CREATE INDEX IF NOT EXISTS membership_roles_tenant_member_idx ON membership_roles (tenant_id, membership_id);
+CREATE INDEX IF NOT EXISTS reporting_lines_manager_idx ON reporting_lines (tenant_id, manager_membership_id);
+CREATE INDEX IF NOT EXISTS reporting_lines_subordinate_idx ON reporting_lines (tenant_id, subordinate_membership_id);
+CREATE INDEX IF NOT EXISTS invitations_tenant_email_idx ON invitations (tenant_id, email);
+CREATE INDEX IF NOT EXISTS identity_connections_tenant_idx ON identity_connections (tenant_id);
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_created_idx ON audit_logs (tenant_id, created_at);
+CREATE INDEX IF NOT EXISTS audit_logs_tenant_category_idx ON audit_logs (tenant_id, category);
+CREATE INDEX IF NOT EXISTS clients_tenant_idx ON clients (tenant_id);
+CREATE INDEX IF NOT EXISTS projects_tenant_idx ON projects (tenant_id);
+CREATE INDEX IF NOT EXISTS projects_tenant_pm_idx ON projects (tenant_id, project_manager_membership_id);
+CREATE INDEX IF NOT EXISTS project_memberships_member_idx ON project_memberships (tenant_id, membership_id);
+CREATE INDEX IF NOT EXISTS timesheets_tenant_status_idx ON timesheets (tenant_id, status);
+CREATE INDEX IF NOT EXISTS timesheet_entries_tenant_sheet_idx ON timesheet_entries (tenant_id, timesheet_id);
+CREATE INDEX IF NOT EXISTS timesheet_entries_tenant_project_idx ON timesheet_entries (tenant_id, project_id);
+CREATE INDEX IF NOT EXISTS leave_requests_tenant_member_idx ON leave_requests (tenant_id, membership_id);
+CREATE INDEX IF NOT EXISTS approvals_tenant_target_idx ON approvals (tenant_id, target_type, target_id);
+CREATE INDEX IF NOT EXISTS approvals_tenant_status_idx ON approvals (tenant_id, status);
+CREATE INDEX IF NOT EXISTS resource_allocations_tenant_date_idx ON resource_allocations (tenant_id, allocation_date);
+CREATE INDEX IF NOT EXISTS resource_allocations_tenant_project_idx ON resource_allocations (tenant_id, project_id);
+CREATE INDEX IF NOT EXISTS company_holidays_tenant_idx ON company_holidays (tenant_id);
+
+-- ============================================================================
+-- 4. Row-Level Security (RLS) Defense-in-Depth (17 Tenant-Scoped Tables)
+-- ============================================================================
+
+ALTER TABLE tenant_domains ENABLE ROW LEVEL SECURITY;
 ALTER TABLE departments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
 ALTER TABLE membership_roles ENABLE ROW LEVEL SECURITY;
 ALTER TABLE reporting_lines ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE identity_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
 ALTER TABLE project_memberships ENABLE ROW LEVEL SECURITY;
-ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE timesheets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE timesheet_entries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE resource_allocations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE company_holidays ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS tenant_isolation_tenant_domains ON tenant_domains;
+CREATE POLICY tenant_isolation_tenant_domains ON tenant_domains
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_departments ON departments;
+CREATE POLICY tenant_isolation_departments ON departments
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_memberships ON memberships;
 CREATE POLICY tenant_isolation_memberships ON memberships
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 
-CREATE POLICY tenant_isolation_clients ON clients
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+DROP POLICY IF EXISTS tenant_isolation_membership_roles ON membership_roles;
+CREATE POLICY tenant_isolation_membership_roles ON membership_roles
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 
-CREATE POLICY tenant_isolation_projects ON projects
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+DROP POLICY IF EXISTS tenant_isolation_reporting_lines ON reporting_lines;
+CREATE POLICY tenant_isolation_reporting_lines ON reporting_lines
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 
-CREATE POLICY tenant_isolation_project_memberships ON project_memberships
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+DROP POLICY IF EXISTS tenant_isolation_invitations ON invitations;
+CREATE POLICY tenant_isolation_invitations ON invitations
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
 
+DROP POLICY IF EXISTS tenant_isolation_identity_connections ON identity_connections;
+CREATE POLICY tenant_isolation_identity_connections ON identity_connections
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_audit_logs ON audit_logs;
 CREATE POLICY tenant_isolation_audit_logs ON audit_logs
-  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_clients ON clients;
+CREATE POLICY tenant_isolation_clients ON clients
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_projects ON projects;
+CREATE POLICY tenant_isolation_projects ON projects
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_project_memberships ON project_memberships;
+CREATE POLICY tenant_isolation_project_memberships ON project_memberships
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_timesheets ON timesheets;
+CREATE POLICY tenant_isolation_timesheets ON timesheets
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_timesheet_entries ON timesheet_entries;
+CREATE POLICY tenant_isolation_timesheet_entries ON timesheet_entries
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_leave_requests ON leave_requests;
+CREATE POLICY tenant_isolation_leave_requests ON leave_requests
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_approvals ON approvals;
+CREATE POLICY tenant_isolation_approvals ON approvals
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_resource_allocations ON resource_allocations;
+CREATE POLICY tenant_isolation_resource_allocations ON resource_allocations
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+DROP POLICY IF EXISTS tenant_isolation_company_holidays ON company_holidays;
+CREATE POLICY tenant_isolation_company_holidays ON company_holidays
+  USING (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid)
+  WITH CHECK (tenant_id = NULLIF(current_setting('app.current_tenant_id', true), '')::uuid);
+
+COMMIT;

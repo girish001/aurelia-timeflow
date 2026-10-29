@@ -135,4 +135,19 @@ export const API_ROUTE_CONTRACTS: ApiRouteContract[] = [
     requiredPermission: "audit:read:tenant",
     description: "Returns immutable server-recorded tenant audit trail events.",
   },
+  {
+    method: "GET",
+    path: "/api/v1/tenants/:tenantId/approvals",
+    scope: "tenant_scoped",
+    requiredPermission: "timesheet:approve:team",
+    description:
+      "Lists pending and decided timesheet and leave approval records scoped to the caller's tenant and reporting/project authority.",
+  },
+  {
+    method: "GET",
+    path: "/api/v1/health/db",
+    scope: "public",
+    description:
+      "Returns credential-redacted PostgreSQL connectivity, SSL enforcement, and latency health status.",
+  },
 ];

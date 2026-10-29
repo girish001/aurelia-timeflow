@@ -291,9 +291,16 @@ export function Team() {
                   <td className="px-5 py-3.5">
                     <Select
                       value={m.role}
-                      disabled={m.id === CURRENT_USER_ID}
+                      disabled={m.id === CURRENT_USER_ID || me.role !== "Admin"}
                       onValueChange={(v) => {
                         updateMember(m.id, { role: v as Role });
+                        addAuditLog({
+                          actorId: me.id,
+                          actorName: me.name,
+                          action: "Member Role Updated",
+                          category: "member",
+                          details: `Updated ${m.name}'s role to ${ROLE_LABEL[v as Role]}`,
+                        });
                         toast.success(`${m.name}'s role updated to ${ROLE_LABEL[v as Role]}`);
                       }}
                     >
@@ -319,24 +326,39 @@ export function Team() {
                     <StatusBadge status={m.status} />
                   </td>
                   <td className="px-5 py-3.5 text-right">
-                    {m.status === "invited" ? (
+                    {me.role === "Admin" && m.status === "invited" ? (
                       <Button
                         variant="outline"
                         size="sm"
                         onClick={() => {
                           updateMember(m.id, { status: "active" });
+                          addAuditLog({
+                            actorId: me.id,
+                            actorName: me.name,
+                            action: "Member Activated",
+                            category: "member",
+                            details: `Activated invited member ${m.name} (${m.email})`,
+                          });
                           toast.success(`${m.name} marked as active`);
                         }}
                       >
                         Activate
                       </Button>
-                    ) : m.id !== CURRENT_USER_ID ? (
+                    ) : me.role === "Admin" && m.id !== CURRENT_USER_ID ? (
                       <Button
                         variant="ghost"
                         size="sm"
                         onClick={() => {
                           const nextStatus = m.status === "active" ? "inactive" : "active";
                           updateMember(m.id, { status: nextStatus });
+                          addAuditLog({
+                            actorId: me.id,
+                            actorName: me.name,
+                            action:
+                              nextStatus === "active" ? "Member Reactivated" : "Member Deactivated",
+                            category: "member",
+                            details: `Changed ${m.name}'s status to ${nextStatus}`,
+                          });
                           toast.success(`${m.name} marked as ${nextStatus}`);
                         }}
                       >

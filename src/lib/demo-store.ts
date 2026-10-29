@@ -940,20 +940,44 @@ export function upsertTimesheet(t: Timesheet) {
       : [...s.timesheets, t],
   }));
 }
-export function reviewTimesheet(id: string, decision: "approved" | "rejected", comment: string) {
-  setState((s) => ({
-    ...s,
-    timesheets: s.timesheets.map((t) =>
-      t.id === id
-        ? {
-            ...t,
-            status: decision,
-            reviewComment: comment || undefined,
-            reviewedAt: isoDay(new Date()),
-          }
-        : t,
-    ),
-  }));
+export function reviewTimesheet(
+  id: string,
+  decision: "approved" | "rejected",
+  comment: string,
+  reviewerId?: string,
+  reviewerName?: string,
+) {
+  const today = isoDay(new Date());
+  setState((s) => {
+    const ts = s.timesheets.find((x) => x.id === id);
+    const memberName = s.members.find((m) => m.id === ts?.memberId)?.name ?? "Employee";
+    const activeId = reviewerId || getSessionId() || "m1";
+    const activeName = reviewerName || s.members.find((m) => m.id === activeId)?.name || "Manager";
+    const total = ts ? sheetTotal(ts) : 0;
+    const logItem: AuditLogItem = {
+      id: uid("al"),
+      actorId: activeId,
+      actorName: activeName,
+      action: `Timesheet ${decision === "approved" ? "Approved" : "Rejected"}`,
+      category: "approval",
+      details: `${decision === "approved" ? "Approved" : "Returned"} ${memberName}'s timesheet for week ${ts?.weekStart ?? ""} (${total.toFixed(1)}h)${comment ? ` - Note: ${comment}` : ""}`,
+      timestamp: today,
+    };
+    return {
+      ...s,
+      timesheets: s.timesheets.map((t) =>
+        t.id === id
+          ? {
+              ...t,
+              status: decision,
+              reviewComment: comment || undefined,
+              reviewedAt: today,
+            }
+          : t,
+      ),
+      auditLogs: [logItem, ...(s.auditLogs ?? [])],
+    };
+  });
 }
 export function bulkReviewTimesheets(
   ids: string[],

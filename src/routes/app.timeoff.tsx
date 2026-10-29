@@ -76,17 +76,16 @@ import {
 import {
   LEAVE_LABEL,
   leaveDays,
+  leaveDaysInYear,
   leaveBalance,
   memberAllLeaveBalances,
   staffLeaveEntitlements,
   calculateMonthlyAccrual,
-  validateLeave,
-  overlapsExisting,
+  validateLeaveSubmission,
   canReviewLeave,
   decideLeave,
   teamIds,
   type LeaveInput,
-  type StaffLeaveEntitlement,
 } from "@/lib/rules";
 import { LeaveBalanceProgress } from "@/components/app/LeaveBalanceProgress";
 import { TeamLeaveCalendar } from "@/components/app/TeamLeaveCalendar";
@@ -214,20 +213,23 @@ export function TimeOffPage() {
         l.start <= todayStr &&
         l.end >= todayStr,
     );
+    const yearStart = `${currentYear}-01-01`;
+    const yearEnd = `${currentYear}-12-31`;
     const approvedTeamDays = s.leaves
       .filter(
         (l) =>
           l.status === "approved" &&
           teamMemberIds.has(l.memberId) &&
-          l.start.startsWith(String(currentYear)),
+          l.start <= yearEnd &&
+          l.end >= yearStart,
       )
-      .reduce((acc, l) => acc + leaveDays(l), 0);
+      .reduce((acc, l) => acc + leaveDaysInYear(l, currentYear, s.holidays), 0);
 
     return {
       outToday: todayLeaves.length,
       approvedDays: approvedTeamDays,
     };
-  }, [s.leaves, teamMemberIds, todayStr, currentYear]);
+  }, [s.leaves, s.holidays, teamMemberIds, todayStr, currentYear]);
 
   // Calculated days for modal (automatically excluding company holidays and weekends)
   const estimatedDays = useMemo(() => {
@@ -299,46 +301,13 @@ export function TimeOffPage() {
       reason: reason.trim(),
     };
 
-    const err = validateLeave(input, todayStr, s.holidays);
+    const err = validateLeaveSubmission(s, me.id, input, todayStr);
     if (err) {
       setRequestError(err);
       return;
     }
 
-    const overlap = overlapsExisting(s.leaves, me.id, input);
-    if (overlap) {
-      setRequestError(
-        `Conflicts with an existing ${overlap.status} request from ${overlap.start} to ${overlap.end}.`,
-      );
-      return;
-    }
-
-    // Check balance for annual, sick, or personal leave using actual working days (excluding holidays)
-    const currentBalances = memberAllLeaveBalances(s, me.id, currentYear);
     const days = leaveDays(input, s.holidays);
-    if (leaveType === "annual") {
-      if (days > currentBalances.annual.remaining) {
-        setRequestError(
-          `Insufficient annual balance: requesting ${days}d, remaining ${currentBalances.annual.remaining}d.`,
-        );
-        return;
-      }
-    } else if (leaveType === "sick") {
-      if (days > currentBalances.sick.remaining) {
-        setRequestError(
-          `Insufficient sick leave balance: requesting ${days}d, remaining ${currentBalances.sick.remaining}d.`,
-        );
-        return;
-      }
-    } else if (leaveType === "personal") {
-      if (days > currentBalances.personal.remaining) {
-        setRequestError(
-          `Insufficient personal balance: requesting ${days}d, remaining ${currentBalances.personal.remaining}d.`,
-        );
-        return;
-      }
-    }
-
     const newRequest: LeaveRequest = {
       id: uid("leave"),
       memberId: me.id,
@@ -522,8 +491,8 @@ export function TimeOffPage() {
           />
           <StatCard
             label="My Remaining Leave"
-            value={`${myBalance.remaining} days`}
-            hint={`${myBalance.used}d used of ${myBalance.entitlement}d`}
+            value={`${myBalance.available} days`}
+            hint={`${myBalance.used}d used${myBalance.pending > 0 ? `, ${myBalance.pending}d pending` : ""} of ${myBalance.entitlement}d`}
             icon={CalendarDays}
             tone="primary"
           />
@@ -669,7 +638,7 @@ export function TimeOffPage() {
                   </thead>
                   <tbody className="divide-y divide-border">
                     {filteredMyRequests.map((req) => {
-                      const days = leaveDays(req);
+                      const days = leaveDays(req, s.holidays);
                       const reviewer = req.reviewedBy ? memberLookup(req.reviewedBy)?.name : null;
                       return (
                         <tr key={req.id} className="hover:bg-muted/30 transition-colors">
@@ -796,7 +765,7 @@ export function TimeOffPage() {
                     <tbody className="divide-y divide-border">
                       {filteredPendingRequests.map((req) => {
                         const emp = memberLookup(req.memberId);
-                        const days = leaveDays(req);
+                        const days = leaveDays(req, s.holidays);
                         const bal = emp ? leaveBalance(s, emp.id, currentYear) : null;
                         return (
                           <tr key={req.id} className="hover:bg-muted/30 transition-colors">
@@ -897,7 +866,7 @@ export function TimeOffPage() {
                       .slice(0, 8)
                       .map((req) => {
                         const emp = memberLookup(req.memberId);
-                        const days = leaveDays(req);
+                        const days = leaveDays(req, s.holidays);
                         return (
                           <tr key={req.id} className="hover:bg-muted/30 transition-colors">
                             <td className="px-5 py-3 font-medium text-foreground">{emp?.name}</td>
@@ -1531,11 +1500,11 @@ export function TimeOffPage() {
                 <span className="text-muted-foreground">Estimated working days:</span>
                 {leaveType !== "unpaid" && (
                   <span className="block text-[11px] text-muted-foreground mt-0.5">
-                    Remaining balance:{" "}
+                    Available balance:{" "}
                     {
                       memberAllLeaveBalances(s, me.id, currentYear)[
                         leaveType as "annual" | "sick" | "personal"
-                      ]?.remaining
+                      ]?.available
                     }
                     d available
                   </span>
@@ -1595,7 +1564,7 @@ export function TimeOffPage() {
                 <div className="flex justify-between">
                   <span className="text-muted-foreground">Requested Period:</span>
                   <span className="font-mono text-foreground tabular-nums">
-                    {selectedReq.start} to {selectedReq.end} ({leaveDays(selectedReq)}d)
+                    {selectedReq.start} to {selectedReq.end} ({leaveDays(selectedReq, s.holidays)}d)
                   </span>
                 </div>
                 {selectedReqBalance && selectedReq.type === "annual" && (

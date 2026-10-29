@@ -53,8 +53,17 @@ const CATEGORY_COLORS: Record<string, string> = {
   client: "bg-sky-100 text-sky-800 dark:bg-sky-950 dark:text-sky-300 border-sky-200",
   member: "bg-violet-100 text-violet-800 dark:bg-violet-950 dark:text-violet-300 border-violet-200",
   settings: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-amber-200",
+  policy: "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-amber-200",
   auth: "bg-slate-100 text-slate-800 dark:bg-slate-800 dark:text-slate-300 border-slate-200",
 };
+
+function formatAuditTimestamp(ts: string): string {
+  if (!ts) return "—";
+  if (ts.length > 10) {
+    return ts.replace("T", " ").slice(0, 16);
+  }
+  return ts;
+}
 
 export function AuditPage() {
   const me = useMe();
@@ -75,9 +84,10 @@ export function AuditPage() {
       // Category filter
       if (categoryFilter !== "all" && log.category !== categoryFilter) return false;
 
-      // Date range filter
-      if (startDate && log.timestamp < startDate) return false;
-      if (endDate && log.timestamp > endDate) return false;
+      // Date range filter (inclusive of entire selected end date)
+      const logDate = log.timestamp.slice(0, 10);
+      if (startDate && logDate < startDate) return false;
+      if (endDate && logDate > endDate) return false;
 
       // Search keyword filter
       if (search.trim()) {
@@ -107,7 +117,7 @@ export function AuditPage() {
   const approvalEvents = (s.auditLogs ?? []).filter((l) => l.category === "approval").length;
   const timesheetEvents = (s.auditLogs ?? []).filter((l) => l.category === "timesheet").length;
   const adminEvents = (s.auditLogs ?? []).filter(
-    (l) => l.category === "settings" || l.category === "member",
+    (l) => l.category === "settings" || l.category === "member" || l.category === "policy",
   ).length;
 
   // CSV Export
@@ -145,7 +155,7 @@ export function AuditPage() {
     <div className="space-y-6">
       <PageHeader
         title="Audit Trail"
-        description="Immutable system log capturing workflow approvals, leave determinations, project adjustments and administrative changes."
+        description="Simulated workspace activity log stored in browser localStorage for demo preview purposes (not an immutable production audit record)."
         action={
           <Button variant="outline" onClick={handleExportCSV} className="gap-2 shadow-xs">
             <Download className="size-4" />
@@ -159,7 +169,7 @@ export function AuditPage() {
         <StatCard
           label="Total Audit Events"
           value={totalEvents.toString()}
-          meta="System lifecycle events"
+          meta="Simulated demo events"
           icon={<History className="size-5 text-primary" />}
         />
         <StatCard
@@ -177,7 +187,7 @@ export function AuditPage() {
         <StatCard
           label="Admin & Config Updates"
           value={adminEvents.toString()}
-          meta="Settings and member changes"
+          meta="Settings, policies and members"
           icon={<Settings className="size-5 text-amber-500" />}
         />
       </div>
@@ -222,6 +232,7 @@ export function AuditPage() {
                 <SelectItem value="client">Clients</SelectItem>
                 <SelectItem value="member">Team & Roles</SelectItem>
                 <SelectItem value="settings">Settings</SelectItem>
+                <SelectItem value="policy">Policies & Holidays</SelectItem>
                 <SelectItem value="auth">Authentication</SelectItem>
               </SelectContent>
             </Select>
@@ -323,7 +334,7 @@ export function AuditPage() {
                   return (
                     <tr key={log.id} className="hover:bg-muted/30 transition-colors">
                       <td className="px-5 py-3 font-mono text-xs text-muted-foreground whitespace-nowrap">
-                        {log.timestamp}
+                        {formatAuditTimestamp(log.timestamp)}
                       </td>
                       <td className="px-5 py-3 whitespace-nowrap">
                         <div className="flex items-center gap-2">

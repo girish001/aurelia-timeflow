@@ -231,7 +231,7 @@ export function LeaveBalanceProgress({
                   ) : (
                     <span className="inline-flex items-center gap-1 rounded-md bg-emerald-500/10 px-2 py-0.5 text-[11px] font-medium text-emerald-600 dark:text-emerald-400 border border-emerald-500/20">
                       <Sparkles className="size-3" />
-                      {100 - bal.percentUsed}% Free
+                      {Math.max(0, 100 - bal.percentUsed - bal.percentPending)}% Free
                     </span>
                   )}
                 </div>
@@ -243,7 +243,7 @@ export function LeaveBalanceProgress({
                     aria-valuenow={bal.used}
                     aria-valuemin={0}
                     aria-valuemax={bal.entitlement}
-                    aria-label={`${bal.label}: ${bal.used} of ${bal.entitlement} days used, ${bal.pending} pending, ${bal.remaining} remaining`}
+                    aria-label={`${bal.label}: ${bal.used} of ${bal.entitlement} days used, ${bal.pending} pending, ${bal.available} available`}
                     className="relative h-2.5 w-full overflow-hidden rounded-full bg-secondary/80 flex"
                   >
                     {/* Approved / Used Segment */}
@@ -306,7 +306,7 @@ export function LeaveBalanceProgress({
                       <span className="truncate">Available</span>
                     </div>
                     <p className="mt-0.5 font-semibold text-foreground font-mono tabular-nums">
-                      {bal.remaining}d
+                      {bal.available}d
                     </p>
                   </div>
                 </div>
@@ -320,7 +320,7 @@ export function LeaveBalanceProgress({
                     size="sm"
                     className="w-full h-8 text-xs font-medium gap-1.5 justify-center hover:bg-secondary/80"
                     onClick={() => onRequestLeave(config.type)}
-                    disabled={isExhausted}
+                    disabled={bal.available === 0 && bal.entitlement > 0}
                   >
                     <Plus className="size-3.5" />
                     Request {bal.label}

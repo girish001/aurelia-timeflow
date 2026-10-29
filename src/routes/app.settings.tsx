@@ -203,6 +203,13 @@ export function SettingsPage() {
                   onCheckedChange={(v) => {
                     setF({ ...f, lockApproved: v });
                     updateSettings({ lockApproved: v });
+                    addAuditLog({
+                      actorId: me.id,
+                      actorName: me.name,
+                      action: "Settings Updated",
+                      category: "settings",
+                      details: `Updated policy: Lock approved timesheets set to ${v ? "enabled" : "disabled"}`,
+                    });
                     toast.success("Policy updated");
                   }}
                 />
@@ -222,6 +229,13 @@ export function SettingsPage() {
                   onCheckedChange={(v) => {
                     setF({ ...f, requireRejectReason: v });
                     updateSettings({ requireRejectReason: v });
+                    addAuditLog({
+                      actorId: me.id,
+                      actorName: me.name,
+                      action: "Settings Updated",
+                      category: "settings",
+                      details: `Updated policy: Mandatory rejection justification set to ${v ? "enabled" : "disabled"}`,
+                    });
                     toast.success("Policy updated");
                   }}
                 />
@@ -261,6 +275,13 @@ export function SettingsPage() {
                   value={settings.timeFormat}
                   onValueChange={(v) => {
                     updateSettings({ timeFormat: v as "decimal" | "hhmm" });
+                    addAuditLog({
+                      actorId: me.id,
+                      actorName: me.name,
+                      action: "Settings Updated",
+                      category: "settings",
+                      details: `Updated workspace time display format to ${v}`,
+                    });
                     toast.success("Time display format updated");
                   }}
                   className="mt-2 grid grid-cols-2 gap-3"
@@ -290,6 +311,13 @@ export function SettingsPage() {
                   value={settings.currency}
                   onValueChange={(v) => {
                     updateSettings({ currency: v as "INR" | "USD" });
+                    addAuditLog({
+                      actorId: me.id,
+                      actorName: me.name,
+                      action: "Settings Updated",
+                      category: "settings",
+                      details: `Updated workspace billing currency to ${v}`,
+                    });
                     toast.success("Currency updated");
                   }}
                   className="mt-2 grid grid-cols-2 gap-3"

@@ -112,18 +112,22 @@ export function ResourcePlanningPage() {
   // Scoped members & projects
   const accessibleMembers = useMemo(() => scopedMembers(s, me), [s, me]);
   const accessibleProjects = useMemo(() => scopedProjects(s, me), [s, me]);
+  const editableProjects = useMemo(
+    () =>
+      accessibleProjects.filter((p) => p.status !== "completed" && canEditAllocation(s, me, p.id)),
+    [accessibleProjects, s, me],
+  );
 
-  // Days of the selected week (Mon - Fri or Mon - Sun)
+  // Days of the selected week (Mon - Fri)
   const weekDays = useMemo(() => {
     const mon = parseISO(currentWeekStart);
-    // 5 working days (Mon-Fri)
     return [0, 1, 2, 3, 4].map((offset) => addDays(mon, offset));
   }, [currentWeekStart]);
 
   const weekDateStrings = useMemo(() => weekDays.map((d) => isoDay(d)), [weekDays]);
 
-  // Can the user edit allocations? (Admin or Manager with managed projects)
-  const canManage = me.role === "Admin" || (me.role === "Manager" && accessibleProjects.length > 0);
+  // Can the user edit allocations? Only if they can edit at least one accessible project
+  const canManage = editableProjects.length > 0;
 
   // Filtered members list
   const visibleMembers = useMemo(() => {
@@ -133,25 +137,44 @@ export function ResourcePlanningPage() {
     });
   }, [accessibleMembers, filterMember]);
 
-  // All allocations in current week for visible members
+  const visibleMemberIdSet = useMemo(
+    () => new Set(visibleMembers.map((m) => m.id)),
+    [visibleMembers],
+  );
+
+  const accessibleProjectIdSet = useMemo(
+    () => new Set(accessibleProjects.map((p) => p.id)),
+    [accessibleProjects],
+  );
+
+  const effectiveProjectIds = useMemo(() => {
+    if (filterProject === "all") return Array.from(accessibleProjectIdSet);
+    return accessibleProjectIdSet.has(filterProject) ? [filterProject] : [];
+  }, [filterProject, accessibleProjectIdSet]);
+
+  const effectiveProjectIdSet = useMemo(() => new Set(effectiveProjectIds), [effectiveProjectIds]);
+
+  // All allocations in current week for visible members & scoped/filtered projects
   const weekAllocations = useMemo(() => {
     const dates = new Set(weekDateStrings);
     return s.allocations.filter((a) => {
       if (!dates.has(a.date)) return false;
-      if (filterProject !== "all" && a.projectId !== filterProject) return false;
+      if (!visibleMemberIdSet.has(a.memberId)) return false;
+      if (!effectiveProjectIdSet.has(a.projectId)) return false;
       return true;
     });
-  }, [s.allocations, weekDateStrings, filterProject]);
+  }, [s.allocations, weekDateStrings, visibleMemberIdSet, effectiveProjectIdSet]);
 
-  // Conflicts in current week
+  // Conflicts in current week consistent with displayed scope
   const allConflicts = useMemo(() => {
     const conflicts = findConflicts(
       s,
       visibleMembers.map((m) => m.id),
+      effectiveProjectIds,
     );
     const dates = new Set(weekDateStrings);
     return conflicts.filter((c) => dates.has(c.date));
-  }, [s, visibleMembers, weekDateStrings]);
+  }, [s, visibleMembers, effectiveProjectIds, weekDateStrings]);
 
   // Metrics
   const totalPlannedHours = useMemo(() => {
@@ -196,9 +219,14 @@ export function ResourcePlanningPage() {
 
   // Open modal to create or edit
   const openCreateModal = (memberId?: string, date?: string) => {
+    if (!canManage) return;
     setEditingAllocId(null);
-    setFormMemberId(memberId ?? (visibleMembers[0]?.id || ""));
-    setFormProjectId(accessibleProjects[0]?.id || "");
+    setFormMemberId(memberId ?? (visibleMembers[0]?.id || accessibleMembers[0]?.id || ""));
+    const defaultProjId =
+      filterProject !== "all" && editableProjects.some((p) => p.id === filterProject)
+        ? filterProject
+        : editableProjects[0]?.id || "";
+    setFormProjectId(defaultProjId);
     setFormDate(date ?? currentWeekStart);
     setFormHours("8");
     setFormStatus("confirmed");
@@ -207,8 +235,8 @@ export function ResourcePlanningPage() {
   };
 
   const openEditModal = (alloc: Allocation) => {
-    if (!canEditAllocation(s, me, alloc.projectId)) {
-      toast.error("You don't have permission to modify allocations for this project.");
+    if (!canEditAllocation(s, me, alloc.projectId, alloc.memberId)) {
+      toast.error("You don't have permission to modify this allocation.");
       return;
     }
     setEditingAllocId(alloc.id);
@@ -226,8 +254,10 @@ export function ResourcePlanningPage() {
     e.preventDefault();
     setFormError("");
 
-    if (!canEditAllocation(s, me, formProjectId)) {
-      setFormError("You can only manage allocations on projects you lead.");
+    if (!canEditAllocation(s, me, formProjectId, formMemberId)) {
+      setFormError(
+        "You can only manage allocations for authorized team members on projects you lead.",
+      );
       return;
     }
 
@@ -270,7 +300,7 @@ export function ResourcePlanningPage() {
     const existing = s.allocations.find((a) => a.id === editingAllocId);
     if (!existing) return;
 
-    if (!canEditAllocation(s, me, existing.projectId)) {
+    if (!canEditAllocation(s, me, existing.projectId, existing.memberId)) {
       toast.error("Permission denied to remove this allocation.");
       return;
     }
@@ -484,7 +514,9 @@ export function ResourcePlanningPage() {
                   return allConflicts.some((c) => c.memberId === m.id);
                 })
                 .map((m) => {
-                  const memberAllocs = s.allocations.filter((a) => a.memberId === m.id);
+                  const memberAllocs = s.allocations.filter(
+                    (a) => a.memberId === m.id && effectiveProjectIdSet.has(a.projectId),
+                  );
                   const memberWeeklyTotal = weekDateStrings.reduce((acc, d) => {
                     return acc + dayLoad(memberAllocs, m.id, d);
                   }, 0);
@@ -609,7 +641,7 @@ export function ResourcePlanningPage() {
 
                               {dayAllocs.map((alloc) => {
                                 const proj = projectLookup(alloc.projectId);
-                                const canEditThis = canEditAllocation(s, me, alloc.projectId);
+                                const canEditThis = canEditAllocation(s, me, alloc.projectId, m.id);
 
                                 return (
                                   <div
@@ -746,7 +778,7 @@ export function ResourcePlanningPage() {
                   <SelectValue placeholder="Select project" />
                 </SelectTrigger>
                 <SelectContent>
-                  {accessibleProjects.map((p) => (
+                  {editableProjects.map((p) => (
                     <SelectItem key={p.id} value={p.id}>
                       {p.name}
                     </SelectItem>

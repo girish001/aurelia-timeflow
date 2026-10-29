@@ -195,9 +195,11 @@ export function Projects() {
           title="No projects found"
           text="Try adjusting your search criteria or create a new project."
           action={
-            <Button onClick={() => setEditing("new")}>
-              <Plus className="size-4" /> Create project
-            </Button>
+            me.role === "Admin" ? (
+              <Button onClick={() => setEditing("new")}>
+                <Plus className="size-4" /> Create project
+              </Button>
+            ) : undefined
           }
         />
       ) : (

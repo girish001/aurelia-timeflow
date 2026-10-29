@@ -68,6 +68,7 @@ import {
   canReviewLeave,
   decideLeave,
   leaveDays,
+  leaveDaysInYear,
   leaveBalance,
 } from "@/lib/rules";
 import { pageHead } from "@/lib/seo";
@@ -190,10 +191,12 @@ export function Approvals() {
   }, [allTeamLeaves, todayStr]);
 
   const teamApprovedDaysThisYear = useMemo(() => {
+    const yearStart = `${currentYear}-01-01`;
+    const yearEnd = `${currentYear}-12-31`;
     return allTeamLeaves
-      .filter((l) => l.status === "approved" && l.start.startsWith(String(currentYear)))
-      .reduce((acc, l) => acc + leaveDays(l), 0);
-  }, [allTeamLeaves, currentYear]);
+      .filter((l) => l.status === "approved" && l.start <= yearEnd && l.end >= yearStart)
+      .reduce((acc, l) => acc + leaveDaysInYear(l, currentYear, s.holidays), 0);
+  }, [allTeamLeaves, currentYear, s.holidays]);
 
   // ================= Single Review (Timesheets) =================
   const decideTs = (decision: "approved" | "rejected") => {
@@ -208,7 +211,7 @@ export function Approvals() {
       return;
     }
 
-    reviewTimesheet(openTs.id, decision, tsComment.trim());
+    reviewTimesheet(openTs.id, decision, tsComment.trim(), me.id, me.name);
     toast.success(`${member(openTs.memberId)?.name}'s timesheet ${decision}`);
     setOpenTsId(null);
     setTsComment("");
@@ -899,7 +902,7 @@ export function Approvals() {
                 <tbody className="divide-y">
                   {filteredLeaves.map((req) => {
                     const emp = member(req.memberId);
-                    const days = leaveDays(req);
+                    const days = leaveDays(req, s.holidays);
                     const bal = emp ? leaveBalance(s, emp.id, currentYear) : null;
                     const isSelected = selectedLeaveIds.includes(req.id);
                     const reviewer = req.reviewedBy ? member(req.reviewedBy)?.name : null;
@@ -1110,7 +1113,7 @@ export function Approvals() {
                       <div>
                         <span className="text-muted-foreground block">Duration:</span>
                         <span className="font-semibold text-foreground">
-                          {leaveDays(selectedLeave)} working day(s)
+                          {leaveDays(selectedLeave, s.holidays)} working day(s)
                           {selectedLeave.partial !== "full" &&
                             ` (${selectedLeave.partial.toUpperCase()})`}
                         </span>
@@ -1288,7 +1291,7 @@ export function Approvals() {
                     <div>
                       <span className="text-muted-foreground block">Duration:</span>
                       <span className="font-semibold text-foreground">
-                        {leaveDays(detailsLeave)} working days
+                        {leaveDays(detailsLeave, s.holidays)} working days
                       </span>
                     </div>
                     <div>

@@ -15,12 +15,18 @@ export function PageHeader({
 }) {
   const headerActions = actions ?? action;
   return (
-    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
-      <div>
-        <h1 className="text-2xl font-bold text-foreground sm:text-[1.7rem]">{title}</h1>
-        {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
+    <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div className="min-w-0 flex-1">
+        <h1 className="text-2xl font-bold tracking-tight text-foreground sm:text-[1.7rem] break-words">
+          {title}
+        </h1>
+        {description && (
+          <p className="mt-1 text-sm text-muted-foreground break-words">{description}</p>
+        )}
       </div>
-      {headerActions && <div className="flex flex-wrap items-center gap-2">{headerActions}</div>}
+      {headerActions && (
+        <div className="flex shrink-0 flex-wrap items-center gap-2">{headerActions}</div>
+      )}
     </div>
   );
 }
@@ -37,9 +43,9 @@ export function Panel({
   className?: string | undefined;
 }) {
   return (
-    <section className={cn("rounded-xl border bg-card shadow-card", className)}>
+    <section className={cn("rounded-xl border bg-card shadow-card overflow-hidden", className)}>
       {title && (
-        <div className="flex items-center justify-between gap-2 border-b px-5 py-3.5">
+        <div className="flex flex-wrap items-center justify-between gap-2 border-b px-5 py-3.5">
           <h2 className="text-sm font-semibold text-foreground">{title}</h2>
           {action}
         </div>
@@ -73,15 +79,19 @@ export function StatCard({
   const subtext = hint ?? meta;
   const IconComp = Icon as LucideIcon;
   return (
-    <div className="rounded-xl border bg-card p-5 shadow-card">
-      <div className="flex items-start justify-between">
-        <p className="text-sm font-medium text-muted-foreground">{label}</p>
-        <span className={cn("grid size-9 place-items-center rounded-lg", tones[tone])}>
+    <div className="flex h-full flex-col justify-between rounded-xl border bg-card p-5 shadow-card min-w-0">
+      <div className="flex items-start justify-between gap-2">
+        <p className="text-sm font-medium text-muted-foreground leading-snug">{label}</p>
+        <span className={cn("grid size-9 shrink-0 place-items-center rounded-lg", tones[tone])}>
           {isValidElement(Icon) ? Icon : <IconComp className="size-4.5" aria-hidden />}
         </span>
       </div>
-      <p className="mt-3 text-3xl font-bold tabular text-foreground">{value}</p>
-      {subtext && <p className="mt-1 text-xs text-muted-foreground">{subtext}</p>}
+      <div className="mt-3 min-w-0">
+        <p className="text-2xl sm:text-3xl font-bold tabular tracking-tight text-foreground break-words">
+          {value}
+        </p>
+        {subtext && <p className="mt-1 text-xs text-muted-foreground break-words">{subtext}</p>}
+      </div>
     </div>
   );
 }

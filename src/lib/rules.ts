@@ -128,9 +128,7 @@ export function scopedMembers(s: State, me: Member): Member[] {
 export function scopedProjects(s: State, me: Member): Project[] {
   if (me.role === "Admin") return s.projects;
   if (me.role === "Manager") {
-    const managed = s.projects.filter((p) => p.managerId === me.id);
-    if (managed.length > 0) return managed;
-    return s.projects.filter((p) => p.status === "active");
+    return s.projects.filter((p) => p.managerId === me.id);
   }
   const ids = new Set(s.allocations.filter((a) => a.memberId === me.id).map((a) => a.projectId));
   // Include projects the employee has entries in
@@ -170,9 +168,23 @@ export function canApproveTimesheet(s: State, me: Member, timesheetId: string): 
   return teamIds(s, me).includes(ts.memberId);
 }
 
-export function canEditAllocation(s: State, me: Member, projectId: string) {
-  if (me.role === "Admin") return true;
-  if (me.role === "Manager") return s.projects.find((p) => p.id === projectId)?.managerId === me.id;
+export function canEditAllocation(
+  s: State,
+  me: Member,
+  projectId: string,
+  memberId?: string,
+): boolean {
+  if (me.role === "Admin") {
+    const validProject = s.projects.some((p) => p.id === projectId);
+    const validMember = !memberId || s.members.some((m) => m.id === memberId);
+    return validProject && validMember;
+  }
+  if (me.role === "Manager") {
+    const managesProject = s.projects.find((p) => p.id === projectId)?.managerId === me.id;
+    if (!managesProject) return false;
+    if (memberId && !teamIds(s, me).includes(memberId)) return false;
+    return true;
+  }
   return false;
 }
 
@@ -259,21 +271,49 @@ export function weekdaysBetween(
 }
 
 export function leaveDays(
-  r: Pick<LeaveRequest, "start" | "end" | "partial">,
+  r: Pick<LeaveRequest, "start" | "end"> & { partial?: DayPart | undefined },
   holidays?: { date: string }[],
 ) {
   const n = weekdaysBetween(r.start, r.end, holidays).length;
-  return r.partial === "full" ? n : n * 0.5;
+  const isHalfDay = r.partial === "am" || r.partial === "pm";
+  return isHalfDay ? n * 0.5 : n;
+}
+
+/**
+ * Working days of a leave request that fall within a specific calendar year,
+ * excluding weekends and company holidays consistently.
+ * Handles requests crossing calendar years (e.g. Dec 2026 -> Jan 2027).
+ */
+export function leaveDaysInYear(
+  r: Pick<LeaveRequest, "start" | "end"> & { partial?: DayPart | undefined },
+  year: number,
+  holidays?: { date: string }[],
+): number {
+  const yearStart = `${year}-01-01`;
+  const yearEnd = `${year}-12-31`;
+  if (!r.start || !r.end || r.end < yearStart || r.start > yearEnd) return 0;
+  const isHalfDay = r.partial === "am" || r.partial === "pm";
+  if (isHalfDay) {
+    return r.start >= yearStart && r.start <= yearEnd ? leaveDays(r, holidays) : 0;
+  }
+  const clampedStart = r.start < yearStart ? yearStart : r.start;
+  const clampedEnd = r.end > yearEnd ? yearEnd : r.end;
+  return weekdaysBetween(clampedStart, clampedEnd, holidays).length;
 }
 
 export function overlapsExisting(
   leaves: LeaveRequest[],
   memberId: string,
   i: { start: string; end: string },
+  ignoreId?: string,
 ) {
   return leaves.find(
     (l) =>
-      l.memberId === memberId && l.status !== "rejected" && l.start <= i.end && l.end >= i.start,
+      l.memberId === memberId &&
+      l.id !== ignoreId &&
+      l.status !== "rejected" &&
+      l.start <= i.end &&
+      l.end >= i.start,
   );
 }
 
@@ -306,12 +346,26 @@ export function decideLeave(
 }
 
 export function leaveBalance(s: State, memberId: string, year: number) {
+  const entitlement = s.settings.leavePolicy?.yearlyAnnualLeave ?? ANNUAL_ENTITLEMENT;
+  const yearStart = `${year}-01-01`;
+  const yearEnd = `${year}-12-31`;
   const mine = s.leaves.filter(
-    (l) => l.memberId === memberId && l.type === "annual" && l.start.startsWith(String(year)),
+    (l) =>
+      l.memberId === memberId && l.type === "annual" && l.start <= yearEnd && l.end >= yearStart,
   );
-  const used = mine.filter((l) => l.status === "approved").reduce((a, l) => a + leaveDays(l), 0);
-  const pending = mine.filter((l) => l.status === "pending").reduce((a, l) => a + leaveDays(l), 0);
-  return { entitlement: ANNUAL_ENTITLEMENT, used, pending, remaining: ANNUAL_ENTITLEMENT - used };
+  const used = mine
+    .filter((l) => l.status === "approved")
+    .reduce((a, l) => a + leaveDaysInYear(l, year, s.holidays), 0);
+  const pending = mine
+    .filter((l) => l.status === "pending")
+    .reduce((a, l) => a + leaveDaysInYear(l, year, s.holidays), 0);
+  return {
+    entitlement,
+    used,
+    pending,
+    remaining: Math.max(0, entitlement - used),
+    available: Math.max(0, entitlement - used - pending),
+  };
 }
 
 export interface CategoryLeaveBalance {
@@ -321,6 +375,7 @@ export interface CategoryLeaveBalance {
   used: number;
   pending: number;
   remaining: number;
+  available: number;
   percentUsed: number;
   percentPending: number;
 }
@@ -331,13 +386,28 @@ export function leaveTypeBalance(
   type: LeaveType,
   year: number,
 ): CategoryLeaveBalance {
-  const entitlement = LEAVE_ENTITLEMENTS[type] ?? 0;
+  const policy = s.settings.leavePolicy;
+  const entitlement =
+    type === "annual"
+      ? (policy?.yearlyAnnualLeave ?? ANNUAL_ENTITLEMENT)
+      : type === "sick"
+        ? (policy?.yearlySickLeave ?? SICK_ENTITLEMENT)
+        : type === "personal"
+          ? (policy?.yearlyPersonalLeave ?? PERSONAL_ENTITLEMENT)
+          : (LEAVE_ENTITLEMENTS[type] ?? 0);
+  const yearStart = `${year}-01-01`;
+  const yearEnd = `${year}-12-31`;
   const mine = s.leaves.filter(
-    (l) => l.memberId === memberId && l.type === type && l.start.startsWith(String(year)),
+    (l) => l.memberId === memberId && l.type === type && l.start <= yearEnd && l.end >= yearStart,
   );
-  const used = mine.filter((l) => l.status === "approved").reduce((a, l) => a + leaveDays(l), 0);
-  const pending = mine.filter((l) => l.status === "pending").reduce((a, l) => a + leaveDays(l), 0);
+  const used = mine
+    .filter((l) => l.status === "approved")
+    .reduce((a, l) => a + leaveDaysInYear(l, year, s.holidays), 0);
+  const pending = mine
+    .filter((l) => l.status === "pending")
+    .reduce((a, l) => a + leaveDaysInYear(l, year, s.holidays), 0);
   const remaining = Math.max(0, entitlement - used);
+  const available = Math.max(0, entitlement - used - pending);
   const percentUsed = entitlement > 0 ? Math.min(100, Math.round((used / entitlement) * 100)) : 0;
   const percentPending =
     entitlement > 0 ? Math.min(100 - percentUsed, Math.round((pending / entitlement) * 100)) : 0;
@@ -349,6 +419,7 @@ export function leaveTypeBalance(
     used,
     pending,
     remaining,
+    available,
     percentUsed,
     percentPending,
   };
@@ -370,6 +441,43 @@ export function memberAllLeaveBalances(
   };
 }
 
+/**
+ * Full leave submission validation including date rules, company holidays,
+ * duplicate/overlap prevention, cross-year splits, and pending-inclusive available balance.
+ */
+export function validateLeaveSubmission(
+  s: State,
+  memberId: string,
+  i: LeaveInput,
+  today: string,
+  ignoreId?: string,
+): string | null {
+  const err = validateLeave(i, today, s.holidays);
+  if (err) return err;
+
+  const overlap = overlapsExisting(s.leaves, memberId, i, ignoreId);
+  if (overlap) {
+    return `Conflicts with an existing ${overlap.status} request from ${overlap.start} to ${overlap.end}.`;
+  }
+
+  if (i.type !== "unpaid") {
+    const startYear = Number(i.start.slice(0, 4));
+    const endYear = Number(i.end.slice(0, 4));
+    for (let yr = startYear; yr <= endYear; yr++) {
+      const daysInYear = leaveDaysInYear(i, yr, s.holidays);
+      if (daysInYear <= 0) continue;
+      const bal = leaveTypeBalance(s, memberId, i.type, yr);
+      if (daysInYear > bal.available) {
+        const typeLabel = i.type === "sick" ? "sick leave" : i.type;
+        const pendingInfo = bal.pending > 0 ? ` (${bal.pending}d pending)` : "";
+        return `Insufficient ${typeLabel} balance${startYear !== endYear ? ` for ${yr}` : ""}: requesting ${daysInYear}d, available ${bal.available}d${pendingInfo}.`;
+      }
+    }
+  }
+
+  return null;
+}
+
 export interface StaffLeaveEntitlement {
   member: Member;
   monthlyPaidLeaveAccrual: number;
@@ -381,6 +489,7 @@ export interface StaffLeaveEntitlement {
   totalUsed: number;
   totalPending: number;
   totalRemaining: number;
+  totalAvailable: number;
 }
 
 export function staffLeaveEntitlements(
@@ -402,6 +511,7 @@ export function staffLeaveEntitlements(
     const totalUsed = annual.used + sick.used + personal.used;
     const totalPending = annual.pending + sick.pending + personal.pending;
     const totalRemaining = annual.remaining + sick.remaining + personal.remaining;
+    const totalAvailable = annual.available + sick.available + personal.available;
 
     return {
       member: m,
@@ -414,6 +524,7 @@ export function staffLeaveEntitlements(
       totalUsed,
       totalPending,
       totalRemaining,
+      totalAvailable,
     };
   });
 }
@@ -455,12 +566,14 @@ export interface Conflict {
   detail: string;
 }
 
-export function findConflicts(s: State, memberIds?: string[]): Conflict[] {
+export function findConflicts(s: State, memberIds?: string[], projectIds?: string[]): Conflict[] {
   const capacity = s.settings.dailyTarget || 8;
   const scope = memberIds ? new Set(memberIds) : null;
+  const projScope = projectIds ? new Set(projectIds) : null;
   const byKey = new Map<string, number>();
   for (const a of s.allocations) {
     if (scope && !scope.has(a.memberId)) continue;
+    if (projScope && !projScope.has(a.projectId)) continue;
     const k = `${a.memberId}|${a.date}`;
     byKey.set(k, (byKey.get(k) ?? 0) + a.hours);
   }

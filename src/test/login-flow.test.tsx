@@ -66,7 +66,7 @@ afterEach(() => {
 });
 
 describe("demo role preview flow", () => {
-  it("renders /login with Admin, Manager and Employee personas and no render loop", async () => {
+  it("renders /login with Admin, Manager and Employee role cards, disabled Continue button initially, and no render loop", async () => {
     mount("/login");
 
     expect(await screen.findByRole("heading", { name: "Demo role preview" })).toBeInTheDocument();
@@ -76,13 +76,22 @@ describe("demo role preview flow", () => {
     expect(screen.getByRole("button", { name: /Preview as Vikram Joshi/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Preview as Priya Sharma/ })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Preview as Arjun Mehta/ })).toBeInTheDocument();
+
+    const continueBtn = screen.getByRole("button", { name: /Continue to Demo/i });
+    expect(continueBtn).toBeDisabled();
     expect(reactErrors.some((m) => m.includes("getSnapshot should be cached"))).toBe(false);
   });
 
-  it("selecting a persona starts the demo session and opens /app", async () => {
+  it("selecting a role enables Continue to Demo, and clicking Continue starts the demo session and opens /app", async () => {
     const router = mount("/login");
 
-    fireEvent.click(await screen.findByRole("button", { name: /Preview as Vikram Joshi/ }));
+    const continueBtn = await screen.findByRole("button", { name: /Continue to Demo/i });
+    expect(continueBtn).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: /Preview as Vikram Joshi/ }));
+    expect(continueBtn).toBeEnabled();
+
+    fireEvent.click(continueBtn);
 
     await waitFor(() => expect(router.state.location.pathname).toBe("/app"));
     expect(getSessionId()).toBe("m6");

@@ -130,6 +130,9 @@
 @utility bg-navy-gradient {
   background-image: var(--gradient-navy);
 }
+@utility bg-gradient-navy {
+  background-image: var(--gradient-navy);
+}
 @utility shadow-card {
   box-shadow: var(--shadow-card);
 }

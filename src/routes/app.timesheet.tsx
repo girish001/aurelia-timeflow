@@ -43,6 +43,7 @@ import {
   uid,
   upsertTimesheet,
   copyPreviousWeek,
+  addAuditLog,
   useDemo,
   type Timesheet,
   type State,
@@ -122,16 +123,48 @@ export function TimesheetPage() {
   );
 }
 
-function toRows(sheet: Timesheet | undefined, s: State): Row[] {
-  return (sheet?.entries ?? []).map((e) => ({
-    id: e.id,
-    projectId: e.projectId,
-    clientId: s.projects.find((p) => p.id === e.projectId)?.clientId || "internal",
-    task: e.task,
-    hours: e.hours.map((h) => (h ? String(h) : "")),
-    billable: e.billable,
-    notes: e.notes,
-  }));
+function toRows(sheet: Timesheet | undefined, s: State, memberId?: string): Row[] {
+  if (sheet?.entries && sheet.entries.length > 0) {
+    return sheet.entries.map((e) => ({
+      id: e.id,
+      projectId: e.projectId,
+      clientId: s.projects.find((p) => p.id === e.projectId)?.clientId || "internal",
+      task: e.task,
+      hours: e.hours.map((h) => (h ? String(h) : "")),
+      billable: e.billable,
+      notes: e.notes,
+    }));
+  }
+  // If no entries or sheet is new, provide initial row(s) based on allocations or active projects
+  if (memberId) {
+    const memberAllocs = s.allocations.filter((a) => a.memberId === memberId);
+    const projIds = Array.from(new Set(memberAllocs.map((a) => a.projectId)));
+    if (projIds.length > 0) {
+      return projIds.map((pid) => {
+        const p = s.projects.find((proj) => proj.id === pid);
+        return {
+          id: uid("e"),
+          clientId: p?.clientId || "internal",
+          projectId: pid,
+          task: p?.tasks[0] || "",
+          hours: Array(7).fill(""),
+          billable: (p?.rate ?? 0) > 0,
+          notes: "",
+        };
+      });
+    }
+  }
+  return [
+    {
+      id: uid("e"),
+      clientId: "",
+      projectId: "",
+      task: "",
+      hours: Array(7).fill(""),
+      billable: true,
+      notes: "",
+    },
+  ];
 }
 
 function Editor({
@@ -145,7 +178,7 @@ function Editor({
   state: State;
   CURRENT_USER_ID: string;
 }) {
-  const [rows, setRows] = useState<Row[]>(() => toRows(sheet, state));
+  const [rows, setRows] = useState<Row[]>(() => toRows(sheet, state, CURRENT_USER_ID));
   const [dirty, setDirty] = useState(false);
   const [showErrors, setShowErrors] = useState(false);
   const [showConfirmSubmit, setShowConfirmSubmit] = useState(false);
@@ -314,6 +347,15 @@ function Editor({
     setDirty(false);
     setLastSaved(nowTime);
     setShowConfirmSubmit(false);
+    if (status === "submitted") {
+      addAuditLog({
+        actorId: me.id,
+        actorName: me.name,
+        action: "Timesheet Submitted",
+        category: "timesheet",
+        details: `Submitted ${total.toFixed(1)}h timesheet for week ${week}`,
+      });
+    }
     toast.success(
       status === "submitted" ? "Timesheet submitted for manager approval" : "Draft saved",
     );
@@ -717,59 +759,81 @@ function Editor({
           ))}
         </div>
 
-        {rows.map((r, ri) => {
-          const project = state.projects.find((p) => p.id === r.projectId);
-          const c = parsed[ri]?.[activeMobileDay] ?? { ok: true as const, value: 0 };
-          return (
-            <div key={r.id} className="rounded-xl border bg-card p-4 space-y-3 shadow-xs">
-              <div className="flex items-center justify-between">
-                <div>
-                  <p className="font-semibold text-sm">{project?.name || "Unassigned Project"}</p>
-                  <p className="text-xs text-muted-foreground">{r.task || "Select task"}</p>
-                </div>
-                {!locked && (
-                  <Button
-                    variant="ghost"
-                    size="icon"
-                    onClick={() => {
-                      setRows((rs) => rs.filter((x) => x.id !== r.id));
-                      setDirty(true);
-                    }}
-                  >
-                    <Trash2 className="size-4 text-destructive" />
-                  </Button>
-                )}
+        {rows.length === 0 ? (
+          <div className="rounded-xl border border-dashed bg-card/60 p-8 text-center space-y-3">
+            <CalendarClock className="size-8 mx-auto text-muted-foreground/60" />
+            <p className="text-sm font-semibold text-foreground">No time logged this week</p>
+            <p className="text-xs text-muted-foreground">
+              Add a row for each client project and task you worked on, or copy from last week.
+            </p>
+            {!locked && (
+              <div className="flex justify-center gap-2 pt-1">
+                <Button size="sm" onClick={addRow}>
+                  <Plus className="size-3.5 mr-1" /> Add first row
+                </Button>
+                <Button size="sm" variant="outline" onClick={handleCopyPreviousWeek}>
+                  <Copy className="size-3.5 mr-1" /> Copy previous week
+                </Button>
               </div>
+            )}
+          </div>
+        ) : (
+          rows.map((r, ri) => {
+            const project = state.projects.find((p) => p.id === r.projectId);
+            const c = parsed[ri]?.[activeMobileDay] ?? { ok: true as const, value: 0 };
+            return (
+              <div key={r.id} className="rounded-xl border bg-card p-4 space-y-3 shadow-xs">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="font-semibold text-sm">{project?.name || "Unassigned Project"}</p>
+                    <p className="text-xs text-muted-foreground">{r.task || "Select task"}</p>
+                  </div>
+                  {!locked && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      onClick={() => {
+                        setRows((rs) => rs.filter((x) => x.id !== r.id));
+                        setDirty(true);
+                      }}
+                    >
+                      <Trash2 className="size-4 text-destructive" />
+                    </Button>
+                  )}
+                </div>
 
-              <div className="flex items-center gap-3">
-                <div className="flex-1">
-                  <label className="text-[11px] font-medium text-muted-foreground block mb-1">
-                    Hours on {DAYS[activeMobileDay]}
-                  </label>
-                  <Input
-                    inputMode="decimal"
-                    disabled={locked}
-                    value={r.hours[activeMobileDay] || ""}
-                    onChange={(e) =>
-                      update(r.id, {
-                        hours: r.hours.map((x, i) => (i === activeMobileDay ? e.target.value : x)),
-                      })
-                    }
-                    placeholder="0.0"
-                    className="text-center font-bold tabular"
-                  />
-                </div>
-                <div className="pt-4">
-                  <Switch
-                    disabled={locked}
-                    checked={r.billable}
-                    onCheckedChange={(v) => update(r.id, { billable: v })}
-                  />
+                <div className="flex items-center gap-3">
+                  <div className="flex-1">
+                    <label className="text-[11px] font-medium text-muted-foreground block mb-1">
+                      Hours on {DAYS[activeMobileDay]}
+                    </label>
+                    <Input
+                      inputMode="decimal"
+                      disabled={locked}
+                      value={r.hours[activeMobileDay] || ""}
+                      onChange={(e) =>
+                        update(r.id, {
+                          hours: r.hours.map((x, i) =>
+                            i === activeMobileDay ? e.target.value : x,
+                          ),
+                        })
+                      }
+                      placeholder="0.0"
+                      className="text-center font-bold tabular"
+                    />
+                  </div>
+                  <div className="pt-4">
+                    <Switch
+                      disabled={locked}
+                      checked={r.billable}
+                      onCheckedChange={(v) => update(r.id, { billable: v })}
+                    />
+                  </div>
                 </div>
               </div>
-            </div>
-          );
-        })}
+            );
+          })
+        )}
       </div>
 
       {/* Submission Confirmation Modal */}

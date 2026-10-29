@@ -25,7 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { PageHeader, Panel } from "@/components/app/common";
-import { getState, updateSettings, useDemo } from "@/lib/demo-store";
+import { getState, updateSettings, useDemo, useMe, addAuditLog } from "@/lib/demo-store";
 import { pageHead } from "@/lib/seo";
 
 export const Route = createFileRoute("/app/settings")({
@@ -41,6 +41,7 @@ const schema = z.object({
 });
 
 export function SettingsPage() {
+  const me = useMe();
   const settings = useDemo((s) => s.settings);
   const [f, setF] = useState(() => ({
     ...getState().settings,
@@ -64,6 +65,13 @@ export function SettingsPage() {
       lockApproved: f.lockApproved,
       allowOvertime: f.allowOvertime,
       requireRejectReason: f.requireRejectReason,
+    });
+    addAuditLog({
+      actorId: me.id,
+      actorName: me.name,
+      action: "Settings Updated",
+      category: "settings",
+      details: `Updated workspace policies (Target: ${r.data.dailyTarget}h/day, Lock approved: ${f.lockApproved})`,
     });
     toast.success("Workspace settings saved");
   };

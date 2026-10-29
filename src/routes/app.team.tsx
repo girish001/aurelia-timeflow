@@ -35,6 +35,7 @@ import {
 import { Initials, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
 import {
   addMember,
+  addAuditLog,
   useMe,
   uid,
   updateMember,
@@ -44,7 +45,7 @@ import {
   type Member,
 } from "@/lib/demo-store";
 import { formatHours, weekKey } from "@/lib/time";
-import { ROLE_LABEL } from "@/lib/rules";
+import { ROLE_LABEL, scopedMembers } from "@/lib/rules";
 import { pageHead } from "@/lib/seo";
 
 export const Route = createFileRoute("/app/team")({
@@ -112,6 +113,14 @@ export function Team() {
       status: "invited",
     });
 
+    addAuditLog({
+      actorId: me.id,
+      actorName: me.name,
+      action: "Member Invited",
+      category: "member",
+      details: `Invited ${r.data.name} (${r.data.email}) as ${r.data.role} in ${r.data.department}`,
+    });
+
     toast.success(`Invitation generated for ${r.data.name} (${r.data.email})`);
     setOpen(false);
     setF({
@@ -125,7 +134,9 @@ export function Team() {
     setErrors({});
   };
 
-  const filteredMembers = s.members.filter((m) => {
+  const visibleMembers = scopedMembers(s, me);
+
+  const filteredMembers = visibleMembers.filter((m) => {
     const matchesQ = `${m.name} ${m.email} ${m.title} ${m.department || ""}`
       .toLowerCase()
       .includes(q.toLowerCase());
@@ -134,9 +145,10 @@ export function Team() {
     return matchesQ && matchesRole && matchesDept;
   });
 
-  const activeCount = s.members.filter((m) => m.status === "active").length;
-  const invitedCount = s.members.filter((m) => m.status === "invited").length;
-  const managerCount = s.members.filter((m) => m.role === "Manager").length;
+  const activeCount = visibleMembers.filter((m) => m.status === "active").length;
+  const invitedCount = visibleMembers.filter((m) => m.status === "invited").length;
+  const managerCount = visibleMembers.filter((m) => m.role === "Manager").length;
+  const employeeCount = visibleMembers.filter((m) => m.role === "Employee").length;
 
   return (
     <div className="space-y-6">
@@ -144,18 +156,20 @@ export function Team() {
         title="Team"
         description="Company personnel, organizational roles, department hierarchy and onboarding."
         actions={
-          <Button onClick={() => setOpen(true)}>
-            <UserPlus className="size-4" />
-            <span>Invite member</span>
-          </Button>
+          me.role === "Admin" ? (
+            <Button onClick={() => setOpen(true)}>
+              <UserPlus className="size-4" />
+              <span>Invite member</span>
+            </Button>
+          ) : undefined
         }
       />
 
       {/* KPI Cards */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
-          label="Total team size"
-          value={s.members.length}
+          label={me.role === "Admin" ? "Total team size" : "Team members"}
+          value={visibleMembers.length}
           hint={`${activeCount} active, ${invitedCount} invited`}
           icon={Users}
           tone="primary"
@@ -168,9 +182,9 @@ export function Team() {
           tone="teal"
         />
         <StatCard
-          label="Active consultants"
-          value={s.members.filter((m) => m.role === "Employee").length}
-          hint="Logging client billable hours"
+          label="Consultants & Engineers"
+          value={employeeCount}
+          hint="Active delivery personnel"
           icon={Briefcase}
           tone="success"
         />

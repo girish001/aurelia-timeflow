@@ -34,7 +34,15 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyState, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
-import { loggedHours, uid, upsertClient, useDemo, type Client } from "@/lib/demo-store";
+import {
+  loggedHours,
+  uid,
+  upsertClient,
+  useDemo,
+  useMe,
+  addAuditLog,
+  type Client,
+} from "@/lib/demo-store";
 import { formatHours, formatMoney } from "@/lib/time";
 import { pageHead } from "@/lib/seo";
 
@@ -259,6 +267,7 @@ export function Clients() {
 }
 
 function ClientDialog({ client, onClose }: { client: Client | null; onClose: () => void }) {
+  const me = useMe();
   const [f, setF] = useState({
     name: client?.name ?? "",
     contact: client?.contact ?? "",
@@ -277,11 +286,20 @@ function ClientDialog({ client, onClose }: { client: Client | null; onClose: () 
       return setErrors(Object.fromEntries(r.error.issues.map((i) => [i.path[0], i.message])));
     }
 
+    const isNew = !client;
     upsertClient({
       id: client?.id ?? uid("c"),
       ...r.data,
       phone: r.data.phone || undefined,
       billingTerms: r.data.billingTerms || "Net 30",
+    });
+
+    addAuditLog({
+      actorId: me.id,
+      actorName: me.name,
+      action: isNew ? "Client Added" : "Client Updated",
+      category: "client",
+      details: `${isNew ? "Added" : "Updated"} client "${r.data.name}" (${r.data.contact}, ${r.data.billingTerms})`,
     });
 
     toast.success(client ? "Client updated" : "Client profile added");

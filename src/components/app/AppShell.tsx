@@ -19,6 +19,9 @@ import {
   Sparkles,
   Shield,
   Layers,
+  CalendarDays,
+  CalendarRange,
+  History,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
@@ -46,7 +49,13 @@ import {
   markNotificationRead,
   type Role,
 } from "@/lib/demo-store";
-import { canAccess, ROLE_LABEL, type Page } from "@/lib/rules";
+import {
+  canAccess,
+  ROLE_LABEL,
+  approvableTimesheets,
+  canReviewLeave,
+  type Page,
+} from "@/lib/rules";
 import { cn } from "@/lib/utils";
 
 interface NavItem {
@@ -59,18 +68,29 @@ interface NavItem {
 const navItems: NavItem[] = [
   { to: "/app", label: "Overview", icon: LayoutDashboard, section: "Workspace" },
   { to: "/app/timesheet", label: "My Timesheet", icon: Clock, section: "Workspace" },
+  { to: "/app/timeoff", label: "Leave Management", icon: CalendarDays, section: "Workspace" },
   { to: "/app/approvals", label: "Approvals", icon: CheckSquare, section: "Operations" },
+  { to: "/app/calendar", label: "Resource Planning", icon: CalendarRange, section: "Operations" },
   { to: "/app/projects", label: "Projects", icon: Briefcase, section: "Operations" },
   { to: "/app/clients", label: "Clients", icon: Building2, section: "Operations" },
   { to: "/app/team", label: "Team", icon: Users, section: "Operations" },
   { to: "/app/reports", label: "Reports", icon: BarChart3, section: "Insights & Setup" },
+  { to: "/app/audit", label: "Audit Trail", icon: History, section: "Insights & Setup" },
   { to: "/app/settings", label: "Settings", icon: Settings, section: "Insights & Setup" },
 ];
 
 function NavList({ onNavigate }: { onNavigate?: (() => void) | undefined }) {
   const path = useRouterState({ select: (r) => r.location.pathname });
-  const pending = useDemo((s) => s.timesheets.filter((t) => t.status === "submitted").length);
+  const s = useDemo((x) => x);
   const me = useMe();
+  const pendingTimesheets = useMemo(
+    () => approvableTimesheets(s, me).filter((t) => t.status === "submitted").length,
+    [s, me],
+  );
+  const pendingLeaves = useMemo(() => {
+    if (me.role === "Employee") return 0;
+    return s.leaves.filter((l) => l.status === "pending" && canReviewLeave(s, me, l)).length;
+  }, [s, me]);
 
   const sections: ("Workspace" | "Operations" | "Insights & Setup")[] = [
     "Workspace",
@@ -118,9 +138,14 @@ function NavList({ onNavigate }: { onNavigate?: (() => void) | undefined }) {
                       aria-hidden
                     />
                     <span className="flex-1 truncate">{n.label}</span>
-                    {n.label === "Approvals" && pending > 0 && (
+                    {n.label === "Approvals" && pendingTimesheets + pendingLeaves > 0 && (
                       <span className="rounded-full bg-sidebar-primary px-2 py-0.5 text-[0.7rem] font-bold text-sidebar-primary-foreground">
-                        {pending}
+                        {pendingTimesheets + pendingLeaves}
+                      </span>
+                    )}
+                    {n.label === "Leave Management" && pendingLeaves > 0 && (
+                      <span className="rounded-full bg-amber-500/90 px-2 py-0.5 text-[0.7rem] font-bold text-white">
+                        {pendingLeaves}
                       </span>
                     )}
                   </Link>

@@ -257,29 +257,29 @@ export function DemoLogin() {
         </div>
 
         {/* Live Preview Teaser Illustration */}
-        <section className="mt-12 rounded-2xl border bg-gradient-navy p-6 sm:p-8 text-navy-foreground shadow-elevated">
+        <section className="mt-12 rounded-2xl border border-navy/30 bg-navy bg-navy-gradient p-6 sm:p-8 text-white shadow-elevated">
           <div className="flex flex-col md:flex-row items-center justify-between gap-6">
             <div className="space-y-2 text-center md:text-left">
-              <span className="inline-flex items-center gap-1.5 rounded-full bg-sidebar-primary/20 px-3 py-1 text-xs font-semibold text-sidebar-primary">
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-teal/40 bg-teal/15 px-3 py-1 text-xs font-semibold text-teal">
                 <Award className="size-3.5" /> Enterprise Grade TimeFlow
               </span>
               <h3 className="text-2xl font-bold tracking-tight text-white">
                 Engineered for High-Growth IT Services & Consultancies
               </h3>
-              <p className="text-sm text-navy-foreground/80 max-w-2xl leading-relaxed">
+              <p className="text-sm text-white/80 max-w-2xl leading-relaxed">
                 Seamless weekly timesheet grid with keyboard shortcuts, multi-level manager
                 approvals, client rate cards, real-time billable utilization benchmarks, and instant
                 CSV reporting.
               </p>
             </div>
             <div className="grid grid-cols-2 gap-3 w-full md:w-auto shrink-0">
-              <div className="rounded-xl border border-white/10 bg-white/5 p-3.5 text-center backdrop-blur">
+              <div className="rounded-xl border border-white/15 bg-white/10 p-3.5 text-center backdrop-blur">
                 <p className="text-2xl font-extrabold text-white">84.6%</p>
-                <p className="text-xs text-navy-foreground/70">Billable Utilization</p>
+                <p className="text-xs text-white/70">Billable Utilization</p>
               </div>
-              <div className="rounded-xl border border-white/10 bg-white/5 p-3.5 text-center backdrop-blur">
+              <div className="rounded-xl border border-white/15 bg-white/10 p-3.5 text-center backdrop-blur">
                 <p className="text-2xl font-extrabold text-white">100%</p>
-                <p className="text-xs text-navy-foreground/70">Client Hours Logged</p>
+                <p className="text-xs text-white/70">Client Hours Logged</p>
               </div>
             </div>
           </div>

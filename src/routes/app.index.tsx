@@ -40,6 +40,8 @@ import {
 } from "@/components/app/common";
 import { useMe, flatten, sheetTotal, useDemo, loggedHours } from "@/lib/demo-store";
 import { formatHours, formatMoney, isoDay, weekKey, weekLabel } from "@/lib/time";
+import { approvableTimesheets, scopedProjects, teamIds } from "@/lib/rules";
+import { TeamLeaveCalendar } from "@/components/app/TeamLeaveCalendar";
 import { pageHead } from "@/lib/seo";
 import { cn } from "@/lib/utils";
 
@@ -65,8 +67,18 @@ export function Dashboard() {
     [thisWeek, weeksWindow],
   );
 
+  const myProjects = useMemo(() => scopedProjects(s, me), [s, me]);
+  const myTeamIds = useMemo(() => new Set(teamIds(s, me)), [s, me]);
+
   const data = useMemo(() => {
-    const rows = flatten(s, { includeDrafts: true }).filter((r) => r.weekStart >= rangeStart);
+    const rawRows = flatten(s, { includeDrafts: true });
+    const scopedRows = rawRows.filter((r) => {
+      if (me.role === "Admin") return true;
+      if (me.role === "Employee") return r.memberId === me.id;
+      return myTeamIds.has(r.memberId);
+    });
+
+    const rows = scopedRows.filter((r) => r.weekStart >= rangeStart);
     const weeks: { week: string; label: string; billable: number; nonBillable: number }[] = [];
     for (let i = weeksWindow - 1; i >= 0; i--) {
       const w = weekKey(subWeeks(parseISO(thisWeek), i));
@@ -92,11 +104,11 @@ export function Dashboard() {
       totalHours: total,
       billableHours: billable,
     };
-  }, [s, rangeStart, thisWeek, weeksWindow]);
+  }, [s, rangeStart, thisWeek, weeksWindow, me.role, me.id, myTeamIds]);
 
   // Project budget health stats
   const projectStats = useMemo(() => {
-    return s.projects.map((p) => {
+    return myProjects.map((p) => {
       const spent = loggedHours(s, p.id);
       const budget = p.budgetHours || 1;
       const pct = Math.min(100, Math.round((spent / budget) * 100));
@@ -109,25 +121,36 @@ export function Dashboard() {
         clientName: s.clients.find((c) => c.id === p.clientId)?.name ?? "Internal",
       };
     });
-  }, [s]);
+  }, [s, myProjects]);
 
   const overBudgetCount = projectStats.filter((p) => p.isOver).length;
-  const activeProjects = s.projects.filter((p) => p.status === "active").length;
+  const activeProjects = myProjects.filter((p) => p.status === "active").length;
 
   const mine = s.timesheets.find((t) => t.memberId === me.id && t.weekStart === thisWeek);
   const myHoursThisWeek = mine ? sheetTotal(mine) : 0;
   const weeklyTarget = (s.settings.dailyTarget || 8) * 5;
 
-  const pending = s.timesheets.filter((t) => t.status === "submitted");
-  const recent = [...s.timesheets]
-    .filter((t) => t.status !== "draft")
-    .sort((a, b) => (b.submittedAt ?? "").localeCompare(a.submittedAt ?? ""))
-    .slice(0, 6);
+  const pending = approvableTimesheets(s, me).filter((t) => t.status === "submitted");
+  const recent = useMemo(() => {
+    return [...s.timesheets]
+      .filter((t) => {
+        if (t.status === "draft") return false;
+        if (me.role === "Admin") return true;
+        if (me.role === "Employee") return t.memberId === me.id;
+        return t.memberId === me.id || myTeamIds.has(t.memberId);
+      })
+      .sort((a, b) => (b.submittedAt ?? b.weekStart).localeCompare(a.submittedAt ?? a.weekStart))
+      .slice(0, 6);
+  }, [s.timesheets, me.role, me.id, myTeamIds]);
 
   const member = (id: string) => s.members.find((m) => m.id === id)?.name ?? "Unknown";
 
-  // Recent activity events from store audit logs
-  const activityLogs = s.auditLogs?.slice(0, 5) ?? [];
+  // Recent activity events from store audit logs (scoped to user/team)
+  const activityLogs = useMemo(() => {
+    const all = s.auditLogs ?? [];
+    if (me.role === "Admin") return all.slice(0, 5);
+    return all.filter((l) => l.actorId === me.id || myTeamIds.has(l.actorId)).slice(0, 5);
+  }, [s.auditLogs, me, myTeamIds]);
 
   return (
     <div className="space-y-6">
@@ -248,7 +271,7 @@ export function Dashboard() {
           }
         >
           <div
-            className="h-72 w-full"
+            className="h-72 w-full min-w-0 min-h-[288px]"
             role="img"
             aria-label="Stacked bar chart of billable and non-billable hours per week"
           >
@@ -342,6 +365,14 @@ export function Dashboard() {
         </Panel>
       </div>
 
+      {/* Team Leave Calendar (Manager & Admin Dashboard View) */}
+      {(me.role === "Manager" || me.role === "Admin") && (
+        <TeamLeaveCalendar
+          title="Team Leave Calendar"
+          description="Visual month timeline of approved team absences categorized by leave type."
+        />
+      )}
+
       {/* Projects Burn & Activity Grid */}
       <div className="grid gap-6 lg:grid-cols-2">
         {/* Project Budget Health */}
@@ -353,32 +384,46 @@ export function Dashboard() {
             </Link>
           }
         >
-          <div className="space-y-4">
-            {projectStats.slice(0, 4).map((p) => (
-              <div key={p.id} className="space-y-1.5">
-                <div className="flex items-center justify-between text-xs">
-                  <span className="font-semibold text-foreground truncate max-w-[200px]">
-                    {p.name}
-                  </span>
-                  <span className="tabular text-muted-foreground">
-                    <strong className="text-foreground">{formatHours(p.spent, fmt)}h</strong>
-                    {p.budgetHours > 0 ? ` / ${p.budgetHours}h` : " (Internal)"}
-                  </span>
-                </div>
-                {p.budgetHours > 0 && (
-                  <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
-                    <div
-                      className={cn(
-                        "h-full rounded-full transition-all duration-300",
-                        p.pct >= 90 ? "bg-destructive" : p.pct >= 75 ? "bg-warning" : "bg-primary",
-                      )}
-                      style={{ width: `${p.pct}%` }}
-                    />
+          {projectStats.length === 0 ? (
+            <div className="py-6">
+              <EmptyState
+                icon={Briefcase}
+                title="No active projects assigned"
+                text="You currently have no project budget allocations tracked."
+              />
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {projectStats.slice(0, 4).map((p) => (
+                <div key={p.id} className="space-y-1.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-semibold text-foreground truncate max-w-[200px]">
+                      {p.name}
+                    </span>
+                    <span className="tabular text-muted-foreground">
+                      <strong className="text-foreground">{formatHours(p.spent, fmt)}h</strong>
+                      {p.budgetHours > 0 ? ` / ${p.budgetHours}h` : " (Internal)"}
+                    </span>
                   </div>
-                )}
-              </div>
-            ))}
-          </div>
+                  {p.budgetHours > 0 && (
+                    <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                      <div
+                        className={cn(
+                          "h-full rounded-full transition-all duration-300",
+                          p.pct >= 90
+                            ? "bg-destructive"
+                            : p.pct >= 75
+                              ? "bg-warning"
+                              : "bg-primary",
+                        )}
+                        style={{ width: `${p.pct}%` }}
+                      />
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
         </Panel>
 
         {/* Recent Activity / Audit Log */}
@@ -414,43 +459,53 @@ export function Dashboard() {
 
       {/* Recent Timesheets Table */}
       <Panel title="Recent timesheets">
-        <div className="-mx-5 -my-5 overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="bg-muted/60 text-left text-xs uppercase tracking-wide text-muted-foreground">
-              <tr>
-                <th className="px-5 py-3 font-medium">Employee</th>
-                <th className="px-5 py-3 font-medium">Week</th>
-                <th className="px-5 py-3 text-right font-medium">Hours</th>
-                <th className="px-5 py-3 font-medium">Status</th>
-                <th className="px-5 py-3 text-right font-medium">Action</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {recent.map((t) => (
-                <tr key={t.id} className="hover:bg-muted/30 transition-colors">
-                  <td className="px-5 py-3 font-medium">
-                    <div className="flex items-center gap-2.5">
-                      <Initials name={member(t.memberId)} className="size-7 text-[11px]" />
-                      <span>{member(t.memberId)}</span>
-                    </div>
-                  </td>
-                  <td className="px-5 py-3 text-muted-foreground">{weekLabel(t.weekStart)}</td>
-                  <td className="px-5 py-3 text-right tabular font-semibold">
-                    {formatHours(sheetTotal(t), fmt)}h
-                  </td>
-                  <td className="px-5 py-3">
-                    <StatusBadge status={t.status} />
-                  </td>
-                  <td className="px-5 py-3 text-right">
-                    <Button asChild variant="ghost" size="sm">
-                      <Link to="/app/timesheet">View</Link>
-                    </Button>
-                  </td>
+        {recent.length === 0 ? (
+          <div className="py-6">
+            <EmptyState
+              icon={Inbox}
+              title="No recent timesheets"
+              text="Timesheets will appear here once submitted or approved."
+            />
+          </div>
+        ) : (
+          <div className="-mx-5 -my-5 overflow-x-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/60 text-left text-xs uppercase tracking-wide text-muted-foreground">
+                <tr>
+                  <th className="px-5 py-3 font-medium">Employee</th>
+                  <th className="px-5 py-3 font-medium">Week</th>
+                  <th className="px-5 py-3 text-right font-medium">Hours</th>
+                  <th className="px-5 py-3 font-medium">Status</th>
+                  <th className="px-5 py-3 text-right font-medium">Action</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody className="divide-y">
+                {recent.map((t) => (
+                  <tr key={t.id} className="hover:bg-muted/30 transition-colors">
+                    <td className="px-5 py-3 font-medium">
+                      <div className="flex items-center gap-2.5">
+                        <Initials name={member(t.memberId)} className="size-7 text-[11px]" />
+                        <span>{member(t.memberId)}</span>
+                      </div>
+                    </td>
+                    <td className="px-5 py-3 text-muted-foreground">{weekLabel(t.weekStart)}</td>
+                    <td className="px-5 py-3 text-right tabular font-semibold">
+                      {formatHours(sheetTotal(t), fmt)}h
+                    </td>
+                    <td className="px-5 py-3">
+                      <StatusBadge status={t.status} />
+                    </td>
+                    <td className="px-5 py-3 text-right">
+                      <Button asChild variant="ghost" size="sm">
+                        <Link to="/app/timesheet">View</Link>
+                      </Button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </Panel>
     </div>
   );

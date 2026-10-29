@@ -20,6 +20,7 @@ import { Route as ProjectsRoute } from "@/routes/app.projects";
 import { Route as ReportsRoute } from "@/routes/app.reports";
 import { Route as SettingsRoute } from "@/routes/app.settings";
 import { Route as TeamRoute } from "@/routes/app.team";
+import { Route as TimeoffRoute } from "@/routes/app.timeoff";
 import { Route as TimesheetRoute } from "@/routes/app.timesheet";
 
 // Mounts the real /app layout and every real workspace page under a bare root route
@@ -31,6 +32,7 @@ const component = (r: Comp) => r.options.component as RouteComponent;
 const pages: [string, string, Comp][] = [
   ["/app", "/", IndexRoute],
   ["/app/timesheet", "/timesheet", TimesheetRoute],
+  ["/app/timeoff", "/timeoff", TimeoffRoute],
   ["/app/approvals", "/approvals", ApprovalsRoute],
   ["/app/projects", "/projects", ProjectsRoute],
   ["/app/clients", "/clients", ClientsRoute],

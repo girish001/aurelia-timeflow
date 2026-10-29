@@ -25,7 +25,8 @@ export type Page =
   | "team"
   | "reports"
   | "settings"
-  | "profile";
+  | "profile"
+  | "audit";
 
 export const ROLE_LABEL: Record<Role, string> = {
   Admin: "Business Admin",
@@ -45,6 +46,7 @@ export const ACCESS: Record<Page, Role[]> = {
   clients: ["Admin"],
   reports: ["Admin"],
   settings: ["Admin"],
+  audit: ["Admin"],
 };
 
 export const NAV_ORDER: Page[] = [
@@ -57,11 +59,12 @@ export const NAV_ORDER: Page[] = [
   "clients",
   "team",
   "reports",
+  "audit",
   "settings",
   "profile",
 ];
 
-export const canAccess = (role: Role, page: Page) => ACCESS[page].includes(role);
+export const canAccess = (role: Role, page: Page) => (ACCESS[page] ?? []).includes(role);
 export const navFor = (role: Role) => NAV_ORDER.filter((p) => canAccess(role, p));
 
 export function pageFromPath(path: string): Page | null {
@@ -70,7 +73,7 @@ export function pageFromPath(path: string): Page | null {
   return seg in ACCESS ? (seg as Page) : null;
 }
 
-// ---------- scope ----------
+// ---------- scope & permission isolation ----------
 export function managedProjectIds(s: State, meId: string) {
   return s.projects.filter((p) => p.managerId === meId).map((p) => p.id);
 }
@@ -81,22 +84,90 @@ export function teamIds(s: State, me: Member): string[] {
   if (me.role === "Employee") return [me.id];
   const pids = new Set(managedProjectIds(s, me.id));
   const ids = new Set<string>([me.id]);
+  s.members.forEach((m) => {
+    if (m.reportingManagerId === me.id) ids.add(m.id);
+  });
   s.allocations.forEach((a) => pids.has(a.projectId) && ids.add(a.memberId));
   s.timesheets.forEach((t) => t.entries.some((e) => pids.has(e.projectId)) && ids.add(t.memberId));
   return s.members.filter((m) => ids.has(m.id)).map((m) => m.id);
 }
 
+/** Returns member IDs of employees reporting to this manager (excluding themselves). */
+export function directReportIds(s: State, me: Member): string[] {
+  if (me.role === "Admin") return s.members.filter((m) => m.id !== me.id).map((m) => m.id);
+  if (me.role === "Employee") return [];
+  const ids = new Set<string>();
+
+  // 1. Primary: Direct reporting structure (reportingManagerId)
+  s.members.forEach((m) => {
+    if (m.reportingManagerId === me.id && m.id !== me.id) ids.add(m.id);
+  });
+
+  // 2. Fallback: If no reporting lines are established in state, fall back to project team
+  const hasReportingLines = s.members.some((m) => !!m.reportingManagerId);
+  if (!hasReportingLines) {
+    const pids = new Set(managedProjectIds(s, me.id));
+    s.allocations.forEach((a) => {
+      if (pids.has(a.projectId) && a.memberId !== me.id) ids.add(a.memberId);
+    });
+    s.timesheets.forEach((t) => {
+      if (t.entries.some((e) => pids.has(e.projectId)) && t.memberId !== me.id) ids.add(t.memberId);
+    });
+  }
+
+  return s.members.filter((m) => ids.has(m.id)).map((m) => m.id);
+}
+
+export function scopedMembers(s: State, me: Member): Member[] {
+  if (me.role === "Admin") return s.members;
+  if (me.role === "Employee") return [me];
+  const ids = new Set(teamIds(s, me));
+  return s.members.filter((m) => ids.has(m.id));
+}
+
 export function scopedProjects(s: State, me: Member): Project[] {
   if (me.role === "Admin") return s.projects;
-  if (me.role === "Manager") return s.projects.filter((p) => p.managerId === me.id);
+  if (me.role === "Manager") {
+    const managed = s.projects.filter((p) => p.managerId === me.id);
+    if (managed.length > 0) return managed;
+    return s.projects.filter((p) => p.status === "active");
+  }
   const ids = new Set(s.allocations.filter((a) => a.memberId === me.id).map((a) => a.projectId));
-  return s.projects.filter((p) => ids.has(p.id));
+  // Include projects the employee has entries in
+  s.timesheets
+    .filter((t) => t.memberId === me.id)
+    .forEach((t) => t.entries.forEach((e) => ids.add(e.projectId)));
+  const found = s.projects.filter((p) => ids.has(p.id));
+  return found.length > 0 ? found : s.projects.filter((p) => p.status === "active");
+}
+
+export function scopedTimesheets(s: State, me: Member): Timesheet[] {
+  if (me.role === "Admin") return s.timesheets;
+  if (me.role === "Employee") return s.timesheets.filter((t) => t.memberId === me.id);
+  const team = new Set(teamIds(s, me));
+  return s.timesheets.filter((t) => t.memberId === me.id || team.has(t.memberId));
+}
+
+export function scopedLeaves(s: State, me: Member): LeaveRequest[] {
+  if (me.role === "Admin") return s.leaves;
+  if (me.role === "Employee") return s.leaves.filter((l) => l.memberId === me.id);
+  const team = new Set(teamIds(s, me));
+  return s.leaves.filter((l) => l.memberId === me.id || team.has(l.memberId));
 }
 
 export function approvableTimesheets(s: State, me: Member): Timesheet[] {
   if (me.role === "Employee") return [];
+  if (me.role === "Admin") return s.timesheets.filter((t) => t.memberId !== me.id);
   const team = new Set(teamIds(s, me));
   return s.timesheets.filter((t) => t.memberId !== me.id && team.has(t.memberId));
+}
+
+export function canApproveTimesheet(s: State, me: Member, timesheetId: string): boolean {
+  if (me.role === "Employee") return false;
+  const ts = s.timesheets.find((t) => t.id === timesheetId);
+  if (!ts || ts.memberId === me.id || ts.status !== "submitted") return false;
+  if (me.role === "Admin") return true;
+  return teamIds(s, me).includes(ts.memberId);
 }
 
 export function canEditAllocation(s: State, me: Member, projectId: string) {
@@ -113,6 +184,31 @@ export const LEAVE_LABEL: Record<LeaveType, string> = {
   unpaid: "Unpaid leave",
 };
 export const ANNUAL_ENTITLEMENT = 18;
+export const SICK_ENTITLEMENT = 10;
+export const PERSONAL_ENTITLEMENT = 5;
+export const MONTHLY_PAID_LEAVE_ACCRUAL = 1.5; // 1.5 days/month (18 days/year)
+
+export const LEAVE_ENTITLEMENTS: Record<LeaveType, number> = {
+  annual: ANNUAL_ENTITLEMENT,
+  sick: SICK_ENTITLEMENT,
+  personal: PERSONAL_ENTITLEMENT,
+  unpaid: 0,
+};
+
+export function calculateMonthlyAccrual(
+  date: Date = new Date(),
+  monthlyRate = MONTHLY_PAID_LEAVE_ACCRUAL,
+  annualMax = ANNUAL_ENTITLEMENT,
+) {
+  const month = date.getMonth() + 1; // 1 to 12
+  const accruedToDate = Math.min(annualMax, Math.round(month * monthlyRate * 10) / 10);
+  return {
+    month,
+    monthlyRate,
+    accruedToDate,
+    annualMax,
+  };
+}
 
 export interface LeaveInput {
   type: LeaveType;
@@ -122,7 +218,11 @@ export interface LeaveInput {
   reason: string;
 }
 
-export function validateLeave(i: LeaveInput, today: string): string | null {
+export function validateLeave(
+  i: LeaveInput,
+  today: string,
+  holidays?: { date: string; name?: string }[],
+): string | null {
   if (!i.start || !i.end) return "Choose a start and end date";
   if (i.end < i.start) return "End date cannot be before the start date";
   if (i.partial !== "full" && i.start !== i.end)
@@ -130,22 +230,39 @@ export function validateLeave(i: LeaveInput, today: string): string | null {
   if (differenceInCalendarDays(parseISO(i.end), parseISO(i.start)) > 30)
     return "Requests are limited to 31 days";
   if (i.type !== "sick" && i.start < today) return "Only sick leave can be backdated";
-  if (weekdaysBetween(i.start, i.end).length === 0) return "The selected range has no working days";
+  if (weekdaysBetween(i.start, i.end, holidays).length === 0) {
+    if (holidays && holidays.some((h) => h.date >= i.start && h.date <= i.end)) {
+      return "The selected dates fall entirely on official company holidays or weekends";
+    }
+    return "The selected range has no working days";
+  }
   if (i.type === "unpaid" && i.reason.trim().length < 3) return "Add a reason for unpaid leave";
   if (i.reason.length > 300) return "Reason must be under 300 characters";
   return null;
 }
 
-export function weekdaysBetween(start: string, end: string): string[] {
+export function weekdaysBetween(
+  start: string,
+  end: string,
+  holidays?: { date: string }[],
+): string[] {
   const out: string[] = [];
   if (!start || !end || end < start) return out;
-  for (let d = parseISO(start); isoDay(d) <= end; d = addDays(d, 1))
-    if (!isWeekend(d)) out.push(isoDay(d));
+  const holidaySet = new Set(holidays?.map((h) => h.date) ?? []);
+  for (let d = parseISO(start); isoDay(d) <= end; d = addDays(d, 1)) {
+    const dStr = isoDay(d);
+    if (!isWeekend(d) && !holidaySet.has(dStr)) {
+      out.push(dStr);
+    }
+  }
   return out;
 }
 
-export function leaveDays(r: Pick<LeaveRequest, "start" | "end" | "partial">) {
-  const n = weekdaysBetween(r.start, r.end).length;
+export function leaveDays(
+  r: Pick<LeaveRequest, "start" | "end" | "partial">,
+  holidays?: { date: string }[],
+) {
+  const n = weekdaysBetween(r.start, r.end, holidays).length;
   return r.partial === "full" ? n : n * 0.5;
 }
 
@@ -160,9 +277,15 @@ export function overlapsExisting(
   );
 }
 
+export function approvableLeaves(s: State, me: Member): LeaveRequest[] {
+  if (me.role === "Employee") return [];
+  const reports = new Set(directReportIds(s, me));
+  return s.leaves.filter((l) => l.memberId !== me.id && reports.has(l.memberId));
+}
+
 export function canReviewLeave(s: State, me: Member, req: LeaveRequest) {
   if (me.role === "Employee" || req.memberId === me.id || req.status !== "pending") return false;
-  return teamIds(s, me).includes(req.memberId);
+  return directReportIds(s, me).includes(req.memberId);
 }
 
 export function decideLeave(
@@ -189,6 +312,110 @@ export function leaveBalance(s: State, memberId: string, year: number) {
   const used = mine.filter((l) => l.status === "approved").reduce((a, l) => a + leaveDays(l), 0);
   const pending = mine.filter((l) => l.status === "pending").reduce((a, l) => a + leaveDays(l), 0);
   return { entitlement: ANNUAL_ENTITLEMENT, used, pending, remaining: ANNUAL_ENTITLEMENT - used };
+}
+
+export interface CategoryLeaveBalance {
+  type: LeaveType;
+  label: string;
+  entitlement: number;
+  used: number;
+  pending: number;
+  remaining: number;
+  percentUsed: number;
+  percentPending: number;
+}
+
+export function leaveTypeBalance(
+  s: State,
+  memberId: string,
+  type: LeaveType,
+  year: number,
+): CategoryLeaveBalance {
+  const entitlement = LEAVE_ENTITLEMENTS[type] ?? 0;
+  const mine = s.leaves.filter(
+    (l) => l.memberId === memberId && l.type === type && l.start.startsWith(String(year)),
+  );
+  const used = mine.filter((l) => l.status === "approved").reduce((a, l) => a + leaveDays(l), 0);
+  const pending = mine.filter((l) => l.status === "pending").reduce((a, l) => a + leaveDays(l), 0);
+  const remaining = Math.max(0, entitlement - used);
+  const percentUsed = entitlement > 0 ? Math.min(100, Math.round((used / entitlement) * 100)) : 0;
+  const percentPending =
+    entitlement > 0 ? Math.min(100 - percentUsed, Math.round((pending / entitlement) * 100)) : 0;
+
+  return {
+    type,
+    label: LEAVE_LABEL[type],
+    entitlement,
+    used,
+    pending,
+    remaining,
+    percentUsed,
+    percentPending,
+  };
+}
+
+export function memberAllLeaveBalances(
+  s: State,
+  memberId: string,
+  year: number,
+): {
+  annual: CategoryLeaveBalance;
+  sick: CategoryLeaveBalance;
+  personal: CategoryLeaveBalance;
+} {
+  return {
+    annual: leaveTypeBalance(s, memberId, "annual", year),
+    sick: leaveTypeBalance(s, memberId, "sick", year),
+    personal: leaveTypeBalance(s, memberId, "personal", year),
+  };
+}
+
+export interface StaffLeaveEntitlement {
+  member: Member;
+  monthlyPaidLeaveAccrual: number;
+  accruedPaidLeaveToDate: number;
+  annual: CategoryLeaveBalance;
+  sick: CategoryLeaveBalance;
+  personal: CategoryLeaveBalance;
+  totalEntitlement: number;
+  totalUsed: number;
+  totalPending: number;
+  totalRemaining: number;
+}
+
+export function staffLeaveEntitlements(
+  s: State,
+  year = new Date().getFullYear(),
+): StaffLeaveEntitlement[] {
+  const accrual = calculateMonthlyAccrual(
+    new Date(),
+    s.settings.leavePolicy?.monthlyPaidLeaveAccrual ?? MONTHLY_PAID_LEAVE_ACCRUAL,
+    s.settings.leavePolicy?.yearlyAnnualLeave ?? ANNUAL_ENTITLEMENT,
+  );
+
+  return s.members.map((m) => {
+    const annual = leaveTypeBalance(s, m.id, "annual", year);
+    const sick = leaveTypeBalance(s, m.id, "sick", year);
+    const personal = leaveTypeBalance(s, m.id, "personal", year);
+
+    const totalEntitlement = annual.entitlement + sick.entitlement + personal.entitlement;
+    const totalUsed = annual.used + sick.used + personal.used;
+    const totalPending = annual.pending + sick.pending + personal.pending;
+    const totalRemaining = annual.remaining + sick.remaining + personal.remaining;
+
+    return {
+      member: m,
+      monthlyPaidLeaveAccrual: accrual.monthlyRate,
+      accruedPaidLeaveToDate: accrual.accruedToDate,
+      annual,
+      sick,
+      personal,
+      totalEntitlement,
+      totalUsed,
+      totalPending,
+      totalRemaining,
+    };
+  });
 }
 
 export function leaveOn(leaves: LeaveRequest[], memberId: string, date: string) {

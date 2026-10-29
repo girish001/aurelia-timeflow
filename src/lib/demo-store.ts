@@ -58,6 +58,14 @@ export interface Timesheet {
   reviewComment?: string | undefined;
   lastAutoSavedAt?: string | undefined;
 }
+export interface LeavePolicySettings {
+  monthlyPaidLeaveAccrual: number; // 1.5 days/month
+  yearlyAnnualLeave: number; // 18 days/year
+  yearlySickLeave: number; // 10 days/year
+  yearlyPersonalLeave: number; // 5 days/year
+  carryForwardLimit: number; // 5 days
+}
+
 export interface Settings {
   companyName: string;
   companyEmail: string;
@@ -71,6 +79,7 @@ export interface Settings {
   allowOvertime?: boolean;
   roundingStep?: number;
   requireRejectReason?: boolean;
+  leavePolicy?: LeavePolicySettings;
 }
 export type LeaveType = "annual" | "sick" | "personal" | "unpaid";
 export type LeaveStatus = "pending" | "approved" | "rejected";
@@ -102,7 +111,16 @@ export interface AuditLogItem {
   actorId: string;
   actorName: string;
   action: string;
-  category: "timesheet" | "approval" | "project" | "client" | "member" | "settings" | "auth";
+  category:
+    | "timesheet"
+    | "approval"
+    | "project"
+    | "client"
+    | "member"
+    | "settings"
+    | "auth"
+    | "leave"
+    | "allocation";
   details: string;
   timestamp: string;
 }
@@ -116,6 +134,18 @@ export interface AppNotification {
   read: boolean;
   link?: string;
 }
+export type HolidayType = "national" | "gazetted" | "festival" | "company";
+
+export interface CompanyHoliday {
+  id: string;
+  name: string;
+  date: string; // YYYY-MM-DD
+  type: HolidayType;
+  mandatory: boolean;
+  description?: string;
+}
+
+
 export interface State {
   version: number;
   clients: Client[];
@@ -127,6 +157,7 @@ export interface State {
   settings: Settings;
   auditLogs: AuditLogItem[];
   notifications: AppNotification[];
+  holidays: CompanyHoliday[];
 }
 
 const KEY = "aurelia-timeflow-demo-v2";
@@ -135,6 +166,116 @@ const VERSION = 2;
 
 export function uid(prefix: string) {
   return `${prefix}_${Date.now().toString(36)}${Math.floor(Math.random() * 1e6).toString(36)}`;
+}
+
+export function getDefaultHolidays(year = 2026): CompanyHoliday[] {
+  const y = String(year);
+  return [
+    {
+      id: "h_1",
+      name: "Republic Day",
+      date: `${y}-01-26`,
+      type: "national",
+      mandatory: true,
+      description: "Celebration of the Constitution of India",
+    },
+    {
+      id: "h_2",
+      name: "Maha Shivratri",
+      date: `${y}-02-15`,
+      type: "gazetted",
+      mandatory: true,
+      description: "Traditional spiritual observance",
+    },
+    {
+      id: "h_3",
+      name: "Holi",
+      date: `${y}-03-04`,
+      type: "festival",
+      mandatory: true,
+      description: "Festival of colors and spring celebration",
+    },
+    {
+      id: "h_4",
+      name: "Eid-ul-Fitr",
+      date: `${y}-03-21`,
+      type: "gazetted",
+      mandatory: true,
+      description: "Culmination of the holy month of Ramadan",
+    },
+    {
+      id: "h_5",
+      name: "Good Friday",
+      date: `${y}-04-03`,
+      type: "gazetted",
+      mandatory: true,
+      description: "Christian religious observance",
+    },
+    {
+      id: "h_6",
+      name: "International Workers' Day",
+      date: `${y}-05-01`,
+      type: "company",
+      mandatory: true,
+      description: "Labour Day holiday for all company locations",
+    },
+    {
+      id: "h_7",
+      name: "Independence Day",
+      date: `${y}-08-15`,
+      type: "national",
+      mandatory: true,
+      description: "National Independence Day observance",
+    },
+    {
+      id: "h_8",
+      name: "Janmashtami",
+      date: `${y}-08-28`,
+      type: "festival",
+      mandatory: false,
+      description: "Celebration of the birth of Lord Krishna",
+    },
+    {
+      id: "h_9",
+      name: "Mahatma Gandhi Jayanti",
+      date: `${y}-10-02`,
+      type: "national",
+      mandatory: true,
+      description: "Birth anniversary of Mahatma Gandhi",
+    },
+    {
+      id: "h_10",
+      name: "Dussehra (Vijayadashami)",
+      date: `${y}-10-20`,
+      type: "festival",
+      mandatory: true,
+      description: "Victory of light over darkness and good over evil",
+    },
+    {
+      id: "h_11",
+      name: "Diwali (Deepavali)",
+      date: `${y}-11-08`,
+      type: "festival",
+      mandatory: true,
+      description: "Festival of lights celebrations",
+    },
+    {
+      id: "h_12",
+      name: "Guru Nanak Jayanti",
+      date: `${y}-11-24`,
+      type: "gazetted",
+      mandatory: true,
+      description: "Birth anniversary of Guru Nanak Dev Ji",
+    },
+    {
+      id: "h_13",
+      name: "Christmas Day",
+      date: `${y}-12-25`,
+      type: "gazetted",
+      mandatory: true,
+      description: "Celebration of Christmas",
+    },
+  ];
 }
 
 export function createSeed(now = new Date()): State {
@@ -180,6 +321,8 @@ export function createSeed(now = new Date()): State {
       title: "Delivery Manager",
       role: "Manager",
       status: "active",
+      department: "Engineering",
+      reportingManagerId: "m7",
     },
     {
       id: "m2",
@@ -188,6 +331,8 @@ export function createSeed(now = new Date()): State {
       title: "Senior Developer",
       role: "Employee",
       status: "active",
+      department: "Engineering",
+      reportingManagerId: "m1",
     },
     {
       id: "m3",
@@ -196,6 +341,8 @@ export function createSeed(now = new Date()): State {
       title: "UX Designer",
       role: "Employee",
       status: "active",
+      department: "Design",
+      reportingManagerId: "m1",
     },
     {
       id: "m4",
@@ -204,6 +351,8 @@ export function createSeed(now = new Date()): State {
       title: "QA Engineer",
       role: "Employee",
       status: "active",
+      department: "Quality Assurance",
+      reportingManagerId: "m5",
     },
     {
       id: "m5",
@@ -212,6 +361,8 @@ export function createSeed(now = new Date()): State {
       title: "Project Manager",
       role: "Manager",
       status: "active",
+      department: "Operations",
+      reportingManagerId: "m6",
     },
     {
       id: "m6",
@@ -220,6 +371,7 @@ export function createSeed(now = new Date()): State {
       title: "Operations Admin",
       role: "Admin",
       status: "active",
+      department: "Operations",
     },
     {
       id: "m7",
@@ -228,6 +380,7 @@ export function createSeed(now = new Date()): State {
       title: "Founder & Business Owner",
       role: "Admin",
       status: "active",
+      department: "Executive",
     },
   ];
   const projects: Project[] = [
@@ -365,9 +518,10 @@ export function createSeed(now = new Date()): State {
           m.id === "m1" || m.id === "m6" ? "approved" : m.id === "m4" ? "rejected" : "submitted";
       else if (w === 2 && m.id === "m3") status = "submitted";
       if (w === 0) {
-        // current week: only past days filled
-        const today = (now.getDay() + 6) % 7;
-        entries.forEach((e) => (e.hours = e.hours.map((h, d) => (d < today ? h : 0))));
+        // current week: populate in-progress days so demo is never empty (minimum Mon-Tue up to current work day)
+        const todayIdx = (now.getDay() + 6) % 7;
+        const filledThrough = Math.max(1, Math.min(4, todayIdx));
+        entries.forEach((e) => (e.hours = e.hours.map((h, d) => (d <= filledThrough ? h : 0))));
       }
       const submitted = isoDay(addDays(parseISO(ws), 5));
       timesheets.push({
@@ -617,6 +771,7 @@ export function createSeed(now = new Date()): State {
     allocations,
     auditLogs,
     notifications,
+    holidays: getDefaultHolidays(now.getFullYear()),
     settings: {
       companyName: "Demo Consulting Pvt Ltd",
       companyEmail: "ops@demo.aurelia.example",
@@ -630,6 +785,13 @@ export function createSeed(now = new Date()): State {
       allowOvertime: true,
       roundingStep: 0.25,
       requireRejectReason: true,
+      leavePolicy: {
+        monthlyPaidLeaveAccrual: 1.5,
+        yearlyAnnualLeave: 18,
+        yearlySickLeave: 10,
+        yearlyPersonalLeave: 5,
+        carryForwardLimit: 5,
+      },
     },
   };
 }
@@ -638,14 +800,34 @@ let state: State | null = null;
 const listeners = new Set<() => void>();
 
 function load(): State {
+  const currentWeek = weekKey(new Date());
   if (typeof window !== "undefined") {
     try {
       const raw = window.localStorage.getItem(KEY);
       if (raw) {
         const parsed = JSON.parse(raw) as State;
-        if (parsed.version === VERSION) {
+        if (
+          parsed.version === VERSION &&
+          Array.isArray(parsed.timesheets) &&
+          parsed.timesheets.some((t) => t.weekStart === currentWeek)
+        ) {
           parsed.auditLogs = parsed.auditLogs ?? [];
           parsed.notifications = parsed.notifications ?? [];
+          parsed.allocations = parsed.allocations ?? [];
+          parsed.leaves = parsed.leaves ?? [];
+          parsed.holidays =
+            Array.isArray(parsed.holidays) && parsed.holidays.length > 0
+              ? parsed.holidays
+              : getDefaultHolidays(new Date().getFullYear());
+          if (!parsed.settings.leavePolicy) {
+            parsed.settings.leavePolicy = {
+              monthlyPaidLeaveAccrual: 1.5,
+              yearlyAnnualLeave: 18,
+              yearlySickLeave: 10,
+              yearlyPersonalLeave: 5,
+              carryForwardLimit: 5,
+            };
+          }
           return parsed;
         }
       }
@@ -653,7 +835,15 @@ function load(): State {
       /* corrupted storage: fall back to seed */
     }
   }
-  return createSeed();
+  const fresh = createSeed(new Date());
+  if (typeof window !== "undefined") {
+    try {
+      window.localStorage.setItem(KEY, JSON.stringify(fresh));
+    } catch {
+      /* storage quota exceeded or private mode */
+    }
+  }
+  return fresh;
 }
 
 export function getState(): State {
@@ -899,6 +1089,44 @@ export function setLeave(l: LeaveRequest) {
 export function removeLeave(id: string) {
   setState((s) => ({ ...s, leaves: s.leaves.filter((x) => x.id !== id) }));
 }
+export function bulkReviewLeaves(
+  ids: string[],
+  decision: "approved" | "rejected",
+  reviewerId: string,
+  reviewerName: string,
+  comment?: string,
+) {
+  const today = isoDay(new Date());
+  setState((s) => {
+    const updated = s.leaves.map((l) => {
+      if (!ids.includes(l.id)) return l;
+      return {
+        ...l,
+        status: decision,
+        reviewedBy: reviewerId,
+        reviewComment: comment || l.reviewComment,
+      };
+    });
+    const newLogs: AuditLogItem[] = ids.map((id) => {
+      const lv = s.leaves.find((x) => x.id === id);
+      const member = s.members.find((m) => m.id === lv?.memberId)?.name ?? "Employee";
+      return {
+        id: uid("al"),
+        actorId: reviewerId,
+        actorName: reviewerName,
+        action: `Leave ${decision === "approved" ? "Approved" : "Rejected"}`,
+        category: "leave",
+        details: `${decision === "approved" ? "Approved" : "Returned"} ${member}'s leave request (${lv?.start} to ${lv?.end})`,
+        timestamp: today,
+      };
+    });
+    return {
+      ...s,
+      leaves: updated,
+      auditLogs: [...newLogs, ...(s.auditLogs ?? [])],
+    };
+  });
+}
 export function upsertAllocation(a: Allocation) {
   setState((s) => ({
     ...s,
@@ -909,6 +1137,41 @@ export function upsertAllocation(a: Allocation) {
 }
 export function removeAllocation(id: string) {
   setState((s) => ({ ...s, allocations: s.allocations.filter((x) => x.id !== id) }));
+}
+
+export function upsertHoliday(h: CompanyHoliday) {
+  setState((s) => ({
+    ...s,
+    holidays: s.holidays.some((x) => x.id === h.id)
+      ? s.holidays.map((x) => (x.id === h.id ? h : x))
+      : [...s.holidays, h].sort((a, b) => a.date.localeCompare(b.date)),
+  }));
+}
+
+export function removeHoliday(id: string) {
+  setState((s) => ({
+    ...s,
+    holidays: s.holidays.filter((h) => h.id !== id),
+  }));
+}
+
+export function updateLeavePolicy(policy: Partial<LeavePolicySettings>) {
+  setState((s) => ({
+    ...s,
+    settings: {
+      ...s.settings,
+      leavePolicy: {
+        ...(s.settings.leavePolicy ?? {
+          monthlyPaidLeaveAccrual: 1.5,
+          yearlyAnnualLeave: 18,
+          yearlySickLeave: 10,
+          yearlyPersonalLeave: 5,
+          carryForwardLimit: 5,
+        }),
+        ...policy,
+      },
+    },
+  }));
 }
 
 // ---------- demo role preview session (NOT authentication) ----------

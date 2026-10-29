@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState } from "react";
+import { useState, useMemo } from "react";
 import { z } from "zod";
 import {
   Plus,
@@ -34,8 +34,17 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyState, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
-import { loggedHours, uid, upsertProject, useDemo, type Project } from "@/lib/demo-store";
+import {
+  loggedHours,
+  uid,
+  upsertProject,
+  useDemo,
+  useMe,
+  addAuditLog,
+  type Project,
+} from "@/lib/demo-store";
 import { formatHours, formatMoney } from "@/lib/time";
+import { scopedProjects } from "@/lib/rules";
 import { pageHead } from "@/lib/seo";
 import { cn } from "@/lib/utils";
 
@@ -61,6 +70,7 @@ const schema = z.object({
 });
 
 export function Projects() {
+  const me = useMe();
   const s = useDemo((x) => x);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("all");
@@ -70,7 +80,9 @@ export function Projects() {
   const cur = s.settings.currency;
   const fmt = s.settings.timeFormat;
 
-  const list = s.projects.filter((p) => {
+  const scoped = useMemo(() => scopedProjects(s, me), [s, me]);
+
+  const list = scoped.filter((p) => {
     const c = s.clients.find((x) => x.id === p.clientId)?.name ?? "Internal";
     return (
       (status === "all" || p.status === status) &&
@@ -79,14 +91,11 @@ export function Projects() {
     );
   });
 
-  // Calculate project aggregate metrics
-  const totalBudgetHours = s.projects.reduce((acc, p) => acc + (p.budgetHours || 0), 0);
-  const totalLoggedHours = s.projects.reduce((acc, p) => acc + loggedHours(s, p.id), 0);
-  const totalEstRevenue = s.projects.reduce(
-    (acc, p) => acc + loggedHours(s, p.id) * (p.rate || 0),
-    0,
-  );
-  const overBudgetCount = s.projects.filter(
+  // Calculate project aggregate metrics based on scoped projects
+  const totalBudgetHours = scoped.reduce((acc, p) => acc + (p.budgetHours || 0), 0);
+  const totalLoggedHours = scoped.reduce((acc, p) => acc + loggedHours(s, p.id), 0);
+  const totalEstRevenue = scoped.reduce((acc, p) => acc + loggedHours(s, p.id) * (p.rate || 0), 0);
+  const overBudgetCount = scoped.filter(
     (p) => p.budgetHours > 0 && loggedHours(s, p.id) > p.budgetHours,
   ).length;
 
@@ -96,19 +105,21 @@ export function Projects() {
         title="Projects"
         description="Monitor project progress, budget consumption, billable rates and delivery revenue."
         actions={
-          <Button onClick={() => setEditing("new")}>
-            <Plus className="size-4" />
-            <span>New project</span>
-          </Button>
+          me.role === "Admin" ? (
+            <Button onClick={() => setEditing("new")}>
+              <Plus className="size-4" />
+              <span>New project</span>
+            </Button>
+          ) : undefined
         }
       />
 
       {/* KPI Cards */}
       <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
         <StatCard
-          label="Total projects"
-          value={s.projects.length}
-          hint={`${s.projects.filter((p) => p.status === "active").length} active, ${s.projects.filter((p) => p.status === "completed").length} completed`}
+          label={me.role === "Admin" ? "Total projects" : "Managed projects"}
+          value={scoped.length}
+          hint={`${scoped.filter((p) => p.status === "active").length} active, ${scoped.filter((p) => p.status === "completed").length} completed`}
           icon={Briefcase}
           tone="primary"
         />
@@ -257,14 +268,18 @@ export function Projects() {
                       {estValue > 0 ? formatMoney(estValue, cur) : "—"}
                     </td>
                     <td className="px-5 py-3.5 text-right">
-                      <Button
-                        size="icon"
-                        variant="ghost"
-                        aria-label={`Edit ${p.name}`}
-                        onClick={() => setEditing(p)}
-                      >
-                        <Pencil className="size-4 text-muted-foreground" />
-                      </Button>
+                      {me.role === "Admin" || p.managerId === me.id ? (
+                        <Button
+                          size="icon"
+                          variant="ghost"
+                          aria-label={`Edit ${p.name}`}
+                          onClick={() => setEditing(p)}
+                        >
+                          <Pencil className="size-4 text-muted-foreground" />
+                        </Button>
+                      ) : (
+                        <span className="text-xs text-muted-foreground font-mono">—</span>
+                      )}
                     </td>
                   </tr>
                 );
@@ -295,6 +310,7 @@ function ProjectEditor({
   onClose: () => void;
   state: ReturnType<typeof useDemo>;
 }) {
+  const me = useMe();
   const [f, setF] = useState({
     name: project?.name ?? "",
     clientId: project?.clientId ?? "",
@@ -317,10 +333,19 @@ function ProjectEditor({
       .map((t) => t.trim())
       .filter(Boolean);
 
+    const isNew = !project;
     upsertProject({
       id: project?.id ?? uid("p"),
       ...r.data,
       tasks: tasks.length ? tasks : ["General"],
+    });
+
+    addAuditLog({
+      actorId: me.id,
+      actorName: me.name,
+      action: isNew ? "Project Created" : "Project Updated",
+      category: "project",
+      details: `${isNew ? "Created" : "Updated"} project "${r.data.name}" (budget: ${r.data.budgetHours}h, rate: ${r.data.rate})`,
     });
 
     toast.success(project ? "Project updated" : "Project created successfully");

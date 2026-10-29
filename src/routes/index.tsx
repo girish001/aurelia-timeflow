@@ -11,6 +11,9 @@ import {
   Briefcase,
   Info,
   Check,
+  Calendar,
+  ShieldCheck,
+  Sparkles,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -259,64 +262,103 @@ function Landing() {
 }
 
 function ProductPreview() {
-  const bars = [62, 74, 58, 81, 70, 88];
   return (
-    <div className="relative rounded-2xl border bg-card p-5 shadow-elevated" aria-hidden>
-      <div className="flex items-center justify-between">
-        <p className="text-sm font-semibold">Team hours · last 6 weeks</p>
-        <span className="rounded-full bg-teal-soft px-2.5 py-0.5 text-xs font-medium text-accent-foreground">
-          Demo
+    <div className="relative rounded-2xl border bg-card p-6 shadow-elevated">
+      <div className="flex items-center justify-between border-b pb-4">
+        <div className="flex items-center gap-2.5">
+          <span className="grid size-9 place-items-center rounded-lg bg-primary/10 text-primary">
+            <Sparkles className="size-4.5" />
+          </span>
+          <div>
+            <p className="text-sm font-bold text-foreground">Aurelia TimeFlow Platform</p>
+            <p className="text-xs text-muted-foreground">
+              Unified Time, Approvals & Resource Governance
+            </p>
+          </div>
+        </div>
+        <span className="rounded-md border border-primary/20 bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary">
+          Enterprise SaaS
         </span>
       </div>
-      <div className="mt-4 grid grid-cols-3 gap-3">
-        {[
-          ["Hours this week", "214"],
-          ["Pending approvals", "4"],
-          ["Utilization", "82%"],
-        ].map(([l, v]) => (
-          <div key={l} className="rounded-lg bg-muted p-3">
-            <p className="text-[0.65rem] text-muted-foreground">{l}</p>
-            <p className="text-xl font-bold tabular">{v}</p>
+
+      <div className="mt-5 space-y-3">
+        {/* Module 1: Timesheet & Hour Tracking */}
+        <div className="flex items-start gap-3 rounded-xl border bg-muted/30 p-3.5 transition-colors hover:bg-muted/50">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary text-primary">
+            <Clock className="size-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-foreground">Weekly Timesheet Engine</p>
+              <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                Active
+              </span>
+            </div>
+            <p className="mt-0.5 text-xs text-muted-foreground leading-relaxed">
+              Keyboard-driven weekly grid, billable task tracking & validation checks.
+            </p>
           </div>
-        ))}
-      </div>
-      <div className="mt-5 flex h-36 items-end gap-3 border-b pb-1">
-        {bars.map((b, i) => (
-          <div
-            key={i}
-            className="flex flex-1 flex-col justify-end overflow-hidden rounded-t-md"
-            style={{ height: `${b}%` }}
-          >
-            <div className="bg-teal" style={{ height: "22%" }} />
-            <div className="flex-1 bg-primary" />
+        </div>
+
+        {/* Module 2: Manager Approvals */}
+        <div className="flex items-start gap-3 rounded-xl border bg-muted/30 p-3.5 transition-colors hover:bg-muted/50">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-teal-soft text-accent-foreground">
+            <CheckSquare className="size-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-foreground">Manager Approval Workflow</p>
+              <span className="text-[10px] font-medium text-primary">Multi-level</span>
+            </div>
+            <p className="mt-0.5 text-xs text-muted-foreground leading-relaxed">
+              Review weekly submissions, one-click approvals, and audit trail feedback.
+            </p>
           </div>
-        ))}
-      </div>
-      <div className="mt-4 space-y-2">
-        {[
-          ["Arjun M.", "40.5h", "Submitted"],
-          ["Kavya N.", "38h", "Approved"],
-        ].map(([n, h, st]) => (
-          <div
-            key={n}
-            className="flex items-center justify-between rounded-lg border px-3 py-2 text-sm"
-          >
-            <span className="font-medium">{n}</span>
-            <span className="tabular text-muted-foreground">{h}</span>
-            <span
-              className={
-                st === "Approved"
-                  ? "text-xs font-medium text-success"
-                  : "text-xs font-medium text-warning-foreground"
-              }
-            >
-              {st}
-            </span>
+        </div>
+
+        {/* Module 3: Team Leave & Capacity Calendar */}
+        <div className="flex items-start gap-3 rounded-xl border bg-muted/30 p-3.5 transition-colors hover:bg-muted/50">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-secondary text-primary">
+            <Calendar className="size-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-foreground">
+                Team Leave & Resource Calendar
+              </p>
+              <span className="text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                Conflict Check
+              </span>
+            </div>
+            <p className="mt-0.5 text-xs text-muted-foreground leading-relaxed">
+              Month-based timeline, categorized balances and absence planning.
+            </p>
           </div>
-        ))}
+        </div>
+
+        {/* Module 4: Project Budgets & Reports */}
+        <div className="flex items-start gap-3 rounded-xl border bg-muted/30 p-3.5 transition-colors hover:bg-muted/50">
+          <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-warning/15 text-warning-foreground">
+            <BarChart3 className="size-4" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center justify-between gap-2">
+              <p className="text-xs font-semibold text-foreground">
+                Utilization & Financial Reports
+              </p>
+              <span className="text-[10px] font-medium text-muted-foreground">CSV Export</span>
+            </div>
+            <p className="mt-0.5 text-xs text-muted-foreground leading-relaxed">
+              Real-time billable utilization, client budget burn alerts and exports.
+            </p>
+          </div>
+        </div>
       </div>
-      <div className="absolute -bottom-4 -left-4 hidden items-center gap-2 rounded-lg border bg-card px-3 py-2 text-xs font-medium shadow-card sm:flex">
-        <Download className="size-3.5 text-primary" /> CSV export ready
+
+      {/* Enterprise Governance Banner */}
+      <div className="mt-5 flex items-center gap-2 rounded-xl border border-primary/20 bg-primary/5 p-3 text-xs text-foreground font-medium">
+        <ShieldCheck className="size-4 text-primary shrink-0" />
+        <span>Enterprise Role-Based Governance (Admin • Manager • Employee)</span>
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { isValidElement, type ReactNode } from "react";
 import type { LucideIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 
@@ -6,18 +6,21 @@ export function PageHeader({
   title,
   description,
   actions,
+  action,
 }: {
   title: string;
-  description?: string;
+  description?: string | undefined;
   actions?: ReactNode;
+  action?: ReactNode;
 }) {
+  const headerActions = actions ?? action;
   return (
     <div className="mb-6 flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
       <div>
         <h1 className="text-2xl font-bold text-foreground sm:text-[1.7rem]">{title}</h1>
         {description && <p className="mt-1 text-sm text-muted-foreground">{description}</p>}
       </div>
-      {actions && <div className="flex flex-wrap items-center gap-2">{actions}</div>}
+      {headerActions && <div className="flex flex-wrap items-center gap-2">{headerActions}</div>}
     </div>
   );
 }
@@ -31,7 +34,7 @@ export function Panel({
   title?: ReactNode;
   action?: ReactNode;
   children: ReactNode;
-  className?: string;
+  className?: string | undefined;
 }) {
   return (
     <section className={cn("rounded-xl border bg-card shadow-card", className)}>
@@ -50,14 +53,16 @@ export function StatCard({
   label,
   value,
   hint,
+  meta,
   icon: Icon,
   tone = "primary",
 }: {
   label: string;
   value: ReactNode;
   hint?: ReactNode;
-  icon: LucideIcon;
-  tone?: "primary" | "teal" | "warning" | "success";
+  meta?: ReactNode;
+  icon: LucideIcon | ReactNode;
+  tone?: "primary" | "teal" | "warning" | "success" | undefined;
 }) {
   const tones = {
     primary: "bg-secondary text-primary",
@@ -65,16 +70,18 @@ export function StatCard({
     warning: "bg-warning/15 text-warning-foreground",
     success: "bg-success/12 text-success",
   };
+  const subtext = hint ?? meta;
+  const IconComp = Icon as LucideIcon;
   return (
     <div className="rounded-xl border bg-card p-5 shadow-card">
       <div className="flex items-start justify-between">
         <p className="text-sm font-medium text-muted-foreground">{label}</p>
         <span className={cn("grid size-9 place-items-center rounded-lg", tones[tone])}>
-          <Icon className="size-4.5" aria-hidden />
+          {isValidElement(Icon) ? Icon : <IconComp className="size-4.5" aria-hidden />}
         </span>
       </div>
       <p className="mt-3 text-3xl font-bold tabular text-foreground">{value}</p>
-      {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
+      {subtext && <p className="mt-1 text-xs text-muted-foreground">{subtext}</p>}
     </div>
   );
 }
@@ -108,26 +115,44 @@ export function EmptyState({
   icon: Icon,
   title,
   text,
+  description,
   action,
 }: {
   icon: LucideIcon;
   title: string;
-  text?: string;
+  text?: string | undefined;
+  description?: string | undefined;
   action?: ReactNode;
 }) {
+  const body = text ?? description;
   return (
     <div className="flex flex-col items-center justify-center rounded-lg border border-dashed px-6 py-12 text-center">
       <span className="grid size-11 place-items-center rounded-full bg-secondary text-primary">
         <Icon className="size-5" aria-hidden />
       </span>
       <p className="mt-3 font-semibold text-foreground">{title}</p>
-      {text && <p className="mt-1 max-w-sm text-sm text-muted-foreground">{text}</p>}
+      {body && <p className="mt-1 max-w-sm text-sm text-muted-foreground">{body}</p>}
       {action && <div className="mt-4">{action}</div>}
     </div>
   );
 }
 
-export function Initials({ name, className }: { name: string; className?: string }) {
+const initialsSizes: Record<string, string> = {
+  xs: "size-6 text-[10px]",
+  sm: "size-7 text-xs",
+  md: "size-8 text-xs",
+  lg: "size-10 text-sm",
+};
+
+export function Initials({
+  name,
+  className,
+  size = "md",
+}: {
+  name: string;
+  className?: string | undefined;
+  size?: "xs" | "sm" | "md" | "lg" | undefined;
+}) {
   const i = name
     .split(" ")
     .map((p) => p[0])
@@ -136,7 +161,8 @@ export function Initials({ name, className }: { name: string; className?: string
   return (
     <span
       className={cn(
-        "grid size-8 shrink-0 place-items-center rounded-full bg-secondary text-xs font-semibold text-primary",
+        "grid shrink-0 place-items-center rounded-full bg-secondary font-semibold text-primary",
+        initialsSizes[size] ?? initialsSizes["md"],
         className,
       )}
       aria-hidden

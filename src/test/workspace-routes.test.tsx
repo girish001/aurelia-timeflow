@@ -14,6 +14,8 @@ import { endDemoSession, resetDemo, startDemoSession, type Role } from "@/lib/de
 import { canAccess, pageFromPath, ROLE_LABEL } from "@/lib/rules";
 import { Route as AppRoute } from "@/routes/app";
 import { Route as ApprovalsRoute } from "@/routes/app.approvals";
+import { Route as AuditRoute } from "@/routes/app.audit";
+import { Route as CalendarRoute } from "@/routes/app.calendar";
 import { Route as ClientsRoute } from "@/routes/app.clients";
 import { Route as IndexRoute } from "@/routes/app.index";
 import { Route as ProjectsRoute } from "@/routes/app.projects";
@@ -33,11 +35,13 @@ const pages: [string, string, Comp][] = [
   ["/app", "/", IndexRoute],
   ["/app/timesheet", "/timesheet", TimesheetRoute],
   ["/app/timeoff", "/timeoff", TimeoffRoute],
+  ["/app/calendar", "/calendar", CalendarRoute],
   ["/app/approvals", "/approvals", ApprovalsRoute],
   ["/app/projects", "/projects", ProjectsRoute],
   ["/app/clients", "/clients", ClientsRoute],
   ["/app/reports", "/reports", ReportsRoute],
   ["/app/team", "/team", TeamRoute],
+  ["/app/audit", "/audit", AuditRoute],
   ["/app/settings", "/settings", SettingsRoute],
 ];
 

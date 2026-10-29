@@ -10,9 +10,9 @@ export interface Client {
   email: string;
   country: string;
   status: Status;
-  phone?: string;
-  billingTerms?: string;
-  taxId?: string;
+  phone?: string | undefined;
+  billingTerms?: string | undefined;
+  taxId?: string | undefined;
 }
 export type ProjectStatus = "active" | "on-hold" | "completed";
 export interface Project {
@@ -22,7 +22,7 @@ export interface Project {
   managerId: string;
   status: ProjectStatus;
   budgetHours: number;
-  plannedHours?: number;
+  plannedHours?: number | undefined;
   rate: number;
   tasks: string[];
 }
@@ -34,9 +34,9 @@ export interface Member {
   title: string;
   role: Role;
   status: "active" | "invited" | "inactive";
-  department?: string;
-  reportingManagerId?: string;
-  phone?: string;
+  department?: string | undefined;
+  reportingManagerId?: string | undefined;
+  phone?: string | undefined;
 }
 export interface Entry {
   id: string;
@@ -75,11 +75,11 @@ export interface Settings {
   timeFormat: TimeFormat;
   currency: "INR" | "USD";
   dailyTarget: number;
-  lockApproved?: boolean;
-  allowOvertime?: boolean;
-  roundingStep?: number;
-  requireRejectReason?: boolean;
-  leavePolicy?: LeavePolicySettings;
+  lockApproved?: boolean | undefined;
+  allowOvertime?: boolean | undefined;
+  roundingStep?: number | undefined;
+  requireRejectReason?: boolean | undefined;
+  leavePolicy?: LeavePolicySettings | undefined;
 }
 export type LeaveType = "annual" | "sick" | "personal" | "unpaid";
 export type LeaveStatus = "pending" | "approved" | "rejected";
@@ -120,7 +120,8 @@ export interface AuditLogItem {
     | "settings"
     | "auth"
     | "leave"
-    | "allocation";
+    | "allocation"
+    | "policy";
   details: string;
   timestamp: string;
 }
@@ -132,7 +133,7 @@ export interface AppNotification {
   type: "info" | "success" | "warning" | "alert";
   timestamp: string;
   read: boolean;
-  link?: string;
+  link?: string | undefined;
 }
 export type HolidayType = "national" | "gazetted" | "festival" | "company";
 
@@ -142,9 +143,8 @@ export interface CompanyHoliday {
   date: string; // YYYY-MM-DD
   type: HolidayType;
   mandatory: boolean;
-  description?: string;
+  description?: string | undefined;
 }
-
 
 export interface State {
   version: number;
@@ -269,7 +269,7 @@ export function getDefaultHolidays(year = 2026): CompanyHoliday[] {
     },
     {
       id: "h_13",
-      name: "Christmas Day",
+      name: "Christmas",
       date: `${y}-12-25`,
       type: "gazetted",
       mandatory: true,

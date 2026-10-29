@@ -348,9 +348,10 @@ function Editor({
     setLastSaved(nowTime);
     setShowConfirmSubmit(false);
     if (status === "submitted") {
+      const actor = state.members.find((m) => m.id === CURRENT_USER_ID);
       addAuditLog({
-        actorId: me.id,
-        actorName: me.name,
+        actorId: CURRENT_USER_ID,
+        actorName: actor?.name ?? "Employee",
         action: "Timesheet Submitted",
         category: "timesheet",
         details: `Submitted ${total.toFixed(1)}h timesheet for week ${week}`,

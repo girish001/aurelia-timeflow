@@ -387,6 +387,7 @@ export function TimeOffPage() {
       name: newHolidayName.trim(),
       date: newHolidayDate,
       type: newHolidayType,
+      mandatory: true,
       description: newHolidayDescription.trim() || undefined,
     };
     upsertHoliday(holiday);
@@ -938,12 +939,16 @@ export function TimeOffPage() {
                   <h2 className="font-semibold text-foreground">
                     Official Holiday Calendar ({currentYear})
                   </h2>
-                  <Badge variant="outline" className="bg-primary/5 text-primary border-primary/20 text-xs">
+                  <Badge
+                    variant="outline"
+                    className="bg-primary/5 text-primary border-primary/20 text-xs"
+                  >
                     {s.holidays?.length ?? 0} Paid Holidays
                   </Badge>
                 </div>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  Official company-recognized holidays. Leaves booked on holidays are automatically excluded from leave deductions.
+                  Official company-recognized holidays. Leaves booked on holidays are automatically
+                  excluded from leave deductions.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2.5">
@@ -1066,7 +1071,9 @@ export function TimeOffPage() {
                       <th className="px-5 py-3">Holiday Name</th>
                       <th className="px-5 py-3 w-32">Category</th>
                       <th className="px-5 py-3">Observance & Details</th>
-                      {me.role !== "Employee" && <th className="px-5 py-3 text-right w-20">Actions</th>}
+                      {me.role !== "Employee" && (
+                        <th className="px-5 py-3 text-right w-20">Actions</th>
+                      )}
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
@@ -1087,7 +1094,9 @@ export function TimeOffPage() {
                                 {format(dateObj, "MMM d, yyyy")}
                               </span>
                               {isToday && (
-                                <Badge className="bg-emerald-600 text-[10px] px-1 py-0 h-4">Today</Badge>
+                                <Badge className="bg-emerald-600 text-[10px] px-1 py-0 h-4">
+                                  Today
+                                </Badge>
                               )}
                             </div>
                           </td>
@@ -1139,7 +1148,8 @@ export function TimeOffPage() {
             <div className="border-t px-5 py-3 bg-muted/20 text-xs text-muted-foreground flex items-center gap-2">
               <Info className="size-4 shrink-0 text-primary" />
               <span>
-                Note: All 13 company holidays are fully paid. When an employee takes leave spanning any of these dates, TimeFlow automatically deducts 0 working days for holiday dates.
+                Note: All 13 company holidays are fully paid. When an employee takes leave spanning
+                any of these dates, TimeFlow automatically deducts 0 working days for holiday dates.
               </span>
             </div>
           </div>
@@ -1205,10 +1215,14 @@ export function TimeOffPage() {
                     My Entitlements
                   </Badge>
                   <span className="text-sm font-bold text-foreground">{me.name}</span>
-                  <span className="text-xs text-muted-foreground">({me.role} · {me.title})</span>
+                  <span className="text-xs text-muted-foreground">
+                    ({me.role} · {me.title})
+                  </span>
                 </div>
                 <p className="text-xs text-muted-foreground mt-1">
-                  You accrue <strong className="text-foreground">1.5 days of Paid Leave (PL)</strong> every month. You have accrued{" "}
+                  You accrue{" "}
+                  <strong className="text-foreground">1.5 days of Paid Leave (PL)</strong> every
+                  month. You have accrued{" "}
                   <strong className="text-foreground">
                     {calculateMonthlyAccrual(new Date()).accruedToDate} days
                   </strong>{" "}
@@ -1245,7 +1259,9 @@ export function TimeOffPage() {
                 </span>
               </div>
               <div className="rounded-lg bg-background/80 p-3 border">
-                <span className="text-xs text-muted-foreground block">Personal Leave (5d grant)</span>
+                <span className="text-xs text-muted-foreground block">
+                  Personal Leave (5d grant)
+                </span>
                 <span className="text-lg font-bold text-amber-600 tabular-nums">
                   {memberAllLeaveBalances(s, me.id, currentYear).personal.remaining}d remaining
                 </span>
@@ -1276,7 +1292,8 @@ export function TimeOffPage() {
                   Staff Leave Entitlements Directory ({currentYear})
                 </h2>
                 <p className="text-xs text-muted-foreground mt-0.5">
-                  Consolidated monthly PL accruals, annual sick/personal leave allotments, and utilization for all staff.
+                  Consolidated monthly PL accruals, annual sick/personal leave allotments, and
+                  utilization for all staff.
                 </p>
               </div>
               <div className="relative w-52">
@@ -1343,7 +1360,10 @@ export function TimeOffPage() {
                           </div>
                         </td>
                         <td className="px-4 py-3 text-center">
-                          <Badge variant="outline" className="font-mono text-xs text-primary bg-primary/5 border-primary/20">
+                          <Badge
+                            variant="outline"
+                            className="font-mono text-xs text-primary bg-primary/5 border-primary/20"
+                          >
                             +{ent.monthlyPaidLeaveAccrual}d / mo
                           </Badge>
                         </td>
@@ -1363,7 +1383,9 @@ export function TimeOffPage() {
                           </span>
                         </td>
                         <td className="px-5 py-3 text-right font-mono tabular-nums">
-                          <span className="font-bold text-amber-600">{ent.personal.remaining}d</span>
+                          <span className="font-bold text-amber-600">
+                            {ent.personal.remaining}d
+                          </span>
                           <span className="text-xs text-muted-foreground ml-1">
                             ({ent.personal.used}d used)
                           </span>
@@ -1375,11 +1397,17 @@ export function TimeOffPage() {
                           {isOnLeave ? (
                             <Badge className="bg-amber-500 text-white text-[11px]">On Leave</Badge>
                           ) : hasPending ? (
-                            <Badge variant="outline" className="text-amber-600 border-amber-300 text-[11px]">
+                            <Badge
+                              variant="outline"
+                              className="text-amber-600 border-amber-300 text-[11px]"
+                            >
                               {ent.totalPending}d Pending
                             </Badge>
                           ) : (
-                            <Badge variant="outline" className="text-emerald-600 border-emerald-300 text-[11px]">
+                            <Badge
+                              variant="outline"
+                              className="text-emerald-600 border-emerald-300 text-[11px]"
+                            >
                               Active
                             </Badge>
                           )}
@@ -1417,9 +1445,13 @@ export function TimeOffPage() {
                 <PartyPopper className="size-4 shrink-0 mt-0.5 text-emerald-600" />
                 <div>
                   <span className="font-semibold">
-                    Includes {rangeHolidays.length} company holiday{rangeHolidays.length > 1 ? "s" : ""}:
+                    Includes {rangeHolidays.length} company holiday
+                    {rangeHolidays.length > 1 ? "s" : ""}:
                   </span>{" "}
-                  {rangeHolidays.map((h) => `${h.name} (${format(parseISO(h.date), "MMM d")})`).join(", ")}.
+                  {rangeHolidays
+                    .map((h) => `${h.name} (${format(parseISO(h.date), "MMM d")})`)
+                    .join(", ")}
+                  .
                   <span className="block mt-0.5 text-[11px] text-emerald-700 dark:text-emerald-400">
                     Official holidays are paid and automatically excluded from your leave deduction!
                   </span>
@@ -1629,7 +1661,8 @@ export function TimeOffPage() {
           <DialogHeader>
             <DialogTitle>Add Official Company Holiday</DialogTitle>
             <DialogDescription>
-              Configure an official paid holiday. Days marked as holidays are not deducted from employee leave quotas.
+              Configure an official paid holiday. Days marked as holidays are not deducted from
+              employee leave quotas.
             </DialogDescription>
           </DialogHeader>
 

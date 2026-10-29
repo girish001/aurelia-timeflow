@@ -385,7 +385,7 @@ describe("Phase 2 - Permission Scoping & Access Control", () => {
     // Employee team view should contain ONLY themselves
     const members = scopedMembers(s, employee);
     expect(members).toHaveLength(1);
-    expect(members[0].id).toBe(employee.id);
+    expect(members[0]?.id).toBe(employee.id);
 
     // Employee timesheets should only be their own
     const timesheets = scopedTimesheets(s, employee);

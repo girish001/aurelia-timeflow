@@ -184,7 +184,7 @@ export function LeaveBalanceProgress({
                       config.accent.badgeBorder,
                     )}
                   >
-                    {config.type === "annual" ? "1.5d/mo (18d/yr)" : `${bal.entitlement}d / yr`}
+                    {bal.entitlement}d / yr
                   </Badge>
                 </div>
 

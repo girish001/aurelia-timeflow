@@ -42,6 +42,7 @@ import {
   useMe,
   addAuditLog,
   type Project,
+  type State,
 } from "@/lib/demo-store";
 import { formatHours, formatMoney } from "@/lib/time";
 import { scopedProjects } from "@/lib/rules";
@@ -308,7 +309,7 @@ function ProjectEditor({
 }: {
   project: Project | null;
   onClose: () => void;
-  state: ReturnType<typeof useDemo>;
+  state: State;
 }) {
   const me = useMe();
   const [f, setF] = useState({

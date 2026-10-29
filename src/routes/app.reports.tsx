@@ -79,10 +79,15 @@ export function Reports() {
     .reduce((a, r) => a + r.hours * (proj(r.projectId)?.rate ?? 0), 0);
 
   const breakdown = useMemo(() => {
+    const getProj = (id: string) => s.projects.find((p) => p.id === id);
+    const getClientName = (pid: string) =>
+      s.clients.find((c) => c.id === getProj(pid)?.clientId)?.name ?? "Internal";
+    const getMemberName = (id: string) => s.members.find((m) => m.id === id)?.name ?? "Unknown";
+
     const key = (r: (typeof rows)[number]) => {
-      if (group === "project") return proj(r.projectId)?.name ?? "Internal";
-      if (group === "client") return clientName(r.projectId);
-      if (group === "employee") return memberName(r.memberId);
+      if (group === "project") return getProj(r.projectId)?.name ?? "Internal";
+      if (group === "client") return getClientName(r.projectId);
+      if (group === "employee") return getMemberName(r.memberId);
       return format(parseISO(r.date), "MMM yyyy");
     };
 
@@ -95,7 +100,7 @@ export function Reports() {
       const e = map.get(k) ?? { name: k, billable: 0, nonBillable: 0, value: 0 };
       if (r.billable) {
         e.billable += r.hours;
-        e.value += r.hours * (proj(r.projectId)?.rate ?? 0);
+        e.value += r.hours * (getProj(r.projectId)?.rate ?? 0);
       } else {
         e.nonBillable += r.hours;
       }

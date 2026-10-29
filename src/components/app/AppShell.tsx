@@ -212,9 +212,7 @@ function SidebarBody({ onNavigate }: { onNavigate?: (() => void) | undefined }) 
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const [open, setOpen] = useState(false);
   const me = useMe();
-  const navigate = useNavigate();
   const rawMembers = useDemo((s) => s.members);
   const allMembers = useMemo(() => rawMembers.filter((m) => m.status === "active"), [rawMembers]);
   const notifications = useDemo((s) => s.notifications);
@@ -234,27 +232,14 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="flex min-h-screen w-full bg-background">
-      <aside className="sticky top-0 hidden h-screen w-64 shrink-0 lg:block border-r border-sidebar-border">
+      <aside
+        aria-label="Sidebar navigation"
+        className="sticky top-0 block h-screen w-56 sm:w-64 shrink-0 overflow-y-auto border-r border-sidebar-border bg-sidebar"
+      >
         <SidebarBody />
       </aside>
-      <Sheet open={open} onOpenChange={setOpen}>
-        <SheetContent side="left" className="w-72 border-0 p-0">
-          <SheetTitle className="sr-only">Navigation</SheetTitle>
-          <SidebarBody onNavigate={() => setOpen(false)} />
-        </SheetContent>
-      </Sheet>
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="sticky top-0 z-20 flex h-16 items-center gap-3 border-b bg-card/90 px-4 backdrop-blur-md sm:px-6">
-          <Button
-            variant="ghost"
-            size="icon"
-            className="lg:hidden"
-            onClick={() => setOpen(true)}
-            aria-label="Open navigation"
-          >
-            <Menu />
-          </Button>
-
           {/* Demo workspace pill (Required by tests and UX) */}
           <span className="inline-flex items-center gap-1.5 rounded-full border border-teal/30 bg-teal-soft px-3 py-1 text-xs font-semibold text-accent-foreground">
             <span className="size-1.5 rounded-full bg-teal animate-pulse" aria-hidden /> Demo

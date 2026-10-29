@@ -433,7 +433,7 @@ export function dayLoad(allocs: Allocation[], memberId: string, date: string, ex
 
 export function checkAllocation(
   s: State,
-  draft: { id?: string; memberId: string; date: string; hours: number },
+  draft: { id?: string | undefined; memberId: string; date: string; hours: number },
 ) {
   const capacity = s.settings.dailyTarget || 8;
   const total = dayLoad(s.allocations, draft.memberId, draft.date, draft.id) + draft.hours;

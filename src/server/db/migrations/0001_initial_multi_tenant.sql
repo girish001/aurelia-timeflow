@@ -1,12 +1,14 @@
 -- ============================================================================
 -- Aurelia TimeFlow Multi-Tenant SaaS Migration: 0001_initial_multi_tenant.sql
--- Target: Private AWS RDS / Aurora PostgreSQL (ap-south-1, Publicly accessible = No)
+-- Target: Private AWS RDS PostgreSQL (ap-south-1, Publicly accessible = No)
 -- Execution: Transactional DDL (BEGIN ... COMMIT). Any failure rolls back atomically.
+-- Retry Safety: Uses IF NOT EXISTS / DROP POLICY IF EXISTS for idempotent re-runs.
 -- ============================================================================
 
 BEGIN;
 
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- Native gen_random_uuid() is built into PostgreSQL 13+ (AWS RDS PostgreSQL 14/15/16/17)
+-- without requiring superuser extension privileges.
 
 -- ============================================================================
 -- 1. Core Tenant, Identity & Governance Tables (Ordered by FK Dependencies)
@@ -29,7 +31,9 @@ CREATE TABLE IF NOT EXISTS tenants (
   require_reject_reason BOOLEAN NOT NULL DEFAULT TRUE,
   leave_policy_json JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT tenants_status_check CHECK (status IN ('provisioning', 'onboarding', 'trial', 'active', 'suspended', 'archived')),
+  CONSTRAINT tenants_onboarding_mode_check CHECK (onboarding_mode IN ('self_service', 'assisted_enterprise'))
 );
 
 -- [2/23] tenant_domains
@@ -56,7 +60,8 @@ CREATE TABLE IF NOT EXISTS users (
   status VARCHAR(32) NOT NULL DEFAULT 'active',
   last_login_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT users_status_check CHECK (status IN ('active', 'locked', 'disabled'))
 );
 
 -- [4/23] departments
@@ -84,6 +89,7 @@ CREATE TABLE IF NOT EXISTS memberships (
   joined_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT memberships_status_check CHECK (status IN ('invited', 'active', 'inactive', 'offboarded')),
   UNIQUE (tenant_id, user_id),
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL
@@ -140,6 +146,7 @@ CREATE TABLE IF NOT EXISTS reporting_lines (
   effective_to DATE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT reporting_no_self_loop CHECK (subordinate_membership_id <> manager_membership_id),
+  CONSTRAINT reporting_lines_relationship_type_check CHECK (relationship_type IN ('primary_hr', 'dotted_line')),
   UNIQUE (tenant_id, subordinate_membership_id, manager_membership_id, relationship_type),
   FOREIGN KEY (tenant_id, subordinate_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE
@@ -159,6 +166,7 @@ CREATE TABLE IF NOT EXISTS invitations (
   expires_at TIMESTAMPTZ NOT NULL,
   accepted_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT invitations_status_check CHECK (status IN ('pending', 'accepted', 'expired', 'revoked')),
   FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL,
   FOREIGN KEY (tenant_id, reporting_manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL,
   FOREIGN KEY (tenant_id, invited_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
@@ -178,7 +186,9 @@ CREATE TABLE IF NOT EXISTS identity_connections (
   enforce_sso_only BOOLEAN NOT NULL DEFAULT FALSE,
   jit_provisioning_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT identity_connections_provider_check CHECK (provider IN ('entra_oidc', 'google_oidc', 'saml')),
+  CONSTRAINT identity_connections_status_check CHECK (status IN ('draft', 'testing', 'active', 'disabled'))
 );
 
 -- [13/23] subscriptions
@@ -193,7 +203,8 @@ CREATE TABLE IF NOT EXISTS subscriptions (
   current_period_end TIMESTAMPTZ NOT NULL,
   provisioned_by_platform_user_id UUID REFERENCES users(id) ON DELETE SET NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT subscriptions_status_check CHECK (status IN ('trialing', 'active', 'past_due', 'canceled'))
 );
 
 -- [14/23] audit_logs
@@ -244,6 +255,7 @@ CREATE TABLE IF NOT EXISTS projects (
   billable_rate NUMERIC(12,2) NOT NULL,
   tasks_json JSONB NOT NULL DEFAULT '[]'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT projects_status_check CHECK (status IN ('active', 'on-hold', 'completed')),
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, client_id) REFERENCES clients(tenant_id, id) ON DELETE RESTRICT,
   FOREIGN KEY (tenant_id, project_manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE RESTRICT
@@ -259,6 +271,7 @@ CREATE TABLE IF NOT EXISTS project_memberships (
   can_approve_timesheets BOOLEAN NOT NULL DEFAULT FALSE,
   can_manage_allocations BOOLEAN NOT NULL DEFAULT FALSE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT project_memberships_role_check CHECK (project_role IN ('project_manager', 'team_lead', 'contributor', 'viewer')),
   UNIQUE (tenant_id, project_id, membership_id),
   FOREIGN KEY (tenant_id, project_id) REFERENCES projects(tenant_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE
@@ -277,6 +290,7 @@ CREATE TABLE IF NOT EXISTS timesheets (
   review_comment TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT timesheets_status_check CHECK (status IN ('draft', 'submitted', 'approved', 'rejected')),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, membership_id, week_start),
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
@@ -311,6 +325,9 @@ CREATE TABLE IF NOT EXISTS leave_requests (
   reviewed_by_membership_id UUID,
   review_comment TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT leave_requests_type_check CHECK (type IN ('annual', 'sick', 'personal', 'unpaid')),
+  CONSTRAINT leave_requests_partial_check CHECK (partial IN ('full', 'am', 'pm')),
+  CONSTRAINT leave_requests_status_check CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
@@ -328,6 +345,8 @@ CREATE TABLE IF NOT EXISTS approvals (
   comment TEXT,
   decided_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT approvals_target_type_check CHECK (target_type IN ('timesheet', 'leave_request')),
+  CONSTRAINT approvals_status_check CHECK (status IN ('pending', 'approved', 'rejected')),
   FOREIGN KEY (tenant_id, requester_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, approver_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
 );
@@ -342,6 +361,7 @@ CREATE TABLE IF NOT EXISTS resource_allocations (
   hours NUMERIC(4,2) NOT NULL,
   status VARCHAR(32) NOT NULL DEFAULT 'confirmed',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT resource_allocations_status_check CHECK (status IN ('tentative', 'confirmed')),
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
   FOREIGN KEY (tenant_id, project_id) REFERENCES projects(tenant_id, id) ON DELETE CASCADE
 );
@@ -359,7 +379,7 @@ CREATE TABLE IF NOT EXISTS company_holidays (
 );
 
 -- ============================================================================
--- 3. Performance & Tenant Scoping Indexes (22 Indexes)
+-- 3. Performance & Tenant Scoping Indexes (26 Indexes)
 -- ============================================================================
 
 CREATE INDEX IF NOT EXISTS tenants_status_idx ON tenants (status);
@@ -391,25 +411,47 @@ CREATE INDEX IF NOT EXISTS company_holidays_tenant_idx ON company_holidays (tena
 
 -- ============================================================================
 -- 4. Row-Level Security (RLS) Defense-in-Depth (17 Tenant-Scoped Tables)
+--    Global/System Tables (6): tenants, users, roles, permissions,
+--    role_permissions, subscriptions (deliberately excluded from tenant RLS;
+--    governed by authenticated membership & platform-admin guards).
+--    Application Role Requirement: NOSUPERUSER NOBYPASSRLS.
+--    FORCE ROW LEVEL SECURITY ensures even table-owner connections obey RLS.
 -- ============================================================================
 
 ALTER TABLE tenant_domains ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tenant_domains FORCE ROW LEVEL SECURITY;
 ALTER TABLE departments ENABLE ROW LEVEL SECURITY;
+ALTER TABLE departments FORCE ROW LEVEL SECURITY;
 ALTER TABLE memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE memberships FORCE ROW LEVEL SECURITY;
 ALTER TABLE membership_roles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE membership_roles FORCE ROW LEVEL SECURITY;
 ALTER TABLE reporting_lines ENABLE ROW LEVEL SECURITY;
+ALTER TABLE reporting_lines FORCE ROW LEVEL SECURITY;
 ALTER TABLE invitations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE invitations FORCE ROW LEVEL SECURITY;
 ALTER TABLE identity_connections ENABLE ROW LEVEL SECURITY;
+ALTER TABLE identity_connections FORCE ROW LEVEL SECURITY;
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
+ALTER TABLE audit_logs FORCE ROW LEVEL SECURITY;
 ALTER TABLE clients ENABLE ROW LEVEL SECURITY;
+ALTER TABLE clients FORCE ROW LEVEL SECURITY;
 ALTER TABLE projects ENABLE ROW LEVEL SECURITY;
+ALTER TABLE projects FORCE ROW LEVEL SECURITY;
 ALTER TABLE project_memberships ENABLE ROW LEVEL SECURITY;
+ALTER TABLE project_memberships FORCE ROW LEVEL SECURITY;
 ALTER TABLE timesheets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE timesheets FORCE ROW LEVEL SECURITY;
 ALTER TABLE timesheet_entries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE timesheet_entries FORCE ROW LEVEL SECURITY;
 ALTER TABLE leave_requests ENABLE ROW LEVEL SECURITY;
+ALTER TABLE leave_requests FORCE ROW LEVEL SECURITY;
 ALTER TABLE approvals ENABLE ROW LEVEL SECURITY;
+ALTER TABLE approvals FORCE ROW LEVEL SECURITY;
 ALTER TABLE resource_allocations ENABLE ROW LEVEL SECURITY;
+ALTER TABLE resource_allocations FORCE ROW LEVEL SECURITY;
 ALTER TABLE company_holidays ENABLE ROW LEVEL SECURITY;
+ALTER TABLE company_holidays FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS tenant_isolation_tenant_domains ON tenant_domains;
 CREATE POLICY tenant_isolation_tenant_domains ON tenant_domains

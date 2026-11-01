@@ -122,7 +122,11 @@ export class MultiTenantDataStore {
         mr.roleKey === assignment.roleKey,
     );
     if (!duplicate) {
-      this.membershipRoles.push(assignment);
+      this.membershipRoles.push({
+        id: assignment.id ?? `mr_${assignment.membershipId}_${assignment.roleKey}`,
+        roleId: assignment.roleId ?? `sys_${assignment.roleKey}`,
+        ...assignment,
+      });
     }
   }
 
@@ -137,7 +141,10 @@ export class MultiTenantDataStore {
     if (line.subordinateMembershipId === line.managerMembershipId) {
       throw new Error("A member cannot report to themselves.");
     }
-    this.reportingLines.push(line);
+    this.reportingLines.push({
+      relationshipType: line.relationshipType ?? "primary_hr",
+      ...line,
+    });
   }
 
   public createProject(project: ProjectRecord): ProjectRecord {
@@ -147,8 +154,13 @@ export class MultiTenantDataStore {
         "Project manager membership must belong to the same tenant as the project.",
       );
     }
-    this.projects.set(project.id, project);
-    return project;
+    const normalized: ProjectRecord = {
+      clientId: project.clientId ?? "default_client",
+      billableRate: project.billableRate ?? 100,
+      ...project,
+    };
+    this.projects.set(normalized.id, normalized);
+    return normalized;
   }
 
   public addProjectMembership(pm: ProjectMembershipRecord): void {
@@ -180,8 +192,12 @@ export class MultiTenantDataStore {
         "Timesheet membership and project must belong to the target tenant.",
       );
     }
-    this.timesheets.set(ts.id, ts);
-    return ts;
+    const normalized: TimesheetRecord = {
+      ...ts,
+      weekStart: ts.weekStart ?? ts.weekStartDate ?? "2026-01-05",
+    };
+    this.timesheets.set(normalized.id, normalized);
+    return normalized;
   }
 
   // --------------------------------------------------------------------------
@@ -228,7 +244,7 @@ export class MultiTenantDataStore {
         const sysPerms = SYSTEM_ROLE_PERMISSIONS[assignment.roleKey as SystemRoleKey];
         sysPerms.forEach((p) => permissions.add(p));
       }
-      const customRole = this.customRoles.get(assignment.roleId);
+      const customRole = assignment.roleId ? this.customRoles.get(assignment.roleId) : undefined;
       if (customRole && (customRole.tenantId === null || customRole.tenantId === tenantId)) {
         customRole.permissions.forEach((p) => permissions.add(p));
       }

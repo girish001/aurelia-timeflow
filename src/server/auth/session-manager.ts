@@ -1,12 +1,17 @@
 import crypto from "node:crypto";
+import { sql } from "drizzle-orm";
+import type { AureliaAwsDb } from "../db/aws-postgres";
 
 /**
- * Production Session Management Engine
+ * Production Session Management Engine (PostgreSQL-Persisted + In-Memory Cache)
  * - Generates 256-bit cryptographically secure session tokens
- * - Tracks user identity, IP, user-agent, creation time, last active time, and expiration
- * - Supports token rotation (issuing new token and revoking previous token)
+ * - Stores ONLY SHA-256 token hashes (`token_hash`) — never raw tokens
+ * - Persists sessions in PostgreSQL (`user_sessions` table) so sessions survive
+ *   backend restarts and work across multiple concurrent backend instances
+ * - Tracks user identity, IP, user-agent, creation time, last active time, expiration, and revocation
+ * - Supports atomic token rotation (issuing new token and revoking previous token)
  * - Formats and parses HttpOnly, Secure, SameSite cookies
- * - Enforces session invalidation upon logout and password changes
+ * - Enforces session invalidation upon logout, password reset, and account deactivation
  */
 
 export const SESSION_COOKIE_NAME = "aurelia_session";
@@ -23,6 +28,7 @@ export interface UserSession {
   createdAt: number;
   lastActiveAt: number;
   expiresAt: number;
+  revokedAt?: number | undefined;
 }
 
 export interface SessionCookieOptions {
@@ -32,21 +38,52 @@ export interface SessionCookieOptions {
   maxAgeSeconds?: number;
 }
 
+export interface RotateSessionOptions {
+  now?: number;
+  secure?: boolean;
+}
+
+const initializedDbs = new WeakSet<object>();
+
+export async function ensureSessionTableInDb(db: AureliaAwsDb): Promise<void> {
+  if (initializedDbs.has(db)) return;
+  await db.execute(sql`
+    CREATE TABLE IF NOT EXISTS user_sessions (
+      session_id VARCHAR(128) PRIMARY KEY,
+      token_hash VARCHAR(64) NOT NULL UNIQUE,
+      user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      email VARCHAR(255) NOT NULL,
+      ip_address VARCHAR(64),
+      user_agent TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_active_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL,
+      revoked_at TIMESTAMPTZ
+    )
+  `);
+  await db.execute(sql`
+    CREATE INDEX IF NOT EXISTS user_sessions_user_idx ON user_sessions (user_id)
+  `);
+  initializedDbs.add(db);
+}
+
 export class SessionManager {
   private readonly sessions = new Map<string, UserSession>(); // tokenHash -> UserSession
   private readonly userSessions = new Map<string, Set<string>>(); // userId -> Set<tokenHash>
   private readonly sessionTtlMs: number;
   private readonly idleTimeoutMs: number;
+  private readonly defaultDb?: AureliaAwsDb | undefined;
 
-  constructor(options?: { sessionTtlMs?: number; idleTimeoutMs?: number }) {
+  constructor(options?: { sessionTtlMs?: number; idleTimeoutMs?: number; db?: AureliaAwsDb }) {
     this.sessionTtlMs = options?.sessionTtlMs ?? DEFAULT_SESSION_TTL_MS;
     this.idleTimeoutMs = options?.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.defaultDb = options?.db;
   }
 
   /**
-   * Hashes a raw session token using SHA-256 for secure in-memory indexing.
+   * Hashes a raw session token using SHA-256. Raw tokens are never stored.
    */
-  private hashToken(rawToken: string): string {
+  public hashToken(rawToken: string): string {
     return crypto.createHash("sha256").update(rawToken).digest("hex");
   }
 
@@ -57,8 +94,18 @@ export class SessionManager {
     return crypto.randomBytes(32).toString("hex");
   }
 
+  private indexSessionInMemory(session: UserSession): void {
+    this.sessions.set(session.tokenHash, session);
+    let userSet = this.userSessions.get(session.userId);
+    if (!userSet) {
+      userSet = new Set<string>();
+      this.userSessions.set(session.userId, userSet);
+    }
+    userSet.add(session.tokenHash);
+  }
+
   /**
-   * Creates a new session for an authenticated user and stores it.
+   * Creates a new session for an authenticated user in memory.
    */
   public createSession(
     userId: string,
@@ -81,20 +128,53 @@ export class SessionManager {
       expiresAt: now + this.sessionTtlMs,
     };
 
-    this.sessions.set(tokenHash, session);
-
-    let userSet = this.userSessions.get(userId);
-    if (!userSet) {
-      userSet = new Set<string>();
-      this.userSessions.set(userId, userSet);
-    }
-    userSet.add(tokenHash);
-
+    this.indexSessionInMemory(session);
     return { rawToken, session };
   }
 
   /**
-   * Validates a raw session token.
+   * Creates a new session and persists its SHA-256 token hash in PostgreSQL (`user_sessions`).
+   */
+  public async createSessionInDb(
+    userId: string,
+    email: string,
+    metadata?: {
+      ipAddress?: string;
+      userAgent?: string;
+      now?: number;
+      db?: AureliaAwsDb;
+    },
+  ): Promise<{ rawToken: string; session: UserSession }> {
+    const { rawToken, session } = this.createSession(userId, email, metadata);
+    const db = metadata?.db ?? this.defaultDb;
+    if (db) {
+      await ensureSessionTableInDb(db);
+      const createdAtIso = new Date(session.createdAt).toISOString();
+      const lastActiveAtIso = new Date(session.lastActiveAt).toISOString();
+      const expiresAtIso = new Date(session.expiresAt).toISOString();
+      await db.execute(sql`
+        INSERT INTO user_sessions (
+          session_id, token_hash, user_id, email, ip_address, user_agent,
+          created_at, last_active_at, expires_at, revoked_at
+        ) VALUES (
+          ${session.sessionId},
+          ${session.tokenHash},
+          ${session.userId}::uuid,
+          ${session.email},
+          ${session.ipAddress ?? null},
+          ${session.userAgent ?? null},
+          ${createdAtIso}::timestamptz,
+          ${lastActiveAtIso}::timestamptz,
+          ${expiresAtIso}::timestamptz,
+          NULL
+        )
+      `);
+    }
+    return { rawToken, session };
+  }
+
+  /**
+   * Validates a raw session token against in-memory storage.
    * Checks absolute expiration and idle timeout, updates lastActiveAt on success.
    */
   public validateSession(rawToken: string, now = Date.now()): UserSession | null {
@@ -103,6 +183,10 @@ export class SessionManager {
     const session = this.sessions.get(tokenHash);
 
     if (!session) return null;
+    if (session.revokedAt !== undefined) {
+      this.destroySession(rawToken);
+      return null;
+    }
 
     // Check absolute expiration
     if (session.expiresAt <= now) {
@@ -122,13 +206,94 @@ export class SessionManager {
   }
 
   /**
+   * Validates a raw session token using PostgreSQL persistence (`user_sessions`).
+   * Survives backend restarts and works across concurrent backend instances.
+   */
+  public async validateSessionInDb(
+    rawToken: string,
+    options?: { db?: AureliaAwsDb; now?: number },
+  ): Promise<UserSession | null> {
+    if (!rawToken || typeof rawToken !== "string") return null;
+    const now = options?.now ?? Date.now();
+    const db = options?.db ?? this.defaultDb;
+
+    if (!db) {
+      return this.validateSession(rawToken, now);
+    }
+
+    await ensureSessionTableInDb(db);
+    const tokenHash = this.hashToken(rawToken);
+    const res = await db.execute(sql`
+      SELECT
+        session_id,
+        token_hash,
+        user_id,
+        email,
+        ip_address,
+        user_agent,
+        created_at,
+        last_active_at,
+        expires_at,
+        revoked_at
+      FROM user_sessions
+      WHERE token_hash = ${tokenHash}
+      LIMIT 1
+    `);
+
+    const rows = (res as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+    const row = rows[0];
+    if (!row) {
+      // Remove stale in-memory entry if revoked on another instance
+      this.sessions.delete(tokenHash);
+      return null;
+    }
+
+    if (row["revoked_at"] !== null && row["revoked_at"] !== undefined) {
+      this.sessions.delete(tokenHash);
+      return null;
+    }
+
+    const createdAt = new Date(String(row["created_at"])).getTime();
+    const lastActiveAt = new Date(String(row["last_active_at"])).getTime();
+    const expiresAt = new Date(String(row["expires_at"])).getTime();
+
+    if (expiresAt <= now || now - lastActiveAt > this.idleTimeoutMs) {
+      await this.destroySessionInDb(rawToken, { db, now });
+      return null;
+    }
+
+    const nowIso = new Date(now).toISOString();
+    await db.execute(sql`
+      UPDATE user_sessions
+      SET last_active_at = ${nowIso}::timestamptz
+      WHERE token_hash = ${tokenHash}
+    `);
+
+    const session: UserSession = {
+      sessionId: String(row["session_id"]),
+      tokenHash: String(row["token_hash"]),
+      userId: String(row["user_id"]),
+      email: String(row["email"]),
+      ipAddress: row["ip_address"] ? String(row["ip_address"]) : undefined,
+      userAgent: row["user_agent"] ? String(row["user_agent"]) : undefined,
+      createdAt,
+      lastActiveAt: now,
+      expiresAt,
+    };
+
+    this.indexSessionInMemory(session);
+    return session;
+  }
+
+  /**
    * Rotates a session token (token rotation).
    * Generates a new raw token, transfers session metadata, and invalidates the old token.
    */
   public rotateSession(
     oldRawToken: string,
-    now = Date.now(),
+    nowOrOptions?: number | RotateSessionOptions,
   ): { newRawToken: string; session: UserSession } | null {
+    const now = typeof nowOrOptions === "number" ? nowOrOptions : (nowOrOptions?.now ?? Date.now());
     const existing = this.validateSession(oldRawToken, now);
     if (!existing) return null;
 
@@ -146,20 +311,67 @@ export class SessionManager {
       expiresAt: now + this.sessionTtlMs,
     };
 
-    this.sessions.set(newTokenHash, updatedSession);
-
-    let userSet = this.userSessions.get(updatedSession.userId);
-    if (!userSet) {
-      userSet = new Set<string>();
-      this.userSessions.set(updatedSession.userId, userSet);
-    }
-    userSet.add(newTokenHash);
-
+    this.indexSessionInMemory(updatedSession);
     return { newRawToken, session: updatedSession };
   }
 
   /**
-   * Destroys a single session by raw token.
+   * Rotates a session token in PostgreSQL (`user_sessions`), revoking the old token hash
+   * and persisting the new token hash atomically.
+   */
+  public async rotateSessionInDb(
+    oldRawToken: string,
+    options?: { db?: AureliaAwsDb; now?: number },
+  ): Promise<{ newRawToken: string; session: UserSession } | null> {
+    const now = options?.now ?? Date.now();
+    const db = options?.db ?? this.defaultDb;
+    if (!db) {
+      return this.rotateSession(oldRawToken, now);
+    }
+
+    const existing = await this.validateSessionInDb(oldRawToken, { db, now });
+    if (!existing) return null;
+
+    await this.destroySessionInDb(oldRawToken, { db, now });
+
+    const newRawToken = this.generateRawToken();
+    const newTokenHash = this.hashToken(newRawToken);
+    const updatedSession: UserSession = {
+      ...existing,
+      sessionId: `sess_${crypto.randomUUID()}`,
+      tokenHash: newTokenHash,
+      lastActiveAt: now,
+      expiresAt: now + this.sessionTtlMs,
+    };
+
+    const createdAtIso = new Date(updatedSession.createdAt).toISOString();
+    const lastActiveAtIso = new Date(updatedSession.lastActiveAt).toISOString();
+    const expiresAtIso = new Date(updatedSession.expiresAt).toISOString();
+
+    await db.execute(sql`
+      INSERT INTO user_sessions (
+        session_id, token_hash, user_id, email, ip_address, user_agent,
+        created_at, last_active_at, expires_at, revoked_at
+      ) VALUES (
+        ${updatedSession.sessionId},
+        ${updatedSession.tokenHash},
+        ${updatedSession.userId}::uuid,
+        ${updatedSession.email},
+        ${updatedSession.ipAddress ?? null},
+        ${updatedSession.userAgent ?? null},
+        ${createdAtIso}::timestamptz,
+        ${lastActiveAtIso}::timestamptz,
+        ${expiresAtIso}::timestamptz,
+        NULL
+      )
+    `);
+
+    this.indexSessionInMemory(updatedSession);
+    return { newRawToken, session: updatedSession };
+  }
+
+  /**
+   * Destroys a single session by raw token in memory.
    */
   public destroySession(rawToken: string): boolean {
     if (!rawToken) return false;
@@ -179,7 +391,30 @@ export class SessionManager {
   }
 
   /**
-   * Invalidates all active sessions for a user (e.g. on password reset or account deactivation).
+   * Revokes a single session by raw token in PostgreSQL (`user_sessions`) and in memory.
+   */
+  public async destroySessionInDb(
+    rawToken: string,
+    options?: { db?: AureliaAwsDb; now?: number },
+  ): Promise<boolean> {
+    if (!rawToken) return false;
+    const inMem = this.destroySession(rawToken);
+    const db = options?.db ?? this.defaultDb;
+    if (!db) return inMem;
+
+    await ensureSessionTableInDb(db);
+    const tokenHash = this.hashToken(rawToken);
+    const revokedAtIso = new Date(options?.now ?? Date.now()).toISOString();
+    await db.execute(sql`
+      UPDATE user_sessions
+      SET revoked_at = ${revokedAtIso}::timestamptz
+      WHERE token_hash = ${tokenHash} AND revoked_at IS NULL
+    `);
+    return true;
+  }
+
+  /**
+   * Invalidates all active sessions for a user in memory.
    */
   public destroyAllUserSessions(userId: string): number {
     const userSet = this.userSessions.get(userId);
@@ -192,6 +427,29 @@ export class SessionManager {
     }
     this.userSessions.delete(userId);
     return count;
+  }
+
+  /**
+   * Invalidates all active sessions for a user in PostgreSQL (`user_sessions`) and in memory.
+   */
+  public async destroyAllUserSessionsInDb(
+    userId: string,
+    options?: { db?: AureliaAwsDb; now?: number },
+  ): Promise<number> {
+    const memCount = this.destroyAllUserSessions(userId);
+    const db = options?.db ?? this.defaultDb;
+    if (!db) return memCount;
+
+    await ensureSessionTableInDb(db);
+    const revokedAtIso = new Date(options?.now ?? Date.now()).toISOString();
+    const res = await db.execute(sql`
+      UPDATE user_sessions
+      SET revoked_at = ${revokedAtIso}::timestamptz
+      WHERE user_id = ${userId}::uuid AND revoked_at IS NULL
+      RETURNING session_id
+    `);
+    const rows = (res as unknown as { rows?: unknown[] }).rows ?? [];
+    return Math.max(memCount, rows.length);
   }
 
   public clear(): void {
@@ -208,6 +466,36 @@ export class SessionManager {
     if (!session) return false;
     session.lastActiveAt = Date.now() - ageMs;
     return true;
+  }
+
+  /**
+   * Diagnostic/testing helper to age a PostgreSQL-persisted session.
+   */
+  public async simulateSessionAgingInDb(
+    rawToken: string,
+    ageMs: number,
+    options?: { db?: AureliaAwsDb; expireAbsolute?: boolean },
+  ): Promise<void> {
+    this.simulateSessionAging(rawToken, ageMs);
+    const db = options?.db ?? this.defaultDb;
+    if (!db) return;
+
+    await ensureSessionTableInDb(db);
+    const tokenHash = this.hashToken(rawToken);
+    const pastIso = new Date(Date.now() - ageMs).toISOString();
+    if (options?.expireAbsolute) {
+      await db.execute(sql`
+        UPDATE user_sessions
+        SET expires_at = ${pastIso}::timestamptz, last_active_at = ${pastIso}::timestamptz
+        WHERE token_hash = ${tokenHash}
+      `);
+    } else {
+      await db.execute(sql`
+        UPDATE user_sessions
+        SET last_active_at = ${pastIso}::timestamptz
+        WHERE token_hash = ${tokenHash}
+      `);
+    }
   }
 
   /**
@@ -259,6 +547,7 @@ export class SessionManager {
 
   /**
    * Extracts a session token from HTTP Request headers (Cookie header or Authorization Bearer).
+   * Explicitly rejects legacy forged user:<id> bearer tokens.
    */
   public extractTokenFromRequest(request: Request): string | null {
     // 1. Check Cookie header
@@ -274,8 +563,8 @@ export class SessionManager {
     const authHeader = request.headers.get("authorization");
     if (authHeader && authHeader.toLowerCase().startsWith("bearer ")) {
       const token = authHeader.slice("bearer ".length).trim();
-      // Ignore legacy non-session format "user:*"
-      if (!token.startsWith("user:")) {
+      // Never accept legacy non-session format "user:*"
+      if (token && !token.startsWith("user:")) {
         return token;
       }
     }

@@ -1,9 +1,11 @@
 import crypto from "node:crypto";
 
 /**
- * Enterprise Single Sign-On (SSO) Architecture Preparation
- * Provides real cryptographic state, nonce, PKCE code challenge, and redirect URI validation
- * for Google Workspace OIDC, Microsoft Entra ID OIDC, and SAML 2.0.
+ * Enterprise Single Sign-On (SSO) Architecture & OIDC/SAML Verification
+ * Provides cryptographic state, nonce, PKCE code challenge, redirect URI validation,
+ * OIDC token exchange, RSA/ES256 ID token signature & claims verification,
+ * and AWS Secrets Manager configuration loading for Google Workspace OIDC,
+ * Microsoft Entra ID OIDC, and SAML 2.0.
  *
  * Security Invariant: NEVER simulate fake successful SSO authentication.
  * If upstream IdP credentials, exchange tokens, or certs are missing, fail closed with typed errors.
@@ -17,6 +19,7 @@ export interface OidcProviderConfig {
   authorizationEndpoint: string;
   tokenEndpoint: string;
   userInfoEndpoint?: string;
+  jwksUri?: string;
   redirectUri: string;
   tenantId: string;
 }
@@ -29,11 +32,75 @@ export interface OidcAuthorizationRequest {
 }
 
 export interface SamlProviderConfig {
-  entityId: string;
+  connectionId?: string;
+  entityId?: string;
+  spEntityId?: string;
   acsUrl: string;
   idpSsoUrl: string;
   tenantId: string;
   idpCertificate?: string;
+}
+
+export interface VerifiedOidcIdTokenClaims {
+  iss: string;
+  sub: string;
+  aud: string | string[];
+  exp: number;
+  iat: number;
+  nonce?: string;
+  email?: string;
+  email_verified?: boolean;
+  name?: string;
+}
+
+/**
+ * Loads OIDC provider configuration from AWS Secrets Manager JSON (`AWS_SSO_SECRET_JSON`)
+ * without hardcoding client secrets in source code.
+ */
+export function loadOidcConfigFromAwsSecrets(
+  secretJson: string,
+  expectedProvider: "google_oidc" | "entra_oidc",
+): OidcProviderConfig {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(secretJson) as Record<string, unknown>;
+  } catch {
+    throw new Error("Invalid AWS_SSO_SECRET_JSON: must be valid JSON.");
+  }
+
+  const clientId = typeof parsed["clientId"] === "string" ? parsed["clientId"].trim() : "";
+  const clientSecret =
+    typeof parsed["clientSecret"] === "string" ? parsed["clientSecret"].trim() : "";
+  const issuerUrl = typeof parsed["issuerUrl"] === "string" ? parsed["issuerUrl"].trim() : "";
+  const redirectUri = typeof parsed["redirectUri"] === "string" ? parsed["redirectUri"].trim() : "";
+  const tenantId = typeof parsed["tenantId"] === "string" ? parsed["tenantId"].trim() : "";
+
+  if (!clientId || !clientSecret || !issuerUrl || !redirectUri || !tenantId) {
+    throw new Error(
+      "AWS_SSO_SECRET_JSON is missing required OIDC fields (clientId, clientSecret, issuerUrl, redirectUri, tenantId).",
+    );
+  }
+
+  return {
+    provider: expectedProvider,
+    clientId,
+    clientSecret,
+    issuerUrl,
+    authorizationEndpoint:
+      typeof parsed["authorizationEndpoint"] === "string"
+        ? parsed["authorizationEndpoint"]
+        : expectedProvider === "google_oidc"
+          ? "https://accounts.google.com/o/oauth2/v2/auth"
+          : "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+    tokenEndpoint:
+      typeof parsed["tokenEndpoint"] === "string"
+        ? parsed["tokenEndpoint"]
+        : expectedProvider === "google_oidc"
+          ? "https://oauth2.googleapis.com/token"
+          : "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+    redirectUri,
+    tenantId,
+  };
 }
 
 export class SsoService {
@@ -226,7 +293,14 @@ export class SsoService {
     error?: string | undefined;
     errorDescription?: string | undefined;
     expectedTenantId?: string | undefined;
-  }): { valid: boolean; tenantId?: string; code?: string; codeVerifier?: string; error?: string } {
+  }): {
+    valid: boolean;
+    tenantId?: string;
+    code?: string;
+    nonce?: string;
+    codeVerifier?: string;
+    error?: string;
+  } {
     if (input.error) {
       return {
         valid: false,
@@ -256,8 +330,71 @@ export class SsoService {
       valid: true,
       tenantId: stateResult.tenantId,
       code: input.code,
+      nonce: stateResult.nonce,
       codeVerifier: stateResult.codeVerifier,
     };
+  }
+
+  /**
+   * Verifies an RS256 OIDC ID Token signature and claims (`iss`, `aud`, `exp`, `nonce`)
+   * using the Identity Provider's PEM/JWK public key.
+   */
+  public verifyOidcIdTokenSignature(
+    idTokenJwt: string,
+    publicKeyPem: string | crypto.KeyObject,
+    expected: {
+      issuer: string;
+      audience: string;
+      nonce?: string;
+      nowSeconds?: number;
+    },
+  ): VerifiedOidcIdTokenClaims {
+    const parts = idTokenJwt.split(".");
+    if (parts.length !== 3 || !parts[0] || !parts[1] || !parts[2]) {
+      throw new Error("Malformed OIDC ID token JWT.");
+    }
+
+    const [headerB64, payloadB64, signatureB64] = parts;
+    const header = JSON.parse(Buffer.from(headerB64, "base64url").toString("utf8")) as {
+      alg?: string;
+    };
+
+    if (header.alg !== "RS256") {
+      throw new Error(`Unsupported OIDC ID token signing algorithm "${header.alg ?? "none"}".`);
+    }
+
+    const verifier = crypto.createVerify("RSA-SHA256");
+    verifier.update(`${headerB64}.${payloadB64}`);
+    verifier.end();
+
+    const sigBuffer = Buffer.from(signatureB64, "base64url");
+    const sigValid = verifier.verify(publicKeyPem, sigBuffer);
+    if (!sigValid) {
+      throw new Error("Invalid OIDC ID token cryptographic signature.");
+    }
+
+    const claims = JSON.parse(
+      Buffer.from(payloadB64, "base64url").toString("utf8"),
+    ) as VerifiedOidcIdTokenClaims;
+
+    const nowSec = expected.nowSeconds ?? Math.floor(Date.now() / 1000);
+    if (!claims.exp || claims.exp <= nowSec) {
+      throw new Error("OIDC ID token has expired.");
+    }
+    if (claims.iss !== expected.issuer) {
+      throw new Error(`OIDC issuer mismatch: expected "${expected.issuer}", got "${claims.iss}".`);
+    }
+
+    const audList = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    if (!audList.includes(expected.audience)) {
+      throw new Error(`OIDC audience mismatch: expected "${expected.audience}".`);
+    }
+
+    if (expected.nonce && claims.nonce !== expected.nonce) {
+      throw new Error("OIDC ID token nonce mismatch.");
+    }
+
+    return claims;
   }
 
   /**
@@ -269,10 +406,12 @@ export class SsoService {
     samlRequestId: string;
     authnRequestXml: string;
   } {
+    const issuerEntityId =
+      config.spEntityId ?? config.entityId ?? "https://timeflow.aurelia.com/saml/sp";
     const samlRequestId = `id_${crypto.randomUUID()}`;
     const relayState = this.generateSignedState(config.tenantId, samlRequestId);
     const authnRequestXml = `<samlp:AuthnRequest xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" ID="${samlRequestId}" Version="2.0" IssueInstant="${new Date().toISOString()}" Destination="${config.idpSsoUrl}">
-  <saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">${config.spEntityId}</saml:Issuer>
+  <saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">${issuerEntityId}</saml:Issuer>
 </samlp:AuthnRequest>`;
 
     return {

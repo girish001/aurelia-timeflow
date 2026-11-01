@@ -1,6 +1,8 @@
+import crypto from "node:crypto";
 import { and, asc, count, desc, eq, ilike, inArray, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
+import { defaultEmailDeliveryProvider } from "../auth/email-provider";
 import {
   assertCanAccessTeamMember,
   assertCanManageProject,
@@ -1079,7 +1081,8 @@ export async function recordAuditLogToDb(
 
 /**
  * Self-service company registration in PostgreSQL.
- * Inserts tenant, administrator user, membership, and business_admin role inside a database transaction.
+ * Inserts tenant, administrator user, membership, business_admin role, and SHA-256 hashed
+ * single-use email verification token inside a database transaction.
  */
 export async function registerCompanyInDb(
   poolOrDb: {
@@ -1093,6 +1096,8 @@ export async function registerCompanyInDb(
     adminEmail: string;
     adminFullName: string;
     adminJobTitle?: string | undefined;
+    now?: number | undefined;
+    ttlMs?: number | undefined;
   },
 ): Promise<{
   tenant: TenantRecord;
@@ -1114,26 +1119,60 @@ export async function registerCompanyInDb(
     throw new Error("A valid administrator work email is required.");
   }
 
+  const now = input.now ?? Date.now();
+  const ttlMs = input.ttlMs ?? 24 * 60 * 60 * 1000;
+  const expiresAt = now + ttlMs;
+
   const pool = poolOrDb.pool ?? getAwsPostgresPool(poolOrDb.env);
   const client = await pool.connect();
   try {
-    await client.query("BEGIN;");
+    await client.query("BEGIN");
 
-    // 1. Insert Tenant
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        token_hash VARCHAR(64) PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ
+      );
+    `);
+
+    // 1. Insert Tenant in 'onboarding' status (activated ONLY after email verification)
     const tenantRes = await client.query(
       `INSERT INTO tenants (slug, name, status, onboarding_mode) 
        VALUES ($1, $2, 'onboarding', 'self_service') 
        RETURNING id, slug, name, status, onboarding_mode;`,
       [slug, input.companyName.trim()],
     );
-    const tenantRow = tenantRes.rows[0];
+    const tenantRow = tenantRes.rows[0] as {
+      id: string;
+      slug: string;
+      name: string;
+      status: TenantRecord["status"];
+      onboarding_mode: TenantRecord["onboardingMode"];
+    };
+
+    // Scope transaction-local RLS context to the newly created tenant
+    await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantRow.id]);
 
     // 2. Insert or find User
     const existingUserRes = await client.query(
       `SELECT id, email, full_name, email_verified_at, is_platform_admin, status FROM users WHERE email = $1;`,
       [email],
     );
-    let userRow = existingUserRes.rows[0];
+    let userRow = existingUserRes.rows[0] as
+      | {
+          id: string;
+          email: string;
+          full_name: string;
+          email_verified_at: string | Date | null;
+          is_platform_admin: boolean;
+          status: UserRecord["status"];
+        }
+      | undefined;
     if (!userRow) {
       const newUserRes = await client.query(
         `INSERT INTO users (email, full_name, is_platform_admin, status) 
@@ -1141,7 +1180,14 @@ export async function registerCompanyInDb(
          RETURNING id, email, full_name, email_verified_at, is_platform_admin, status;`,
         [email, input.adminFullName.trim()],
       );
-      userRow = newUserRes.rows[0];
+      userRow = newUserRes.rows[0] as {
+        id: string;
+        email: string;
+        full_name: string;
+        email_verified_at: string | Date | null;
+        is_platform_admin: boolean;
+        status: UserRecord["status"];
+      };
     }
 
     // 3. Insert Membership
@@ -1151,20 +1197,26 @@ export async function registerCompanyInDb(
        RETURNING id, tenant_id, user_id, job_title, status;`,
       [tenantRow.id, userRow.id, input.adminJobTitle?.trim() || "Business Administrator"],
     );
-    const memberRow = memberRes.rows[0];
+    const memberRow = memberRes.rows[0] as {
+      id: string;
+      tenant_id: string;
+      user_id: string;
+      job_title: string;
+      status: MembershipRecord["status"];
+    };
 
     // 4. Ensure System Role business_admin exists & link membership
     const roleRes = await client.query(
       `SELECT id FROM roles WHERE key = 'business_admin' AND is_system_role = true LIMIT 1;`,
     );
-    let roleId = roleRes.rows[0]?.id;
+    let roleId = (roleRes.rows[0] as { id?: string } | undefined)?.id;
     if (!roleId) {
       const newRoleRes = await client.query(
         `INSERT INTO roles (key, name, description, is_system_role) 
          VALUES ('business_admin', 'Business Admin', 'Full workspace admin', true) 
          RETURNING id;`,
       );
-      roleId = newRoleRes.rows[0].id;
+      roleId = (newRoleRes.rows[0] as { id: string }).id;
     }
 
     await client.query(
@@ -1174,10 +1226,29 @@ export async function registerCompanyInDb(
       [tenantRow.id, memberRow.id, roleId],
     );
 
-    // 5. Create verification token
-    const verificationToken = `vtok_${tenantRow.id}_${userRow.id}`;
+    // 5. Generate cryptographically random 256-bit verification token; store ONLY SHA-256 hash
+    const verificationToken = crypto.randomBytes(32).toString("hex");
+    const tokenHash = crypto.createHash("sha256").update(verificationToken).digest("hex");
+    const createdAtIso = new Date(now).toISOString();
+    const expiresAtIso = new Date(expiresAt).toISOString();
 
-    await client.query("COMMIT;");
+    await client.query(
+      `INSERT INTO email_verification_tokens (
+         token_hash, tenant_id, user_id, email, created_at, expires_at, used_at
+       ) VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, NULL);`,
+      [tokenHash, tenantRow.id, userRow.id, email, createdAtIso, expiresAtIso],
+    );
+
+    await client.query("SELECT set_config('app.current_tenant_id', '', true)");
+    await client.query("COMMIT");
+
+    await defaultEmailDeliveryProvider.sendEmailVerificationEmail({
+      to: email,
+      companyName: tenantRow.name,
+      tenantId: tenantRow.id,
+      verificationToken,
+      expiresAt,
+    });
 
     return {
       tenant: {
@@ -1207,7 +1278,11 @@ export async function registerCompanyInDb(
       verificationToken,
     };
   } catch (err) {
-    await client.query("ROLLBACK;");
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Ignore rollback error
+    }
     throw err;
   } finally {
     client.release();
@@ -1215,7 +1290,8 @@ export async function registerCompanyInDb(
 }
 
 /**
- * Verifies email and activates the tenant in PostgreSQL.
+ * Verifies email verification token hash (enforcing expiration and single-use consumption)
+ * and activates the tenant in PostgreSQL.
  */
 export async function verifyCompanyAdminEmailInDb(
   poolOrDb: {
@@ -1224,46 +1300,134 @@ export async function verifyCompanyAdminEmailInDb(
     env?: Record<string, string | undefined>;
   },
   verificationToken: string,
+  options?: { now?: number },
 ): Promise<{ tenant: TenantRecord; user: UserRecord; membership: MembershipRecord }> {
-  const parts = verificationToken.split("_");
-  if (parts.length < 3 || parts[0] !== "vtok") {
-    throw new Error("Invalid or expired email verification token.");
+  if (
+    !verificationToken ||
+    typeof verificationToken !== "string" ||
+    verificationToken.startsWith("vtok_")
+  ) {
+    throw new Error("Invalid, expired, or already used email verification token.");
   }
-  const tenantId = parts[1];
-  const userId = parts[2];
+
+  const now = options?.now ?? Date.now();
+  const nowIso = new Date(now).toISOString();
+  const tokenHash = crypto.createHash("sha256").update(verificationToken.trim()).digest("hex");
 
   const pool = poolOrDb.pool ?? getAwsPostgresPool(poolOrDb.env);
   const client = await pool.connect();
   try {
-    await client.query("BEGIN;");
+    await client.query("BEGIN");
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS email_verification_tokens (
+        token_hash VARCHAR(64) PRIMARY KEY,
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        email VARCHAR(255) NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL,
+        used_at TIMESTAMPTZ
+      );
+    `);
+
+    const tokenRes = await client.query(
+      `SELECT token_hash, tenant_id, user_id, expires_at, used_at
+       FROM email_verification_tokens
+       WHERE token_hash = $1
+       LIMIT 1;`,
+      [tokenHash],
+    );
+
+    const tokenRow = tokenRes.rows[0] as
+      | {
+          token_hash: string;
+          tenant_id: string;
+          user_id: string;
+          expires_at: string | Date;
+          used_at: string | Date | null;
+        }
+      | undefined;
+
+    if (!tokenRow) {
+      throw new Error("Invalid, expired, or already used email verification token.");
+    }
+
+    if (tokenRow.used_at !== null && tokenRow.used_at !== undefined) {
+      throw new Error("Invalid, expired, or already used email verification token.");
+    }
+
+    const expiresAtMs = new Date(tokenRow.expires_at).getTime();
+    if (expiresAtMs <= now) {
+      throw new Error("Invalid, expired, or already used email verification token.");
+    }
+
+    // Consume single-use token atomically
+    const consumeRes = await client.query(
+      `UPDATE email_verification_tokens
+       SET used_at = $2::timestamptz
+       WHERE token_hash = $1 AND used_at IS NULL
+       RETURNING tenant_id, user_id;`,
+      [tokenHash, nowIso],
+    );
+    if (consumeRes.rowCount === 0) {
+      throw new Error("Invalid, expired, or already used email verification token.");
+    }
+
+    const tenantId = tokenRow.tenant_id;
+    const userId = tokenRow.user_id;
+
+    await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
 
     const tenantRes = await client.query(
-      `UPDATE tenants SET status = 'active', updated_at = NOW() 
+      `UPDATE tenants SET status = 'active', updated_at = $2::timestamptz 
        WHERE id = $1 
        RETURNING id, slug, name, status, onboarding_mode;`,
-      [tenantId],
+      [tenantId, nowIso],
     );
     if (tenantRes.rowCount === 0) {
       throw new Error(`Tenant workspace ${tenantId} not found.`);
     }
-    const tenantRow = tenantRes.rows[0];
+    const tenantRow = tenantRes.rows[0] as {
+      id: string;
+      slug: string;
+      name: string;
+      status: TenantRecord["status"];
+      onboarding_mode: TenantRecord["onboardingMode"];
+    };
 
     const userRes = await client.query(
-      `UPDATE users SET email_verified_at = NOW(), updated_at = NOW() 
+      `UPDATE users SET email_verified_at = $2::timestamptz, updated_at = $2::timestamptz 
        WHERE id = $1 
        RETURNING id, email, full_name, email_verified_at, is_platform_admin, status;`,
-      [userId],
+      [userId, nowIso],
     );
-    const userRow = userRes.rows[0];
+    const userRow = userRes.rows[0] as {
+      id: string;
+      email: string;
+      full_name: string;
+      email_verified_at: string | Date | null;
+      is_platform_admin: boolean;
+      status: UserRecord["status"];
+    };
 
     const memberRes = await client.query(
       `SELECT id, tenant_id, user_id, job_title, status FROM memberships 
        WHERE tenant_id = $1 AND user_id = $2 LIMIT 1;`,
       [tenantId, userId],
     );
-    const memberRow = memberRes.rows[0];
+    const memberRow = memberRes.rows[0] as
+      | {
+          id: string;
+          tenant_id: string;
+          user_id: string;
+          job_title: string;
+          status: MembershipRecord["status"];
+        }
+      | undefined;
 
-    await client.query("COMMIT;");
+    await client.query("SELECT set_config('app.current_tenant_id', '', true)");
+    await client.query("COMMIT");
 
     return {
       tenant: {
@@ -1300,7 +1464,11 @@ export async function verifyCompanyAdminEmailInDb(
           },
     };
   } catch (err) {
-    await client.query("ROLLBACK;");
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      // Ignore rollback error
+    }
     throw err;
   } finally {
     client.release();

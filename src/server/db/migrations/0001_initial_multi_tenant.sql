@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS users (
   last_login_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT users_status_check CHECK (status IN ('active', 'locked', 'disabled'))
+  CONSTRAINT users_status_check CHECK (status IN ('active', 'locked', 'disabled', 'suspended', 'deactivated'))
 );
 
 -- [4/23] departments
@@ -74,7 +74,7 @@ CREATE TABLE IF NOT EXISTS departments (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, name),
-  FOREIGN KEY (tenant_id, parent_department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, parent_department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL (parent_department_id)
 );
 
 -- [5/23] memberships
@@ -92,7 +92,7 @@ CREATE TABLE IF NOT EXISTS memberships (
   CONSTRAINT memberships_status_check CHECK (status IN ('invited', 'active', 'inactive', 'offboarded')),
   UNIQUE (tenant_id, user_id),
   UNIQUE (tenant_id, id),
-  FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL (department_id)
 );
 
 -- [6/23] roles
@@ -132,7 +132,7 @@ CREATE TABLE IF NOT EXISTS membership_roles (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE (tenant_id, membership_id, role_id),
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
-  FOREIGN KEY (tenant_id, assigned_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, assigned_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (assigned_by_membership_id)
 );
 
 -- [10/23] reporting_lines
@@ -167,9 +167,9 @@ CREATE TABLE IF NOT EXISTS invitations (
   accepted_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   CONSTRAINT invitations_status_check CHECK (status IN ('pending', 'accepted', 'expired', 'revoked')),
-  FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL,
-  FOREIGN KEY (tenant_id, reporting_manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL,
-  FOREIGN KEY (tenant_id, invited_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, department_id) REFERENCES departments(tenant_id, id) ON DELETE SET NULL (department_id),
+  FOREIGN KEY (tenant_id, reporting_manager_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (reporting_manager_membership_id),
+  FOREIGN KEY (tenant_id, invited_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (invited_by_membership_id)
 );
 
 -- [12/23] identity_connections
@@ -222,7 +222,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   ip_address VARCHAR(64),
   user_agent TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  FOREIGN KEY (tenant_id, actor_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, actor_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (actor_membership_id)
 );
 
 -- ============================================================================
@@ -294,7 +294,7 @@ CREATE TABLE IF NOT EXISTS timesheets (
   UNIQUE (tenant_id, id),
   UNIQUE (tenant_id, membership_id, week_start),
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
-  FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (reviewed_by_membership_id)
 );
 
 -- [19/23] timesheet_entries
@@ -330,7 +330,7 @@ CREATE TABLE IF NOT EXISTS leave_requests (
   CONSTRAINT leave_requests_status_check CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
   UNIQUE (tenant_id, id),
   FOREIGN KEY (tenant_id, membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
-  FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, reviewed_by_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (reviewed_by_membership_id)
 );
 
 -- [21/23] approvals
@@ -348,7 +348,7 @@ CREATE TABLE IF NOT EXISTS approvals (
   CONSTRAINT approvals_target_type_check CHECK (target_type IN ('timesheet', 'leave_request')),
   CONSTRAINT approvals_status_check CHECK (status IN ('pending', 'approved', 'rejected')),
   FOREIGN KEY (tenant_id, requester_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE CASCADE,
-  FOREIGN KEY (tenant_id, approver_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL
+  FOREIGN KEY (tenant_id, approver_membership_id) REFERENCES memberships(tenant_id, id) ON DELETE SET NULL (approver_membership_id)
 );
 
 -- [22/23] resource_allocations

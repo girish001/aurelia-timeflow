@@ -49,7 +49,7 @@ export interface UserRecord {
   fullName: string;
   emailVerifiedAt: string | null;
   isPlatformAdmin: boolean;
-  status: "active" | "locked" | "disabled";
+  status: "active" | "locked" | "disabled" | "suspended" | "deactivated";
 }
 
 export interface MembershipRecord {
@@ -71,10 +71,10 @@ export interface RoleRecord {
 }
 
 export interface MembershipRoleAssignment {
-  id: string;
+  id?: string;
   tenantId: string;
   membershipId: string;
-  roleId: string;
+  roleId?: string;
   roleKey: RoleKey;
 }
 
@@ -83,18 +83,19 @@ export interface ReportingLineRecord {
   tenantId: string;
   subordinateMembershipId: string;
   managerMembershipId: string;
-  relationshipType: "primary_hr" | "dotted_line";
+  relationshipType?: "primary_hr" | "dotted_line";
 }
 
 export interface ProjectRecord {
   id: string;
   tenantId: string;
-  clientId: string;
+  clientId?: string;
+  code?: string;
   name: string;
   projectManagerMembershipId: string;
   status: "active" | "on-hold" | "completed";
   budgetHours: number;
-  billableRate: number;
+  billableRate?: number;
 }
 
 export interface ProjectMembershipRecord {
@@ -112,7 +113,8 @@ export interface TimesheetRecord {
   tenantId: string;
   membershipId: string;
   projectId: string;
-  weekStart: string;
+  weekStart?: string;
+  weekStartDate?: string;
   totalHours: number;
   status: "draft" | "submitted" | "approved" | "rejected";
 }

@@ -10,7 +10,8 @@ import {
   type TenantRecord,
   type UserRecord,
 } from "../tenancy/tenant-context";
-import { hashPassword, verifyPassword } from "./password";
+import { defaultEmailDeliveryProvider, type EmailDeliveryProvider } from "./email-provider";
+import { verifyPassword } from "./password";
 import { defaultPasswordResetService, PasswordResetService } from "./password-reset";
 import { defaultLoginRateLimiter, LoginRateLimiter } from "./rate-limiter";
 import { defaultSessionManager, SessionManager, type UserSession } from "./session-manager";
@@ -27,17 +28,20 @@ export interface AuthServiceOptions {
   sessionManager?: SessionManager;
   rateLimiter?: LoginRateLimiter;
   passwordResetService?: PasswordResetService;
+  emailProvider?: EmailDeliveryProvider;
 }
 
 export class AuthService {
   private readonly sessionManager: SessionManager;
   private readonly rateLimiter: LoginRateLimiter;
   private readonly passwordResetService: PasswordResetService;
+  private readonly emailProvider: EmailDeliveryProvider;
 
   constructor(options?: AuthServiceOptions) {
     this.sessionManager = options?.sessionManager ?? defaultSessionManager;
     this.rateLimiter = options?.rateLimiter ?? defaultLoginRateLimiter;
     this.passwordResetService = options?.passwordResetService ?? defaultPasswordResetService;
+    this.emailProvider = options?.emailProvider ?? defaultEmailDeliveryProvider;
   }
 
   public getSessionManager(): SessionManager {
@@ -52,12 +56,16 @@ export class AuthService {
     return this.passwordResetService;
   }
 
+  public getEmailProvider(): EmailDeliveryProvider {
+    return this.emailProvider;
+  }
+
   /**
    * Production Email & Password Authentication:
    * - Brute-force rate limiting by IP + email
-   * - Constant-time scrypt password verification
-   * - Account status verification (active / suspended / deactivated)
-   * - Cryptographically secure 256-bit session token issuance
+   * - Constant-time scrypt password verification (never allows userId-only impersonation)
+   * - Account status verification (active / suspended / deactivated / locked / disabled)
+   * - Cryptographically secure 256-bit session token issuance persisted to PostgreSQL
    * - HttpOnly, Secure, SameSite Set-Cookie generation
    * - Automatic discovery of authorized tenant workspaces
    */
@@ -65,7 +73,6 @@ export class AuthService {
     input: {
       email: string;
       password?: string;
-      userId?: string; // Fallback for seeded test/demo users without passwords
       ipAddress?: string;
       userAgent?: string;
     },
@@ -75,7 +82,7 @@ export class AuthService {
       isSecureRequest?: boolean;
     },
   ): Promise<LoginResult> {
-    const email = input.email.trim().toLowerCase();
+    const email = (input.email || "").trim().toLowerCase();
     const ip = input.ipAddress || "127.0.0.1";
     const rateLimitKey = this.rateLimiter.makeKey(ip, email);
 
@@ -85,6 +92,11 @@ export class AuthService {
       throw new AuthorizationError(
         `Too many failed login attempts. Account temporarily locked. Please try again in ${rateStatus.retryAfterSeconds} seconds.`,
       );
+    }
+
+    if (!email || !input.password) {
+      this.rateLimiter.recordFailure(rateLimitKey);
+      throw new AuthorizationError("Invalid email or password.");
     }
 
     // 2. Fetch User from Database or Store
@@ -112,9 +124,7 @@ export class AuthService {
       }
     } else if (context.store) {
       const allUsers = context.store.listAllUsers ? context.store.listAllUsers() : [];
-      const found = allUsers.find(
-        (u) => u.email.toLowerCase() === email || (input.userId && u.id === input.userId),
-      );
+      const found = allUsers.find((u) => u.email.toLowerCase() === email);
       if (found) {
         user = found;
         storedPasswordHash = context.store.getUserPasswordHash
@@ -123,43 +133,42 @@ export class AuthService {
       }
     }
 
-    if (!user) {
+    if (!user || !storedPasswordHash) {
       this.rateLimiter.recordFailure(rateLimitKey);
       throw new AuthorizationError("Invalid email or password.");
     }
 
     // 3. Verify Account Status
-    if (user.status === "deactivated") {
+    if (user.status === "deactivated" || user.status === "disabled") {
       throw new AuthorizationError(
         "This account has been deactivated. Please contact your workspace administrator.",
       );
     }
-    if (user.status === "suspended") {
+    if (user.status === "suspended" || user.status === "locked") {
       throw new AuthorizationError("This account is currently suspended. Please contact support.");
     }
 
-    // 4. Verify Password (if password is provided or password hash is set)
-    if (input.password || storedPasswordHash) {
-      if (!input.password || !storedPasswordHash) {
-        this.rateLimiter.recordFailure(rateLimitKey);
-        throw new AuthorizationError("Invalid email or password.");
-      }
-
-      const isValid = await verifyPassword(input.password, storedPasswordHash);
-      if (!isValid) {
-        this.rateLimiter.recordFailure(rateLimitKey);
-        throw new AuthorizationError("Invalid email or password.");
-      }
+    // 4. Verify Password using constant-time scrypt comparison
+    const isValid = await verifyPassword(input.password, storedPasswordHash);
+    if (!isValid) {
+      this.rateLimiter.recordFailure(rateLimitKey);
+      throw new AuthorizationError("Invalid email or password.");
     }
 
     // 5. Authentication Succeeded -> Reset Rate Limiter
     this.rateLimiter.recordSuccess(rateLimitKey);
 
-    // 6. Issue Session & HttpOnly Cookie
-    const { rawToken, session } = this.sessionManager.createSession(user.id, user.email, {
-      ipAddress: input.ipAddress,
-      userAgent: input.userAgent,
-    });
+    // 6. Issue Session (persisted in PostgreSQL when db is available) & HttpOnly Cookie
+    const { rawToken, session } = context.db
+      ? await this.sessionManager.createSessionInDb(user.id, user.email, {
+          ipAddress: input.ipAddress,
+          userAgent: input.userAgent,
+          db: context.db,
+        })
+      : this.sessionManager.createSession(user.id, user.email, {
+          ipAddress: input.ipAddress,
+          userAgent: input.userAgent,
+        });
 
     const setCookieHeader = this.sessionManager.buildSessionCookie(rawToken, {
       secure: context.isSecureRequest ?? false,
@@ -169,11 +178,11 @@ export class AuthService {
 
     // 7. Resolve Tenant Memberships
     let tenants: Array<{ tenant: TenantRecord; membership: MembershipRecord }> = [];
-    if (context.store) {
-      tenants = context.store.listUserTenants(user.id);
-    } else if (context.db) {
+    if (context.db) {
       const { listUserTenantsFromDb } = await import("../repositories/postgres-tenant-store");
       tenants = await listUserTenantsFromDb(context.db, user.id);
+    } else if (context.store) {
+      tenants = context.store.listUserTenants(user.id);
     }
 
     return {
@@ -186,14 +195,19 @@ export class AuthService {
   }
 
   /**
-   * Log out and invalidate the session.
+   * Log out and invalidate the session (in PostgreSQL and memory).
    */
-  public logout(
+  public async logout(
     sessionToken: string,
     isSecure = false,
-  ): { success: boolean; clearCookieHeader: string; setCookieHeader: string } {
+    context?: { db?: AureliaAwsDb },
+  ): Promise<{ success: boolean; clearCookieHeader: string; setCookieHeader: string }> {
     if (sessionToken) {
-      this.sessionManager.destroySession(sessionToken);
+      if (context?.db) {
+        await this.sessionManager.destroySessionInDb(sessionToken, { db: context.db });
+      } else {
+        this.sessionManager.destroySession(sessionToken);
+      }
     }
     const clearCookieHeader = this.sessionManager.buildLogoutCookie({
       secure: isSecure,
@@ -205,11 +219,14 @@ export class AuthService {
   /**
    * Rotates an active session token.
    */
-  public rotateSession(
+  public async rotateSession(
     oldToken: string,
     isSecure = false,
-  ): { sessionToken: string; setCookieHeader: string; session: UserSession } | null {
-    const rotated = this.sessionManager.rotateSession(oldToken);
+    context?: { db?: AureliaAwsDb },
+  ): Promise<{ sessionToken: string; setCookieHeader: string; session: UserSession } | null> {
+    const rotated = context?.db
+      ? await this.sessionManager.rotateSessionInDb(oldToken, { db: context.db })
+      : this.sessionManager.rotateSession(oldToken);
     if (!rotated) return null;
 
     const setCookieHeader = this.sessionManager.buildSessionCookie(rotated.newRawToken, {
@@ -228,7 +245,7 @@ export class AuthService {
   /**
    * Resolves and verifies tenant execution context from an authenticated session.
    * STRICT SECURITY ENFORCEMENT:
-   * 1. Resolves caller's user identity from session
+   * 1. Resolves caller's user identity from validated session
    * 2. Rejects any attempt by the caller to access a tenant they do not belong to
    * 3. Aggregates caller's roles and permissions inside THAT verified tenant
    */
@@ -240,7 +257,9 @@ export class AuthService {
       store?: MultiTenantDataStore;
     },
   ): Promise<ResolvedTenantContext> {
-    const session = this.sessionManager.validateSession(sessionToken);
+    const session = context.db
+      ? await this.sessionManager.validateSessionInDb(sessionToken, { db: context.db })
+      : this.sessionManager.validateSession(sessionToken);
     if (!session) {
       throw new AuthorizationError("UNAUTHENTICATED: Invalid or expired session.");
     }
@@ -277,6 +296,8 @@ export class AuthService {
 
   /**
    * Initiates password reset request.
+   * Generates a cryptographically random reset token, stores only its SHA-256 hash,
+   * and delivers the token via the configured EmailDeliveryProvider.
    */
   public async requestPasswordReset(
     email: string,
@@ -303,19 +324,34 @@ export class AuthService {
       return { success: true };
     }
 
-    const { rawToken } = this.passwordResetService.createResetToken(userId, cleanEmail);
+    const { rawToken, expiresAt } = context.db
+      ? await this.passwordResetService.createResetTokenInDb(userId, cleanEmail, {
+          db: context.db,
+        })
+      : this.passwordResetService.createResetToken(userId, cleanEmail);
+
+    await this.emailProvider.sendPasswordResetEmail({
+      to: cleanEmail,
+      resetToken: rawToken,
+      expiresAt,
+    });
+
     return { success: true, resetToken: rawToken };
   }
 
   /**
    * Confirms password reset with reset token.
+   * Validates and consumes the single-use token, updates the password hash,
+   * and revokes all existing user sessions.
    */
   public async confirmPasswordReset(
     rawToken: string,
     newPassword: string,
     context: { db?: AureliaAwsDb; store?: MultiTenantDataStore },
   ): Promise<{ success: boolean; userId: string }> {
-    const result = await this.passwordResetService.executePasswordReset(rawToken, newPassword);
+    const result = await this.passwordResetService.executePasswordReset(rawToken, newPassword, {
+      db: context.db,
+    });
 
     if (context.db) {
       await context.db
@@ -357,7 +393,7 @@ export class AuthService {
     }
 
     if (newStatus === "deactivated" || newStatus === "suspended") {
-      this.sessionManager.destroyAllUserSessions(userId);
+      await this.sessionManager.destroyAllUserSessionsInDb(userId, { db: context.db });
     }
   }
 }

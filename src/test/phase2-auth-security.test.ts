@@ -1,12 +1,32 @@
+// @vitest-environment node
+import crypto from "node:crypto";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+import { PGlite } from "@electric-sql/pglite";
+import { drizzle } from "drizzle-orm/node-postgres";
+import type { QueryResult } from "pg";
 import { describe, expect, it, beforeEach } from "vitest";
+
 import { defaultAuthService } from "../server/auth/auth-service";
-import { defaultSessionManager } from "../server/auth/session-manager";
-import { defaultSsoService } from "../server/auth/sso-service";
+import { defaultEmailDeliveryProvider } from "../server/auth/email-provider";
 import { hashPassword, verifyPassword, validatePasswordComplexity } from "../server/auth/password";
+import { defaultSessionManager, SessionManager } from "../server/auth/session-manager";
+import { defaultSsoService, loadOidcConfigFromAwsSecrets } from "../server/auth/sso-service";
 import { handleApiRequest } from "../server/api/routes";
+import type {
+  AureliaAwsDb,
+  QueryableTransactionClient,
+  QueryableTransactionPool,
+} from "../server/db/aws-postgres";
+import * as schema from "../server/db/schema";
+import {
+  registerCompanyInDb,
+  verifyCompanyAdminEmailInDb,
+} from "../server/repositories/postgres-tenant-store";
 import { MultiTenantDataStore } from "../server/repositories/tenant-scoped-store";
 
-describe("Phase 2: Production Authentication & Security", () => {
+describe("Phase 2: Production Authentication & Security Remediation", { timeout: 30000 }, () => {
   let store: MultiTenantDataStore;
   const authService = defaultAuthService;
   const sessionManager = defaultSessionManager;
@@ -51,12 +71,23 @@ describe("Phase 2: Production Authentication & Security", () => {
     status: "active" as const,
   };
 
+  const platformAdminUser = {
+    id: "user_platform_superadmin",
+    email: "superadmin@aurelia-platform.com",
+    fullName: "Vikram Platform Admin",
+    emailVerifiedAt: new Date().toISOString(),
+    isPlatformAdmin: true,
+    status: "active" as const,
+  };
+
   const defaultPassword = "SecurePass123!@#";
 
   beforeEach(async () => {
-    // Reset session store & rate limiter
+    // Reset session store, rate limiter, reset service, and email outbox
     sessionManager.clear();
     authService.getRateLimiter().reset();
+    authService.getPasswordResetService().reset();
+    defaultEmailDeliveryProvider.clearOutbox();
 
     store = new MultiTenantDataStore();
 
@@ -86,6 +117,7 @@ describe("Phase 2: Production Authentication & Security", () => {
     store.registerUser(managerUser, hashedPass);
     store.registerUser(employeeUser, hashedPass);
     store.registerUser(betaAdminUser, hashedPass);
+    store.registerUser(platformAdminUser, hashedPass);
 
     // Create Tenant Alpha Memberships
     store.createMembership({
@@ -193,7 +225,105 @@ describe("Phase 2: Production Authentication & Security", () => {
     });
   });
 
-  describe("2. Valid and Invalid Login & Rate Limiting", () => {
+  describe("2. Removal of Authentication Bypasses & Forged Identity Protection", () => {
+    it("rejects forged x-aurelia-user-id header with HTTP 401 UNAUTHENTICATED", async () => {
+      const res = await handleApiRequest(
+        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/team`, {
+          headers: {
+            "x-aurelia-user-id": adminUser.id,
+          },
+        }),
+        { store },
+      );
+
+      expect(res?.status).toBe(401);
+      const body = (await res?.json()) as { error: string };
+      expect(body.error).toBe("UNAUTHENTICATED");
+    });
+
+    it("rejects forged Authorization: Bearer user:<id> header with HTTP 401 UNAUTHENTICATED", async () => {
+      const res = await handleApiRequest(
+        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/projects`, {
+          headers: {
+            authorization: `Bearer user:${adminUser.id}`,
+          },
+        }),
+        { store },
+      );
+
+      expect(res?.status).toBe(401);
+      const body = (await res?.json()) as { error: string };
+      expect(body.error).toBe("UNAUTHENTICATED");
+    });
+
+    it("rejects login attempts supplying only userId without password", async () => {
+      const res = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/login", {
+          method: "POST",
+          body: JSON.stringify({ userId: adminUser.id }),
+        }),
+        { store },
+      );
+
+      expect(res?.status).toBe(400);
+    });
+
+    it("rejects forged x-aurelia-platform-admin: true header from a non-platform-admin user with HTTP 403", async () => {
+      // Regular tenant admin logs in with a real session
+      const loginRes = await authService.login(
+        { email: adminUser.email, password: defaultPassword },
+        { store },
+      );
+
+      // Attempts to call platform-admin endpoint by forging x-aurelia-platform-admin: true
+      const forgedPlatformRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/platform-admin/tenants", {
+          method: "POST",
+          headers: {
+            cookie: `aurelia_session=${loginRes.sessionToken}`,
+            "x-aurelia-platform-admin": "true",
+          },
+          body: JSON.stringify({
+            companyName: "Forged Enterprise Corp",
+            slug: "forged-ent",
+            primaryDomain: "forged.example.com",
+            primaryAdminEmail: "it@forged.example.com",
+            primaryAdminFullName: "Forged IT",
+          }),
+        }),
+        { store },
+      );
+
+      expect(forgedPlatformRes?.status).toBe(403);
+      const body = (await forgedPlatformRes?.json()) as { error: string };
+      expect(body.error).toBe("INSUFFICIENT_PERMISSIONS");
+
+      // Genuine platform admin verified via server-side user record succeeds (201)
+      const superAdminLogin = await authService.login(
+        { email: platformAdminUser.email, password: defaultPassword },
+        { store },
+      );
+      const legitimatePlatformRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/platform-admin/tenants", {
+          method: "POST",
+          headers: {
+            cookie: `aurelia_session=${superAdminLogin.sessionToken}`,
+          },
+          body: JSON.stringify({
+            companyName: "Legitimate Enterprise Corp",
+            slug: "legit-ent",
+            primaryDomain: "legit.example.com",
+            primaryAdminEmail: "it@legit.example.com",
+            primaryAdminFullName: "Legit IT",
+          }),
+        }),
+        { store },
+      );
+      expect(legitimatePlatformRes?.status).toBe(201);
+    });
+  });
+
+  describe("3. Valid and Invalid Login & Rate Limiting", () => {
     it("successfully logs in with valid credentials, issuing session and HttpOnly cookie", async () => {
       const loginRes = await authService.login(
         {
@@ -244,38 +374,153 @@ describe("Phase 2: Production Authentication & Security", () => {
       const email = "victim@example.com";
       const ip = "192.168.1.100";
 
-      // 5 consecutive failed attempts
       for (let i = 0; i < 5; i++) {
         await expect(
           authService.login({ email, password: "BadPassword!", ipAddress: ip }, { store }),
         ).rejects.toThrow("Invalid email or password.");
       }
 
-      // 6th attempt must be locked out
       await expect(
         authService.login({ email, password: defaultPassword, ipAddress: ip }, { store }),
       ).rejects.toThrow(/Too many failed login attempts/);
     });
   });
 
-  describe("3. Session Expiration, Idle Timeout & Token Rotation", () => {
-    it("validates session tokens with SHA-256 hash lookup", () => {
-      const { rawToken } = sessionManager.createSession(adminUser.id, adminUser.email);
-      expect(rawToken).toHaveLength(64); // 256-bit hex
+  describe("4. Persistent PostgreSQL Session Management, Restart Survival & Multi-Instance Concurrency", () => {
+    async function setupPostgresForSessions() {
+      const pg = new PGlite();
+      const migration1 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0001_initial_multi_tenant.sql"),
+        "utf8",
+      );
+      const migration2 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0002_auth_persistence.sql"),
+        "utf8",
+      );
+      await pg.exec(migration1);
+      await pg.exec(migration2);
 
-      const validated = sessionManager.validateSession(rawToken);
-      expect(validated?.userId).toBe(adminUser.id);
-      expect(validated?.email).toBe(adminUser.email);
+      const pgliteClient: QueryableTransactionClient = {
+        query: async (
+          textOrConfig: string | { text: string; values?: unknown[]; rowMode?: string },
+          values?: unknown[],
+        ) => {
+          let text: string;
+          let params: unknown[];
+          let rowMode: "array" | "object" | undefined = undefined;
+
+          if (typeof textOrConfig === "string") {
+            text = textOrConfig;
+            params = Array.isArray(values) ? values : [];
+          } else if (textOrConfig && typeof textOrConfig === "object") {
+            text = textOrConfig.text;
+            params =
+              Array.isArray(values) && values.length > 0
+                ? values
+                : Array.isArray(textOrConfig.values)
+                  ? textOrConfig.values
+                  : [];
+            if (textOrConfig.rowMode === "array") {
+              rowMode = "array";
+            }
+          } else {
+            text = String(textOrConfig);
+            params = Array.isArray(values) ? values : [];
+          }
+
+          const res = await pg.query(text, params, rowMode ? { rowMode } : undefined);
+          return {
+            rows: res.rows,
+            rowCount: res.affectedRows ?? res.rows.length,
+            command: "SELECT",
+            oid: 0,
+            fields: res.fields
+              ? res.fields.map((f) => ({ name: f.name, dataTypeID: f.dataTypeID }))
+              : [],
+          } as unknown as QueryResult;
+        },
+        release: () => {},
+      };
+
+      const pool: QueryableTransactionPool = {
+        connect: async () => pgliteClient,
+      };
+
+      const db = drizzle(pgliteClient as unknown as Parameters<typeof drizzle>[0], {
+        schema,
+      }) as unknown as AureliaAwsDb;
+
+      const userUuid = "aaaaaaaa-1111-4111-8111-111111111111";
+      await pg.query(
+        `INSERT INTO users (id, email, full_name, status, is_platform_admin)
+         VALUES ($1, 'admin@alpha.example.com', 'Aarav Admin', 'active', false);`,
+        [userUuid],
+      );
+
+      return { pg, db, pool, userUuid };
+    }
+
+    it("stores only SHA-256 session token hashes in PostgreSQL, survives backend restarts, and works across concurrent backend instances", async () => {
+      const { pg, db, userUuid } = await setupPostgresForSessions();
+
+      // Backend Instance 1 creates a session
+      const instance1 = new SessionManager({ db });
+      const { rawToken, session } = await instance1.createSessionInDb(
+        userUuid,
+        "admin@alpha.example.com",
+        { ipAddress: "10.0.1.15", userAgent: "Mozilla/5.0" },
+      );
+
+      // Verify rawToken is NEVER stored in PostgreSQL user_sessions table; only SHA-256 token_hash
+      const dbRows = await pg.query<{ token_hash: string }>(
+        "SELECT token_hash FROM user_sessions WHERE session_id = $1;",
+        [session.sessionId],
+      );
+      expect(dbRows.rows).toHaveLength(1);
+      expect(dbRows.rows[0]?.token_hash).toBe(instance1.hashToken(rawToken));
+      expect(dbRows.rows[0]?.token_hash).not.toBe(rawToken);
+
+      // Simulate Backend Restart / Concurrent Backend Instance 2 (fresh SessionManager with empty memory)
+      const instance2 = new SessionManager({ db });
+      const validatedOnInstance2 = await instance2.validateSessionInDb(rawToken);
+      expect(validatedOnInstance2).not.toBeNull();
+      expect(validatedOnInstance2?.userId).toBe(userUuid);
+      expect(validatedOnInstance2?.sessionId).toBe(session.sessionId);
+
+      // Instance 2 rotates the session token
+      const rotatedOnInstance2 = await instance2.rotateSessionInDb(rawToken);
+      expect(rotatedOnInstance2).not.toBeNull();
+      const newToken = rotatedOnInstance2!.newRawToken;
+      expect(newToken).not.toBe(rawToken);
+
+      // Old token is immediately invalid on Instance 1 as well
+      expect(await instance1.validateSessionInDb(rawToken)).toBeNull();
+      // New token is valid on Instance 1
+      const validatedNewOnInstance1 = await instance1.validateSessionInDb(newToken);
+      expect(validatedNewOnInstance1?.userId).toBe(userUuid);
+
+      // Instance 1 revokes all user sessions -> Instance 2 immediately rejects the session
+      await instance1.destroyAllUserSessionsInDb(userUuid);
+      expect(await instance2.validateSessionInDb(newToken)).toBeNull();
+
+      await pg.close();
     });
 
-    it("rejects expired sessions and inactive sessions beyond idle timeout", () => {
+    it("rejects expired and idle-timed-out sessions with HTTP 401", async () => {
       const { rawToken } = sessionManager.createSession(adminUser.id, adminUser.email);
 
       // Artificially age the session beyond idle timeout (2 hours)
       sessionManager.simulateSessionAging(rawToken, 2 * 60 * 60 * 1000 + 1000);
 
-      const validated = sessionManager.validateSession(rawToken);
-      expect(validated).toBeNull();
+      expect(sessionManager.validateSession(rawToken)).toBeNull();
+
+      const res = await handleApiRequest(
+        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/team`, {
+          headers: { cookie: `aurelia_session=${rawToken}` },
+        }),
+        { store },
+      );
+      expect(res?.status).toBe(401);
     });
 
     it("rotates session tokens safely and immediately invalidates the old token", () => {
@@ -285,48 +530,26 @@ describe("Phase 2: Production Authentication & Security", () => {
       expect(rotated).not.toBeNull();
       expect(rotated?.newRawToken).not.toBe(rawToken);
 
-      // Old token is immediately revoked
       expect(sessionManager.validateSession(rawToken)).toBeNull();
-
-      // New token is active
       expect(sessionManager.validateSession(rotated!.newRawToken)?.userId).toBe(adminUser.id);
     });
-  });
 
-  describe("4. Logout & Session Invalidation", () => {
     it("destroys session on logout and returns clearing cookie", async () => {
       const { rawToken } = sessionManager.createSession(adminUser.id, adminUser.email);
 
       const logoutRes = await authService.logout(rawToken);
       expect(logoutRes.setCookieHeader).toContain("Max-Age=0");
-
-      // Validating destroyed token returns null
       expect(sessionManager.validateSession(rawToken)).toBeNull();
-    });
-
-    it("invalidates all sessions for a user when account is deactivated or password is reset", () => {
-      const s1 = sessionManager.createSession(adminUser.id, adminUser.email);
-      const s2 = sessionManager.createSession(adminUser.id, adminUser.email);
-
-      expect(sessionManager.validateSession(s1.rawToken)).not.toBeNull();
-      expect(sessionManager.validateSession(s2.rawToken)).not.toBeNull();
-
-      sessionManager.destroyAllUserSessions(adminUser.id);
-
-      expect(sessionManager.validateSession(s1.rawToken)).toBeNull();
-      expect(sessionManager.validateSession(s2.rawToken)).toBeNull();
     });
   });
 
   describe("5. Multi-Tenant Authorization & RBAC Privilege Isolation", () => {
     it("blocks Employee from approving timesheets (missing timesheet:approve:team)", async () => {
-      // 1. Employee logs in
       const empLogin = await authService.login(
         { email: employeeUser.email, password: defaultPassword },
         { store },
       );
 
-      // 2. Employee attempts to call approve timesheet API
       const approveRes = await handleApiRequest(
         new Request(
           `http://localhost/api/v1/tenants/${tenantAlphaId}/timesheets/ts_alpha_01/approve`,
@@ -347,13 +570,11 @@ describe("Phase 2: Production Authentication & Security", () => {
     });
 
     it("allows Manager to approve timesheets", async () => {
-      // 1. Manager logs in
       const mgrLogin = await authService.login(
         { email: managerUser.email, password: defaultPassword },
         { store },
       );
 
-      // 2. Manager approves timesheet
       const approveRes = await handleApiRequest(
         new Request(
           `http://localhost/api/v1/tenants/${tenantAlphaId}/timesheets/ts_alpha_01/approve`,
@@ -373,14 +594,12 @@ describe("Phase 2: Production Authentication & Security", () => {
       expect(data.timesheet.status).toBe("approved");
     });
 
-    it("blocks Manager from accessing Admin-only user invitation API", async () => {
-      // 1. Manager logs in
+    it("blocks Manager from accessing Admin-only user invitation API (unauthorized role escalation)", async () => {
       const mgrLogin = await authService.login(
         { email: managerUser.email, password: defaultPassword },
         { store },
       );
 
-      // 2. Manager attempts bulk CSV import (requires tenant:members:manage)
       const inviteRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/invitations/bulk-csv`, {
           method: "POST",
@@ -388,7 +607,7 @@ describe("Phase 2: Production Authentication & Security", () => {
             cookie: `aurelia_session=${mgrLogin.sessionToken}`,
           },
           body: JSON.stringify({
-            csvText: "newuser@alpha.example.com,New Dev,Developer,Engineering,employee,",
+            csvText: "newuser@alpha.example.com,New Dev,Developer,Engineering,business_admin,",
           }),
         }),
         { store },
@@ -400,13 +619,11 @@ describe("Phase 2: Production Authentication & Security", () => {
     });
 
     it("allows Admin to access Admin-only APIs", async () => {
-      // 1. Admin logs in
       const adminLogin = await authService.login(
         { email: adminUser.email, password: defaultPassword },
         { store },
       );
 
-      // 2. Admin performs bulk CSV import
       const inviteRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/invitations/bulk-csv`, {
           method: "POST",
@@ -424,27 +641,15 @@ describe("Phase 2: Production Authentication & Security", () => {
       const data = (await inviteRes?.json()) as { importedCount: number };
       expect(data.importedCount).toBe(1);
     });
-
-    it("rejects unauthenticated requests to protected endpoints with 401", async () => {
-      const res = await handleApiRequest(
-        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/team`),
-        { store },
-      );
-      expect(res?.status).toBe(401);
-      const data = (await res?.json()) as { error: string };
-      expect(data.error).toBe("UNAUTHENTICATED");
-    });
   });
 
   describe("6. Cross-Tenant Access & Forged Tenant ID Protection", () => {
     it("strictly blocks user in Tenant Alpha from accessing Tenant Beta endpoints", async () => {
-      // 1. Alpha Admin logs in
       const alphaLogin = await authService.login(
         { email: adminUser.email, password: defaultPassword },
         { store },
       );
 
-      // 2. Alpha Admin attempts to access Tenant Beta's team endpoint
       const crossRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${tenantBetaId}/team`, {
           headers: {
@@ -460,13 +665,11 @@ describe("Phase 2: Production Authentication & Security", () => {
     });
 
     it("rejects forged body tenantId that does not match authenticated URL tenantId", async () => {
-      // 1. Alpha Admin logs in
       const alphaLogin = await authService.login(
         { email: adminUser.email, password: defaultPassword },
         { store },
       );
 
-      // 2. Post to Alpha URL but send claimed tenantId = Beta in body
       const forgedRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/invitations/bulk-csv`, {
           method: "POST",
@@ -474,7 +677,7 @@ describe("Phase 2: Production Authentication & Security", () => {
             cookie: `aurelia_session=${alphaLogin.sessionToken}`,
           },
           body: JSON.stringify({
-            tenantId: tenantBetaId, // Forged!
+            tenantId: tenantBetaId,
             csvText: "attacker@example.com,Attacker,Hacker,Security,employee,",
           }),
         }),
@@ -488,8 +691,8 @@ describe("Phase 2: Production Authentication & Security", () => {
     });
   });
 
-  describe("7. Password Reset Workflow & Session Revocation", () => {
-    it("executes password reset, updates password hash, and invalidates all existing sessions", async () => {
+  describe("7. Secure Password Reset (Non-Exposure in HTTP Responses, Out-of-Band Email & Session Revocation)", () => {
+    it("never exposes resetToken in HTTP API responses, delivers via EmailDeliveryProvider, enforces single-use, and revokes sessions", async () => {
       // 1. Employee logs in and gets active session
       const initialLogin = await authService.login(
         { email: employeeUser.email, password: defaultPassword },
@@ -497,51 +700,158 @@ describe("Phase 2: Production Authentication & Security", () => {
       );
       expect(sessionManager.validateSession(initialLogin.sessionToken)).not.toBeNull();
 
-      // 2. Request password reset
-      const resetReq = await authService.requestPasswordReset(employeeUser.email, { store });
-      expect(resetReq.success).toBe(true);
-      expect(resetReq.resetToken).toBeTruthy();
+      // 2. Request password reset via HTTP endpoint
+      const httpResetReq = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/password-reset/request", {
+          method: "POST",
+          body: JSON.stringify({ email: employeeUser.email }),
+        }),
+        { store },
+      );
+      expect(httpResetReq?.status).toBe(200);
+      const resetBody = (await httpResetReq?.json()) as Record<string, unknown>;
+      expect(resetBody["success"]).toBe(true);
+      // Security Invariant: resetToken MUST NOT be present in the HTTP response
+      expect(resetBody["resetToken"]).toBeUndefined();
 
-      // 3. Confirm password reset with new password
+      // Non-existent email returns the exact same generic response (no email enumeration)
+      const unknownEmailReq = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/password-reset/request", {
+          method: "POST",
+          body: JSON.stringify({ email: "nobody@unknown.example.com" }),
+        }),
+        { store },
+      );
+      expect(unknownEmailReq?.status).toBe(200);
+      const unknownBody = (await unknownEmailReq?.json()) as Record<string, unknown>;
+      expect(unknownBody).toEqual(resetBody);
+
+      // 3. Retrieve reset token from secure EmailDeliveryProvider outbox
+      const emailRecord = defaultEmailDeliveryProvider.getLatestEmailFor(
+        employeeUser.email,
+        "password_reset",
+      );
+      expect(emailRecord).toBeDefined();
+      expect(emailRecord?.token).toHaveLength(64);
+
+      // 4. Confirm password reset with new password via HTTP endpoint
       const newPassword = "BrandNewPassword2026!@#";
-      const confirmRes = await authService.confirmPasswordReset(resetReq.resetToken!, newPassword, {
-        store,
-      });
-      expect(confirmRes.success).toBe(true);
-      expect(confirmRes.userId).toBe(employeeUser.id);
+      const confirmHttpRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/password-reset/confirm", {
+          method: "POST",
+          body: JSON.stringify({
+            token: emailRecord!.token,
+            newPassword,
+          }),
+        }),
+        { store },
+      );
+      expect(confirmHttpRes?.status).toBe(200);
 
-      // 4. Initial session is now revoked
+      // 5. Initial session is now revoked
       expect(sessionManager.validateSession(initialLogin.sessionToken)).toBeNull();
 
-      // 5. Old password no longer works
+      // 6. Old password no longer works
       await expect(
         authService.login({ email: employeeUser.email, password: defaultPassword }, { store }),
       ).rejects.toThrow("Invalid email or password.");
 
-      // 6. New password works
+      // 7. New password works
       const newLogin = await authService.login(
         { email: employeeUser.email, password: newPassword },
         { store },
       );
       expect(newLogin.sessionToken).toBeTruthy();
 
-      // 7. Reset token cannot be reused
+      // 8. Reset token cannot be reused (single-use enforcement)
       await expect(
-        authService.confirmPasswordReset(resetReq.resetToken!, "AnotherPass123!@#", { store }),
+        authService.confirmPasswordReset(emailRecord!.token, "AnotherPass123!@#", { store }),
       ).rejects.toThrow(/Invalid or expired password reset token/);
     });
   });
 
-  describe("8. Account Activation, Suspension & Deactivation", () => {
+  describe("8. Secure Email Verification (Random Token, SHA-256 Hash in PostgreSQL, Single-Use & Forgery Rejection)", () => {
+    it("generates cryptographically random verification tokens in PostgreSQL, stores only SHA-256 hashes, activates tenant only after verification, and blocks replay or forgery", async () => {
+      const pg = new PGlite();
+      const migration1 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0001_initial_multi_tenant.sql"),
+        "utf8",
+      );
+      await pg.exec(migration1);
+
+      const pgliteClient: QueryableTransactionClient = {
+        query: async (text: string, values?: unknown[]) => {
+          const res = await pg.query(text, values);
+          return {
+            rows: res.rows,
+            rowCount: res.affectedRows ?? res.rows.length,
+          } as unknown as QueryResult;
+        },
+        release: () => {},
+      };
+      const pool: QueryableTransactionPool = {
+        connect: async () => pgliteClient,
+      };
+
+      const registration = await registerCompanyInDb(
+        { pool },
+        {
+          companyName: "Quantum Secure Systems",
+          slug: "quantum-secure",
+          adminEmail: "founder@quantum.example.com",
+          adminFullName: "Meera Founder",
+        },
+      );
+
+      // 1. Tenant starts in 'onboarding' status (NOT active before email verification)
+      expect(registration.tenant.status).toBe("onboarding");
+      // Token is a 64-hex-char (256-bit) cryptographically random string, NOT predictable vtok_...
+      expect(registration.verificationToken).toMatch(/^[a-f0-9]{64}$/);
+      expect(registration.verificationToken.startsWith("vtok_")).toBe(false);
+
+      // 2. Verify PostgreSQL stores ONLY the SHA-256 hash, never the raw token
+      const tokenRows = await pg.query<{ token_hash: string; used_at: string | null }>(
+        "SELECT token_hash, used_at FROM email_verification_tokens WHERE tenant_id = $1;",
+        [registration.tenant.id],
+      );
+      expect(tokenRows.rows).toHaveLength(1);
+      const expectedHash = crypto
+        .createHash("sha256")
+        .update(registration.verificationToken)
+        .digest("hex");
+      expect(tokenRows.rows[0]?.token_hash).toBe(expectedHash);
+      expect(tokenRows.rows[0]?.used_at).toBeNull();
+
+      // 3. Forged predictable token is rejected
+      await expect(
+        verifyCompanyAdminEmailInDb(
+          { pool },
+          `vtok_${registration.tenant.id}_${registration.adminUser.id}`,
+        ),
+      ).rejects.toThrow(/Invalid, expired, or already used email verification token/);
+
+      // 4. First verification with genuine token activates the tenant
+      const verified = await verifyCompanyAdminEmailInDb({ pool }, registration.verificationToken);
+      expect(verified.tenant.status).toBe("active");
+      expect(verified.user.emailVerifiedAt).toBeTruthy();
+
+      // 5. Repeated verification attempt with the same token is rejected (single-use)
+      await expect(
+        verifyCompanyAdminEmailInDb({ pool }, registration.verificationToken),
+      ).rejects.toThrow(/Invalid, expired, or already used email verification token/);
+
+      await pg.close();
+    });
+  });
+
+  describe("9. Account Activation, Suspension & Deactivation", () => {
     it("deactivating account immediately revokes sessions and blocks future logins", async () => {
-      // 1. Employee logs in
       const empLogin = await authService.login(
         { email: employeeUser.email, password: defaultPassword },
         { store },
       );
       expect(sessionManager.validateSession(empLogin.sessionToken)).not.toBeNull();
 
-      // 2. Admin deactivates employee account
       const adminLogin = await authService.login(
         { email: adminUser.email, password: defaultPassword },
         { store },
@@ -562,18 +872,15 @@ describe("Phase 2: Production Authentication & Security", () => {
       );
 
       expect(statusRes?.status).toBe(200);
-
-      // 3. Active session is destroyed
       expect(sessionManager.validateSession(empLogin.sessionToken)).toBeNull();
 
-      // 4. Subsequent login attempt is blocked
       await expect(
         authService.login({ email: employeeUser.email, password: defaultPassword }, { store }),
       ).rejects.toThrow(/account has been deactivated/);
     });
   });
 
-  describe("9. SSO Architecture Preparation (OIDC & SAML 2.0)", () => {
+  describe("10. SSO Architecture Preparation (OIDC, RS256 ID Token Signature Verification & SAML 2.0)", () => {
     it("generates OIDC authorization URL with cryptographic HMAC state, nonce, and PKCE", () => {
       const oidcReq = ssoService.prepareGoogleOidcRequest({
         provider: "google_oidc",
@@ -592,6 +899,79 @@ describe("Phase 2: Production Authentication & Security", () => {
       expect(oidcReq.nonce).toBeTruthy();
     });
 
+    it("verifies RS256 OIDC ID token cryptographic signature, issuer, audience, expiry, and nonce", () => {
+      const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
+        modulusLength: 2048,
+      });
+
+      const nowSec = Math.floor(Date.now() / 1000);
+      const header = Buffer.from(JSON.stringify({ alg: "RS256", typ: "JWT" })).toString(
+        "base64url",
+      );
+      const payload = Buffer.from(
+        JSON.stringify({
+          iss: "https://accounts.google.com",
+          sub: "google_user_123",
+          aud: "google-client-id",
+          exp: nowSec + 3600,
+          iat: nowSec,
+          nonce: "nonce_xyz",
+          email: "admin@alpha.example.com",
+          email_verified: true,
+        }),
+      ).toString("base64url");
+
+      const signer = crypto.createSign("RSA-SHA256");
+      signer.update(`${header}.${payload}`);
+      signer.end();
+      const signature = signer.sign(privateKey).toString("base64url");
+      const jwt = `${header}.${payload}.${signature}`;
+
+      const claims = ssoService.verifyOidcIdTokenSignature(jwt, publicKey, {
+        issuer: "https://accounts.google.com",
+        audience: "google-client-id",
+        nonce: "nonce_xyz",
+        nowSeconds: nowSec,
+      });
+      expect(claims.email).toBe("admin@alpha.example.com");
+
+      // Tampered payload fails cryptographic signature verification
+      const tamperedPayload = Buffer.from(
+        JSON.stringify({
+          iss: "https://accounts.google.com",
+          sub: "attacker",
+          aud: "google-client-id",
+          exp: nowSec + 3600,
+          iat: nowSec,
+          nonce: "nonce_xyz",
+        }),
+      ).toString("base64url");
+      expect(() =>
+        ssoService.verifyOidcIdTokenSignature(
+          `${header}.${tamperedPayload}.${signature}`,
+          publicKey,
+          {
+            issuer: "https://accounts.google.com",
+            audience: "google-client-id",
+            nonce: "nonce_xyz",
+          },
+        ),
+      ).toThrow(/Invalid OIDC ID token cryptographic signature/);
+
+      // Loads OIDC credentials from AWS Secrets Manager JSON
+      const loadedCfg = loadOidcConfigFromAwsSecrets(
+        JSON.stringify({
+          clientId: "secret-client-id",
+          clientSecret: "secret-client-secret",
+          issuerUrl: "https://accounts.google.com",
+          redirectUri: "https://timeflow.aurelia.com/api/v1/auth/oidc/google/callback",
+          tenantId: tenantAlphaId,
+        }),
+        "google_oidc",
+      );
+      expect(loadedCfg.clientId).toBe("secret-client-id");
+    });
+
     it("rejects forged or tampered state in OIDC callback", () => {
       const result = ssoService.validateOidcCallback({
         code: "auth_code_123",
@@ -600,31 +980,6 @@ describe("Phase 2: Production Authentication & Security", () => {
 
       expect(result.valid).toBe(false);
       expect(result.error).toMatch(/Invalid.*state/i);
-    });
-
-    it("validates OIDC callback with valid signed state and enforces token exchange requirement", async () => {
-      const oidcReq = ssoService.prepareGoogleOidcRequest({
-        provider: "google_oidc",
-        clientId: "google-client-id",
-        issuerUrl: "https://accounts.google.com",
-        authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
-        tokenEndpoint: "https://oauth2.googleapis.com/token",
-        redirectUri: "http://localhost/api/v1/auth/oidc/google/callback",
-        tenantId: tenantAlphaId,
-      });
-
-      // API route callback validation
-      const callbackRes = await handleApiRequest(
-        new Request(
-          `http://localhost/api/v1/auth/oidc/google/callback?code=mock_code_123&state=${oidcReq.state}`,
-        ),
-        { store },
-      );
-
-      expect(callbackRes?.status).toBe(200);
-      const data = (await callbackRes?.json()) as { status: string; codeReceived: boolean };
-      expect(data.status).toBe("oidc_callback_validated");
-      expect(data.codeReceived).toBe(true);
     });
 
     it("validates SAML 2.0 AuthnRequest and rejects tampered RelayState", () => {
@@ -639,7 +994,6 @@ describe("Phase 2: Production Authentication & Security", () => {
       expect(samlReq.authnRequestXml).toContain("samlp:AuthnRequest");
       expect(samlReq.relayState).toBeTruthy();
 
-      // Tampered RelayState validation
       const validation = ssoService.validateSamlResponse({
         samlResponse: "PHNhbWxwOlJlc3BvbnNlPjwvc2FtbHA6UmVzcG9uc2U+",
         relayState: "tampered_relay_state",

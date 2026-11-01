@@ -9,6 +9,8 @@ import type { QueryResult } from "pg";
 import { describe, expect, it } from "vitest";
 
 import { API_ROUTE_CONTRACTS, handleApiRequest, matchApiRouteContract } from "../server/api/routes";
+import { defaultEmailDeliveryProvider } from "../server/auth/email-provider";
+import { defaultSessionManager } from "../server/auth/session-manager";
 import {
   buildDatabaseAndRoleBootstrapSql,
   buildRollbackMigrationSql,
@@ -563,6 +565,32 @@ describe("AWS RDS PostgreSQL Configuration, TLS, Real PostgreSQL RLS, Migration 
         ),
       ).rejects.toThrow(/foreign key constraint/i);
 
+      // Verify column-specific composite FK ON DELETE SET NULL (department_id) preserves NOT NULL tenant_id
+      const parentDeptId = "33333333-1111-4111-8111-111111111111";
+      const childDeptId = "33333333-2222-4222-8222-222222222222";
+      await pg.exec(`
+        INSERT INTO departments (id, tenant_id, name, code)
+        VALUES ('${parentDeptId}', '${TENANT_A_UUID}', 'Platform Engineering', 'PLAT');
+        INSERT INTO departments (id, tenant_id, name, code, parent_department_id)
+        VALUES ('${childDeptId}', '${TENANT_A_UUID}', 'Core Infrastructure', 'INFRA', '${parentDeptId}');
+        UPDATE memberships SET department_id = '${parentDeptId}' WHERE id = '${MEMBER_A_UUID}';
+        DELETE FROM departments WHERE id = '${parentDeptId}';
+      `);
+      const afterDeptDelete = await pg.query(
+        `SELECT tenant_id, department_id FROM memberships WHERE id = '${MEMBER_A_UUID}';`,
+      );
+      expect(afterDeptDelete.rows[0]).toEqual({
+        tenant_id: TENANT_A_UUID,
+        department_id: null,
+      });
+      const afterParentDeptDelete = await pg.query(
+        `SELECT tenant_id, parent_department_id FROM departments WHERE id = '${childDeptId}';`,
+      );
+      expect(afterParentDeptDelete.rows[0]).toEqual({
+        tenant_id: TENANT_A_UUID,
+        parent_department_id: null,
+      });
+
       // Switch to least-privilege application role
       await pg.exec("SET ROLE aurelia_app_role;");
 
@@ -869,18 +897,20 @@ describe("AWS RDS PostgreSQL Configuration, TLS, Real PostgreSQL RLS, Migration 
       }
 
       const apiStore = new MultiTenantDataStore();
+      defaultEmailDeliveryProvider.clearOutbox();
 
-      // 1. Health Check Route
+      // 1. Public Health Check Route (redacted summary; does not expose databaseName or host publicly)
       const healthRes = await handleApiRequest(new Request("http://localhost/api/v1/health/db"), {
         store: apiStore,
         env: { APP_ENV: "development" },
       });
       expect(healthRes?.status).toBe(200);
-      const healthJson = (await healthRes?.json()) as { status: string; databaseName: string };
-      expect(healthJson.status).toBe("unconfigured");
-      expect(healthJson.databaseName).toBe("postgres");
+      const healthJson = (await healthRes?.json()) as Record<string, unknown>;
+      expect(healthJson["status"]).toBe("unconfigured");
+      expect(healthJson["databaseName"]).toBeUndefined();
+      expect(healthJson["host"]).toBeUndefined();
 
-      // 2. Self-Service Registration & Email Verification Routes
+      // 2. Self-Service Registration & Out-of-Band Email Verification Routes
       const regRes = await handleApiRequest(
         new Request("http://localhost/api/v1/onboarding/self-service/register-company", {
           method: "POST",
@@ -895,31 +925,47 @@ describe("AWS RDS PostgreSQL Configuration, TLS, Real PostgreSQL RLS, Migration 
       );
       expect(regRes?.status).toBe(201);
       const regData = (await regRes?.json()) as {
-        tenant: { id: string };
-        adminUser: { id: string };
-        verificationToken: string;
+        tenant: { id: string; status: string };
+        adminUser: { id: string; email: string };
+        verificationToken?: string;
+        verificationEmailDispatched: boolean;
       };
+      expect(regData.tenant.status).toBe("onboarding");
+      expect(regData.verificationEmailDispatched).toBe(true);
+      expect(regData.verificationToken).toBeUndefined();
+
+      const dispatchedEmail = defaultEmailDeliveryProvider.getLatestEmailFor(
+        "founder@acme.in",
+        "email_verification",
+      );
+      expect(dispatchedEmail?.token).toBeTruthy();
 
       const verifyRes = await handleApiRequest(
         new Request("http://localhost/api/v1/onboarding/self-service/verify-email", {
           method: "POST",
-          body: JSON.stringify({ verificationToken: regData.verificationToken }),
+          body: JSON.stringify({ verificationToken: dispatchedEmail!.token }),
         }),
         { store: apiStore },
       );
       expect(verifyRes?.status).toBe(200);
 
-      // 3. Unauthenticated request to tenant-scoped route returns 401
+      // 3. Unauthenticated or forged x-aurelia-user-id request to tenant-scoped route returns 401
       const unauthRes = await handleApiRequest(
-        new Request(`http://localhost/api/v1/tenants/${regData.tenant.id}/team`),
+        new Request(`http://localhost/api/v1/tenants/${regData.tenant.id}/team`, {
+          headers: { "x-aurelia-user-id": regData.adminUser.id },
+        }),
         { store: apiStore },
       );
       expect(unauthRes?.status).toBe(401);
 
-      // 4. Authenticated request to own tenant succeeds (200)
+      // 4. Authenticated session request to own tenant succeeds (200)
+      const { rawToken } = defaultSessionManager.createSession(
+        regData.adminUser.id,
+        regData.adminUser.email,
+      );
       const teamRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${regData.tenant.id}/team`, {
-          headers: { "x-aurelia-user-id": regData.adminUser.id },
+          headers: { cookie: `aurelia_session=${rawToken}` },
         }),
         { store: apiStore },
       );
@@ -929,7 +975,7 @@ describe("AWS RDS PostgreSQL Configuration, TLS, Real PostgreSQL RLS, Migration 
       const forgedRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${regData.tenant.id}/invitations/bulk-csv`, {
           method: "POST",
-          headers: { "x-aurelia-user-id": regData.adminUser.id },
+          headers: { cookie: `aurelia_session=${rawToken}` },
           body: JSON.stringify({
             tenantId: "forged_other_tenant",
             csvText: "email,fullName,jobTitle,department,roles,managerEmail",

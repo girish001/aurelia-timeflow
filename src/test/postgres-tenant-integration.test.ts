@@ -8,6 +8,7 @@ import type { QueryResult } from "pg";
 import { describe, expect, it } from "vitest";
 
 import { handleApiRequest } from "../server/api/routes";
+import { defaultSessionManager } from "../server/auth/session-manager";
 import {
   withTenantDatabaseScope,
   type AureliaAwsDb,
@@ -364,13 +365,32 @@ describe(
       await pg.close();
     });
 
-    it("6. API router handleApiRequest dispatches PostgreSQL queries when pool is provided", async () => {
+    it("6. API router handleApiRequest dispatches PostgreSQL queries when pool is provided and rejects forged headers", async () => {
       const { pg, db, pglitePool } = await setupRealPostgresDb();
+
+      // 0. Forged x-aurelia-user-id header without a valid session is rejected with HTTP 401
+      const forgedHeaderRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/tenants", {
+          headers: { "x-aurelia-user-id": USER_ADMIN },
+        }),
+        { pool: pglitePool, db },
+      );
+      expect(forgedHeaderRes?.status).toBe(401);
+
+      // Issue a PostgreSQL-persisted session for USER_ADMIN
+      const { rawToken } = await defaultSessionManager.createSessionInDb(
+        USER_ADMIN,
+        "admin@alpha.com",
+        { db },
+      );
+      const authHeaders = {
+        cookie: `aurelia_session=${rawToken}`,
+      };
 
       // 1. Authenticated GET /api/v1/auth/tenants backed by PostgreSQL
       const tenantsRes = await handleApiRequest(
         new Request("http://localhost/api/v1/auth/tenants", {
-          headers: { "x-aurelia-user-id": USER_ADMIN },
+          headers: authHeaders,
         }),
         { pool: pglitePool, db },
       );
@@ -384,7 +404,7 @@ describe(
       // 2. Authenticated GET /api/v1/tenants/:tenantId/projects?page=1&limit=5 backed by PostgreSQL
       const projectsRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${TENANT_ALPHA}/projects?page=1&limit=5`, {
-          headers: { "x-aurelia-user-id": USER_ADMIN },
+          headers: authHeaders,
         }),
         { pool: pglitePool, db },
       );
@@ -401,7 +421,7 @@ describe(
         new Request(`http://localhost/api/v1/tenants/${TENANT_ALPHA}/projects/${PROJECT_ALPHA_1}`, {
           method: "PATCH",
           headers: {
-            "x-aurelia-user-id": USER_ADMIN,
+            ...authHeaders,
             "content-type": "application/json",
           },
           body: JSON.stringify({ budgetHours: 420 }),
@@ -415,7 +435,7 @@ describe(
       // 4. Cross-tenant request is rejected with 403 TENANT_ISOLATION_VIOLATION
       const crossRes = await handleApiRequest(
         new Request(`http://localhost/api/v1/tenants/${TENANT_BETA}/projects`, {
-          headers: { "x-aurelia-user-id": USER_ADMIN },
+          headers: authHeaders,
         }),
         { pool: pglitePool, db },
       );

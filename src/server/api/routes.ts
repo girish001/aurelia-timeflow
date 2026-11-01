@@ -1,3 +1,4 @@
+import { eq } from "drizzle-orm";
 import {
   assertValidTenantExecutionContext,
   checkAwsDatabaseHealth,
@@ -7,6 +8,7 @@ import {
   type AureliaAwsDb,
   type QueryableTransactionPool,
 } from "../db/aws-postgres";
+import * as schema from "../db/schema";
 import {
   importTeamCsvIntoTenant,
   provisionEnterpriseTenant,
@@ -30,19 +32,20 @@ import {
 } from "../repositories/postgres-tenant-store";
 import { MultiTenantDataStore } from "../repositories/tenant-scoped-store";
 import { defaultAuthService } from "../auth/auth-service";
-import { defaultSessionManager } from "../auth/session-manager";
+import { defaultSessionManager, type UserSession } from "../auth/session-manager";
 import { defaultSsoService } from "../auth/sso-service";
 import {
   AuthorizationError,
   TenantIsolationError,
   type PermissionCode,
+  type UserRecord,
 } from "../tenancy/tenant-context";
 
 /**
  * API Route Blueprint & Executable Dispatcher for Aurelia TimeFlow SaaS.
  * Every `/api/v1/tenants/:tenantId/*` endpoint enforces:
- * 1. Authenticated user identity (`x-aurelia-user-id` or `Authorization: Bearer user:<id>`)
- * 2. Active tenant membership (`resolveTenantContext`)
+ * 1. Authenticated server-side session (`aurelia_session` cookie or `Authorization: Bearer <sessionToken>`)
+ * 2. Active tenant membership resolved from PostgreSQL (`resolveTenantContextFromDb`)
  * 3. Rejection of untrusted body `tenantId` mismatches (`assertValidTenantExecutionContext`)
  * 4. Endpoint permission / scope guard (`requiredPermission` + resource-level ABAC)
  */
@@ -313,45 +316,67 @@ function jsonResponse(payload: unknown, status = 200, extraHeaders?: HeadersInit
 
 export interface AuthenticatedIdentity {
   userId: string;
-  sessionToken?: string | undefined;
-  isSession: boolean;
+  sessionToken: string;
+  session: UserSession;
+  isSession: true;
 }
 
-export function extractAuthenticatedIdentity(request: Request): AuthenticatedIdentity | null {
-  // 1. Session cookie or Bearer session token
+/**
+ * Extracts and validates the caller's authenticated session identity.
+ *
+ * Security Invariants:
+ * - NEVER trusts `x-aurelia-user-id` headers.
+ * - NEVER trusts `Authorization: Bearer user:<id>` tokens.
+ * - Requires a valid, non-expired, non-revoked session token verified against PostgreSQL
+ *   (when `db` is provided) or `defaultSessionManager`.
+ */
+export async function extractAuthenticatedIdentity(
+  request: Request,
+  options?: { db?: AureliaAwsDb },
+): Promise<AuthenticatedIdentity | null> {
   const token = defaultSessionManager.extractTokenFromRequest(request);
-  if (token) {
-    const session = defaultSessionManager.validateSession(token);
-    if (session) {
-      return {
-        userId: session.userId,
-        sessionToken: token,
-        isSession: true,
-      };
-    }
+  if (!token) {
+    return null;
   }
 
-  // 2. Direct user identity header fallback (for internal testing or CLI)
-  const headerUser = request.headers.get("x-aurelia-user-id")?.trim();
-  if (headerUser) {
+  const session = options?.db
+    ? await defaultSessionManager.validateSessionInDb(token, { db: options.db })
+    : defaultSessionManager.validateSession(token);
+
+  if (!session) {
+    return null;
+  }
+
+  return {
+    userId: session.userId,
+    sessionToken: token,
+    session,
+    isSession: true,
+  };
+}
+
+async function resolveVerifiedServerUser(
+  userId: string,
+  options: { db?: AureliaAwsDb; store: MultiTenantDataStore },
+): Promise<UserRecord | null> {
+  if (options.db) {
+    const rows = await options.db
+      .select()
+      .from(schema.users)
+      .where(eq(schema.users.id, userId))
+      .limit(1);
+    const row = rows[0];
+    if (!row) return null;
     return {
-      userId: headerUser,
-      isSession: false,
+      id: row.id,
+      email: row.email,
+      fullName: row.fullName,
+      emailVerifiedAt: row.emailVerifiedAt ? row.emailVerifiedAt.toISOString() : null,
+      isPlatformAdmin: row.isPlatformAdmin,
+      status: row.status as UserRecord["status"],
     };
   }
-
-  const authHeader = request.headers.get("authorization")?.trim() ?? "";
-  if (authHeader.toLowerCase().startsWith("bearer user:")) {
-    const tokenUser = authHeader.slice("bearer user:".length).trim();
-    if (tokenUser) {
-      return {
-        userId: tokenUser,
-        isSession: false,
-      };
-    }
-  }
-
-  return null;
+  return options.store.getUser(userId) ?? null;
 }
 
 async function safeReadJsonBody(request: Request): Promise<Record<string, unknown>> {
@@ -400,7 +425,7 @@ export async function handleApiRequest(
   const env = options?.env;
   let targetPool = options?.pool;
   let targetDb = options?.db;
-  if (!targetPool && (options?.pool || options?.db || isAwsPostgresConfigured(env))) {
+  if (!targetPool && !options?.store && isAwsPostgresConfigured(env)) {
     try {
       targetPool = getAwsPostgresPool(env);
       targetDb = options?.db ?? getAwsPostgresDb(env);
@@ -412,11 +437,36 @@ export async function handleApiRequest(
   const store = options?.store ?? getDefaultApiStore();
 
   try {
-    // 1. Public Health Check Endpoint
+    // 1. Health Check Endpoint (Public summary; detailed diagnostics restricted to Platform Admins)
     if (contract.path === "/api/v1/health/db") {
       const health = await checkAwsDatabaseHealth({ env: options?.env });
       const status = health.status === "unhealthy" ? 503 : 200;
-      return jsonResponse(health, status);
+
+      const callerIdentity = await extractAuthenticatedIdentity(request, { db: targetDb });
+      let isAuthorizedPlatformAdmin = false;
+      if (callerIdentity) {
+        const verifiedUser = await resolveVerifiedServerUser(callerIdentity.userId, {
+          db: targetDb,
+          store,
+        });
+        if (verifiedUser && verifiedUser.status === "active" && verifiedUser.isPlatformAdmin) {
+          isAuthorizedPlatformAdmin = true;
+        }
+      }
+
+      if (isAuthorizedPlatformAdmin) {
+        return jsonResponse(health, status);
+      }
+
+      // Redacted public health response: never expose hostnames, database names, regions, or network hints
+      return jsonResponse(
+        {
+          status: health.status,
+          provider: health.provider,
+          checkedAt: health.checkedAt,
+        },
+        status,
+      );
     }
 
     // 2. Public Self-Service Onboarding & Auth Endpoints
@@ -433,7 +483,15 @@ export async function handleApiRequest(
             adminJobTitle: body["adminJobTitle"] ? String(body["adminJobTitle"]) : undefined,
           },
         );
-        return jsonResponse(result, 201);
+        return jsonResponse(
+          {
+            tenant: result.tenant,
+            adminUser: result.adminUser,
+            adminMembership: result.adminMembership,
+            verificationEmailDispatched: true,
+          },
+          201,
+        );
       }
       const result = registerSelfServiceCompany(store, {
         companyName: String(body["companyName"] ?? ""),
@@ -442,7 +500,15 @@ export async function handleApiRequest(
         adminFullName: String(body["adminFullName"] ?? ""),
         adminJobTitle: body["adminJobTitle"] ? String(body["adminJobTitle"]) : undefined,
       });
-      return jsonResponse(result, 201);
+      return jsonResponse(
+        {
+          tenant: result.tenant,
+          adminUser: result.adminUser,
+          adminMembership: result.adminMembership,
+          verificationEmailDispatched: true,
+        },
+        201,
+      );
     }
 
     if (contract.path === "/api/v1/onboarding/self-service/verify-email") {
@@ -466,11 +532,13 @@ export async function handleApiRequest(
     if (contract.path === "/api/v1/auth/login") {
       const body = await safeReadJsonBody(request);
       const email = String(body["email"] ?? "").trim();
-      const userId = String(body["userId"] ?? "").trim();
       const password = typeof body["password"] === "string" ? body["password"] : undefined;
 
-      if (!email && !userId) {
-        return jsonResponse({ error: "BAD_REQUEST", message: "email or userId is required." }, 400);
+      if (!email || !password) {
+        return jsonResponse(
+          { error: "BAD_REQUEST", message: "email and password are required." },
+          400,
+        );
       }
 
       const ipAddress =
@@ -480,9 +548,8 @@ export async function handleApiRequest(
 
       const loginResult = await defaultAuthService.login(
         {
-          email: email || `${userId}@demo.aurelia.example`,
+          email,
           password,
-          userId,
           ipAddress,
           userAgent,
         },
@@ -504,7 +571,9 @@ export async function handleApiRequest(
     if (contract.path === "/api/v1/auth/logout") {
       const token = defaultSessionManager.extractTokenFromRequest(request);
       const isSecure = url.protocol === "https:";
-      const logoutResult = defaultAuthService.logout(token || "", isSecure);
+      const logoutResult = await defaultAuthService.logout(token || "", isSecure, {
+        db: targetDb,
+      });
       return jsonResponse({ success: true, message: "Logged out successfully." }, 200, {
         "set-cookie": logoutResult.clearCookieHeader,
       });
@@ -519,11 +588,11 @@ export async function handleApiRequest(
           400,
         );
       }
-      const result = await defaultAuthService.requestPasswordReset(email, { db: targetDb, store });
+      await defaultAuthService.requestPasswordReset(email, { db: targetDb, store });
+      // Security Invariant: NEVER return password reset tokens in HTTP API responses.
       return jsonResponse({
         success: true,
         message: "If an account exists with that email, a password reset link has been dispatched.",
-        resetToken: result.resetToken,
       });
     }
 
@@ -641,13 +710,13 @@ export async function handleApiRequest(
       );
     }
 
-    // 3. Authenticated Endpoints Requiring Valid User Identity
-    const identity = extractAuthenticatedIdentity(request);
+    // 3. Authenticated Endpoints Requiring Valid Server-Side Session
+    const identity = await extractAuthenticatedIdentity(request, { db: targetDb });
     if (!identity) {
       return jsonResponse(
         {
           error: "UNAUTHENTICATED",
-          message: "Missing authenticated user session or token.",
+          message: "Missing, invalid, or expired session token.",
         },
         401,
       );
@@ -655,35 +724,14 @@ export async function handleApiRequest(
     const userId = identity.userId;
 
     if (contract.path === "/api/v1/auth/session") {
-      if (!identity.isSession || !identity.sessionToken) {
-        return jsonResponse(
-          {
-            authenticated: true,
-            userId,
-            authType: "header_override",
-          },
-          200,
-        );
-      }
-      const session = defaultSessionManager.validateSession(identity.sessionToken);
-      if (!session) {
-        return jsonResponse(
-          { error: "UNAUTHENTICATED", message: "Session expired or invalid." },
-          401,
-        );
-      }
-      return jsonResponse({ authenticated: true, session });
+      return jsonResponse({ authenticated: true, session: identity.session });
     }
 
     if (contract.path === "/api/v1/auth/session/rotate") {
-      if (!identity.isSession || !identity.sessionToken) {
-        return jsonResponse(
-          { error: "BAD_REQUEST", message: "Cannot rotate a header-based session." },
-          400,
-        );
-      }
       const isSecure = url.protocol === "https:";
-      const rotated = defaultAuthService.rotateSession(identity.sessionToken, isSecure);
+      const rotated = await defaultAuthService.rotateSession(identity.sessionToken, isSecure, {
+        db: targetDb,
+      });
       if (!rotated) {
         return jsonResponse(
           { error: "UNAUTHENTICATED", message: "Session expired or invalid." },
@@ -703,18 +751,23 @@ export async function handleApiRequest(
       return jsonResponse({ tenants: store.listUserTenants(userId) });
     }
 
-    // 4. Platform Admin Endpoints
+    // 4. Platform Admin Endpoints (Verified strictly from server-side user record; NEVER from headers)
     if (contract.scope === "platform_admin") {
       const body = await safeReadJsonBody(request);
-      const isPlatformAdminHeader = request.headers.get("x-aurelia-platform-admin") === "true";
-      const platformAdminUser = {
-        id: userId,
-        email: `${userId}@aurelia-platform.internal`,
-        fullName: "Aurelia Platform Admin",
-        emailVerifiedAt: new Date().toISOString(),
-        isPlatformAdmin: isPlatformAdminHeader,
-        status: "active" as const,
-      };
+      const platformAdminUser = await resolveVerifiedServerUser(userId, {
+        db: targetDb,
+        store,
+      });
+
+      if (
+        !platformAdminUser ||
+        platformAdminUser.status !== "active" ||
+        platformAdminUser.isPlatformAdmin !== true
+      ) {
+        throw new AuthorizationError(
+          "Only active Aurelia Platform Administrators verified via server-side records are authorized.",
+        );
+      }
 
       if (contract.path === "/api/v1/platform-admin/tenants") {
         const result = provisionEnterpriseTenant(store, platformAdminUser, {
@@ -742,9 +795,6 @@ export async function handleApiRequest(
       }
 
       if (contract.path === "/api/v1/platform-admin/tenants/:tenantId/sso-connections") {
-        if (!platformAdminUser.isPlatformAdmin) {
-          throw new AuthorizationError("Platform administrator privileges required.");
-        }
         return jsonResponse(
           {
             tenantId: params["tenantId"],
@@ -763,18 +813,11 @@ export async function handleApiRequest(
         typeof body["tenantId"] === "string" ? body["tenantId"] : undefined;
       const pathTenantId = params["tenantId"] || claimedBodyTenantId || "";
 
-      let ctx;
-      if (identity.isSession && identity.sessionToken) {
-        ctx = await defaultAuthService.resolveAuthenticatedTenantContext(
-          identity.sessionToken,
-          pathTenantId,
-          { db: targetDb, store },
-        );
-      } else if (useDatabase && targetDb) {
-        ctx = await resolveTenantContextFromDb(targetDb, userId, pathTenantId);
-      } else {
-        ctx = store.resolveTenantContext(userId, pathTenantId);
-      }
+      const ctx = await defaultAuthService.resolveAuthenticatedTenantContext(
+        identity.sessionToken,
+        pathTenantId,
+        { db: targetDb, store },
+      );
 
       // Reject any mismatch between URL :tenantId, authenticated membership, and body tenantId
       assertValidTenantExecutionContext(ctx, claimedBodyTenantId);

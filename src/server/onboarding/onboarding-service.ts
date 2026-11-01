@@ -1,3 +1,5 @@
+import crypto from "node:crypto";
+import { defaultEmailDeliveryProvider } from "../auth/email-provider";
 import {
   AuthorizationError,
   TenantIsolationError,
@@ -59,10 +61,24 @@ export interface SupportImpersonationInput {
   reason: string;
 }
 
-const pendingVerificationTokens = new Map<
-  string,
-  { tenantId: string; userId: string; expiresAt: number }
->();
+export const EMAIL_VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+interface StoredVerificationTokenRecord {
+  tokenHash: string;
+  tenantId: string;
+  userId: string;
+  email: string;
+  createdAt: number;
+  expiresAt: number;
+  usedAt?: number | undefined;
+}
+
+// Indexed strictly by SHA-256 tokenHash (never raw tokens)
+const pendingVerificationTokens = new Map<string, StoredVerificationTokenRecord>();
+
+export function hashVerificationToken(rawToken: string): string {
+  return crypto.createHash("sha256").update(rawToken).digest("hex");
+}
 
 /**
  * Normalizes a company slug to lowercase alphanumeric + hyphens.
@@ -78,11 +94,14 @@ export function normalizeTenantSlug(raw: string): string {
 
 /**
  * Step 1 (Self-Service): Registers a new company tenant in `onboarding` status,
- * creates the founding user and `business_admin` membership, and returns a verification token.
+ * creates the founding user and `business_admin` membership, generates a 256-bit
+ * cryptographically random verification token, stores ONLY its SHA-256 hash,
+ * and dispatches the verification link via the secure EmailDeliveryProvider.
  */
 export function registerSelfServiceCompany(
   store: MultiTenantDataStore,
   input: SelfServiceRegistrationInput,
+  options?: { now?: number; ttlMs?: number },
 ): SelfServiceRegistrationResult {
   const slug = normalizeTenantSlug(input.slug || input.companyName);
   if (slug.length < 2) {
@@ -93,9 +112,12 @@ export function registerSelfServiceCompany(
     throw new Error("A valid administrator work email is required.");
   }
 
-  const tenantId = `t_${slug}_${Date.now().toString(36)}`;
-  const userId = `u_${Date.now().toString(36)}_admin`;
-  const membershipId = `m_${Date.now().toString(36)}_admin`;
+  const now = options?.now ?? Date.now();
+  const ttlMs = options?.ttlMs ?? EMAIL_VERIFICATION_TTL_MS;
+  const entropy = crypto.randomBytes(6).toString("hex");
+  const tenantId = `t_${slug}_${entropy}`;
+  const userId = `u_${entropy}_admin`;
+  const membershipId = `m_${entropy}_admin`;
 
   const tenant = store.registerTenant({
     id: tenantId,
@@ -130,11 +152,26 @@ export function registerSelfServiceCompany(
     roleKey: "business_admin",
   });
 
-  const verificationToken = `vtok_${tenant.id}_${userId}`;
-  pendingVerificationTokens.set(verificationToken, {
+  // Security Invariant: 256-bit cryptographically secure random token; store ONLY SHA-256 hash
+  const verificationToken = crypto.randomBytes(32).toString("hex");
+  const tokenHash = hashVerificationToken(verificationToken);
+  const expiresAt = now + ttlMs;
+
+  pendingVerificationTokens.set(tokenHash, {
+    tokenHash,
     tenantId: tenant.id,
     userId: adminUser.id,
-    expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+    email,
+    createdAt: now,
+    expiresAt,
+  });
+
+  void defaultEmailDeliveryProvider.sendEmailVerificationEmail({
+    to: email,
+    companyName: tenant.name,
+    tenantId: tenant.id,
+    verificationToken,
+    expiresAt,
   });
 
   return {
@@ -147,16 +184,34 @@ export function registerSelfServiceCompany(
 
 /**
  * Step 2 (Self-Service): Verifies the founding administrator's email token
- * and transitions the tenant from `onboarding` to `active`.
+ * (checking SHA-256 hash, expiration, and single-use status) and transitions
+ * the tenant from `onboarding` to `active`.
  */
 export function verifyCompanyAdminEmail(
   store: MultiTenantDataStore,
   verificationToken: string,
+  now = Date.now(),
 ): ResolvedTenantContext {
-  const record = pendingVerificationTokens.get(verificationToken);
-  if (!record || record.expiresAt < Date.now()) {
-    throw new Error("Invalid or expired email verification token.");
+  if (!verificationToken || typeof verificationToken !== "string") {
+    throw new Error("Invalid, expired, or already used email verification token.");
   }
+
+  const tokenHash = hashVerificationToken(verificationToken.trim());
+  const record = pendingVerificationTokens.get(tokenHash);
+  if (!record) {
+    throw new Error("Invalid, expired, or already used email verification token.");
+  }
+  if (record.usedAt !== undefined) {
+    throw new Error("Invalid, expired, or already used email verification token.");
+  }
+  if (record.expiresAt <= now) {
+    pendingVerificationTokens.delete(tokenHash);
+    throw new Error("Invalid, expired, or already used email verification token.");
+  }
+
+  // Mark single-use token as consumed immediately before activating tenant
+  record.usedAt = now;
+  pendingVerificationTokens.set(tokenHash, record);
 
   const ctx = store.resolveTenantContext(record.userId, record.tenantId);
 
@@ -167,10 +222,9 @@ export function verifyCompanyAdminEmail(
 
   store.registerUser({
     ...ctx.user,
-    emailVerifiedAt: new Date().toISOString(),
+    emailVerifiedAt: new Date(now).toISOString(),
   });
 
-  pendingVerificationTokens.delete(verificationToken);
   return store.resolveTenantContext(record.userId, record.tenantId);
 }
 

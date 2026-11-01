@@ -440,6 +440,17 @@ export function verifySchemaAndMigrationConsistency(
     );
   }
 
+  // Verify composite foreign keys including tenant_id use column-specific ON DELETE SET NULL (col)
+  // rather than bare ON DELETE SET NULL which would attempt to set NOT NULL tenant_id to NULL.
+  const unsafeCompositeSetNullRegex =
+    /FOREIGN\s+KEY\s*\(\s*tenant_id\s*,[^)]+\)\s*REFERENCES\s+[^\n]+ON\s+DELETE\s+SET\s+NULL(?![\s(]*\()/gi;
+  const unsafeMatches = sqlContent.match(unsafeCompositeSetNullRegex);
+  if (unsafeMatches && unsafeMatches.length > 0) {
+    discrepancies.push(
+      `Found ${unsafeMatches.length} composite FOREIGN KEY (tenant_id, ...) using bare ON DELETE SET NULL without a nullable column list.`,
+    );
+  }
+
   return {
     consistent: discrepancies.length === 0,
     schemaTableCount: DRIZZLE_SCHEMA_TABLES.length,

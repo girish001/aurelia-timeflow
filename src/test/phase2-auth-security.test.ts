@@ -4,15 +4,28 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { PGlite } from "@electric-sql/pglite";
-import { drizzle } from "drizzle-orm/node-postgres";
+import { drizzle, type NodePgClient } from "drizzle-orm/node-postgres";
 import type { QueryResult } from "pg";
 import { describe, expect, it, beforeEach } from "vitest";
 
 import { defaultAuthService } from "../server/auth/auth-service";
-import { defaultEmailDeliveryProvider } from "../server/auth/email-provider";
+import {
+  AwsSesEmailProvider,
+  defaultEmailDeliveryProvider,
+  getDevelopmentEmailOutbox,
+  isAwsSesConfigured,
+  loadAwsSesConfig,
+  resolveAppPublicUrl,
+  resolveEmailDeliveryProvider,
+  validateEmailDeliveryEnvironment,
+} from "../server/auth/email-provider";
 import { hashPassword, verifyPassword, validatePasswordComplexity } from "../server/auth/password";
 import { defaultSessionManager, SessionManager } from "../server/auth/session-manager";
-import { defaultSsoService, loadOidcConfigFromAwsSecrets } from "../server/auth/sso-service";
+import {
+  defaultSsoService,
+  loadOidcConfigFromAwsSecrets,
+  type OidcProviderConfig,
+} from "../server/auth/sso-service";
 import { handleApiRequest } from "../server/api/routes";
 import type {
   AureliaAwsDb,
@@ -446,7 +459,7 @@ describe("Phase 2: Production Authentication & Security Remediation", { timeout:
         connect: async () => pgliteClient,
       };
 
-      const db = drizzle(pgliteClient as unknown as Parameters<typeof drizzle>[0], {
+      const db = drizzle(pgliteClient as unknown as NodePgClient, {
         schema,
       }) as unknown as AureliaAwsDb;
 
@@ -1000,6 +1013,1011 @@ describe("Phase 2: Production Authentication & Security Remediation", { timeout:
       });
       expect(validation.valid).toBe(false);
       expect(validation.error).toContain("Invalid SAML RelayState");
+    });
+  });
+
+  describe("11. Phase 2.1: Production Email Delivery via AWS SES (Success, Failure & Token Redaction)", () => {
+    it("loads AWS SES configuration from environment variables and AWS_SES_SECRET_JSON and signs SES v2 requests", async () => {
+      const sesEnv = {
+        AWS_SES_REGION: "ap-south-1",
+        AWS_SES_FROM_EMAIL: "no-reply@timeflow.aurelia.com",
+        AWS_SES_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+        AWS_SES_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        APP_PUBLIC_URL: "https://timeflow.aurelia.com",
+      };
+      const cfg = loadAwsSesConfig(sesEnv);
+      expect(cfg.region).toBe("ap-south-1");
+      expect(cfg.fromEmail).toBe("no-reply@timeflow.aurelia.com");
+      expect(cfg.credentialSource).toBe("environment");
+
+      const secretJsonCfg = loadAwsSesConfig({
+        AWS_SES_SECRET_JSON: JSON.stringify({
+          region: "ap-south-1",
+          fromEmail: "security@timeflow.aurelia.com",
+          accessKeyId: "AKIASECRETEXAMPLE",
+          secretAccessKey: "SecretManagerSesKey!2026",
+          appPublicUrl: "https://timeflow.aurelia.com",
+        }),
+      });
+      expect(secretJsonCfg.fromEmail).toBe("security@timeflow.aurelia.com");
+      expect(secretJsonCfg.credentialSource).toBe("aws_secrets_manager_json");
+
+      // Mock AWS SES v2 HTTP endpoint confirming delivery acceptance with MessageId
+      let capturedAuthHeader = "";
+      let capturedUrl = "";
+      const sesProvider = new AwsSesEmailProvider({
+        config: cfg,
+        fetchFn: async (input, init) => {
+          capturedUrl = String(input);
+          const headers = init?.headers as Record<string, string>;
+          capturedAuthHeader = headers["authorization"] ?? "";
+          return new Response(JSON.stringify({ MessageId: "ses_msg_mumbai_001" }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        },
+      });
+
+      const resetToken = crypto.randomBytes(32).toString("hex");
+      const res = await sesProvider.sendPasswordResetEmail({
+        to: "admin@alpha.example.com",
+        resetToken,
+        expiresAt: Date.now() + 3600_000,
+      });
+
+      expect(res.accepted).toBe(true);
+      expect(res.messageId).toBe("ses_msg_mumbai_001");
+      expect(res.provider).toBe("aws_ses");
+      expect(capturedUrl).toBe("https://email.ap-south-1.amazonaws.com/v2/outbound-emails");
+      expect(capturedAuthHeader).toContain("AWS4-HMAC-SHA256");
+      expect(capturedAuthHeader).toContain("ap-south-1/ses/aws4_request");
+    });
+
+    it("fails safely when AWS SES rejects delivery or omits MessageId, never logs or leaks raw tokens, and blocks in-memory fallback in production", async () => {
+      const cfg = loadAwsSesConfig({
+        AWS_SES_REGION: "ap-south-1",
+        AWS_SES_FROM_EMAIL: "no-reply@timeflow.aurelia.com",
+        AWS_SES_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+        AWS_SES_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      });
+
+      const secretVerifyToken = crypto.randomBytes(32).toString("hex");
+
+      // Case 1: AWS SES returns HTTP 500 and echoes back part of the request containing the token
+      const failingProvider = new AwsSesEmailProvider({
+        config: cfg,
+        fetchFn: async () =>
+          new Response(
+            JSON.stringify({
+              message: `SES upstream throttling for token=${secretVerifyToken}`,
+            }),
+            { status: 500 },
+          ),
+      });
+
+      let caughtError: Error | null = null;
+      try {
+        await failingProvider.sendEmailVerificationEmail({
+          to: "founder@alpha.example.com",
+          companyName: "Alpha Corp",
+          tenantId: tenantAlphaId,
+          verificationToken: secretVerifyToken,
+          expiresAt: Date.now() + 3600_000,
+        });
+      } catch (err) {
+        caughtError = err as Error;
+      }
+
+      expect(caughtError).not.toBeNull();
+      // Raw verification token MUST be redacted from any error message
+      expect(caughtError?.message).not.toContain(secretVerifyToken);
+      expect(caughtError?.message).toContain("[REDACTED_TOKEN]");
+
+      // Case 2: Self-service registration via HTTP API fails safely and does NOT report verificationEmailDispatched: true when SES fails
+      const failedRegRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/onboarding/self-service/register-company", {
+          method: "POST",
+          body: JSON.stringify({
+            companyName: "FailSafe Corp",
+            slug: "failsafe-corp",
+            adminEmail: "admin@failsafe.example.com",
+            adminFullName: "Fail Safe Admin",
+          }),
+        }),
+        { store, emailProvider: failingProvider },
+      );
+      expect(failedRegRes?.status).toBe(502);
+      const failedRegBody = (await failedRegRes?.json()) as Record<string, unknown>;
+      expect(failedRegBody["error"]).toBe("EMAIL_DELIVERY_FAILED");
+      expect(failedRegBody["verificationEmailDispatched"]).toBeUndefined();
+
+      // Case 3: Production mode without AWS SES configured refuses to fall back to in-memory email provider
+      expect(() => resolveEmailDeliveryProvider({ APP_ENV: "production" })).toThrow(
+        /Missing or invalid AWS_SES_FROM_EMAIL/,
+      );
+    });
+  });
+
+  describe("12. Phase 2.1: Atomic PostgreSQL Session Rotation Under Concurrency", () => {
+    it("executes session rotation in a single PostgreSQL transaction so concurrent rotation requests cannot rotate the same old token twice", async () => {
+      const pg = new PGlite();
+      const migration1 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0001_initial_multi_tenant.sql"),
+        "utf8",
+      );
+      const migration2 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0002_auth_persistence.sql"),
+        "utf8",
+      );
+      await pg.exec(migration1);
+      await pg.exec(migration2);
+
+      const pgliteClient: QueryableTransactionClient = {
+        query: async (
+          textOrConfig: string | { text: string; values?: unknown[] },
+          values?: unknown[],
+        ) => {
+          const text = typeof textOrConfig === "string" ? textOrConfig : textOrConfig.text;
+          const params =
+            Array.isArray(values) && values.length > 0
+              ? values
+              : typeof textOrConfig === "object" && Array.isArray(textOrConfig.values)
+                ? textOrConfig.values
+                : [];
+          const res = await pg.query(text, params);
+          return {
+            rows: res.rows,
+            rowCount: res.affectedRows ?? res.rows.length,
+          } as unknown as QueryResult;
+        },
+        release: () => {},
+      };
+      const db = drizzle(pgliteClient as unknown as NodePgClient, {
+        schema,
+      }) as unknown as AureliaAwsDb;
+
+      const userUuid = "aaaaaaaa-1111-4111-8111-111111111111";
+      await pg.query(
+        `INSERT INTO users (id, email, full_name, status, is_platform_admin)
+         VALUES ($1, 'admin@alpha.example.com', 'Aarav Admin', 'active', false);`,
+        [userUuid],
+      );
+
+      const manager = new SessionManager({ db });
+      const { rawToken, session: originalSession } = await manager.createSessionInDb(
+        userUuid,
+        "admin@alpha.example.com",
+        { ipAddress: "10.20.30.40", userAgent: "AureliaClient/2.1" },
+      );
+
+      // Fire 5 concurrent rotation requests with the exact same old token
+      const rotationResults = await Promise.all([
+        manager.rotateSessionInDb(rawToken),
+        manager.rotateSessionInDb(rawToken),
+        manager.rotateSessionInDb(rawToken),
+        manager.rotateSessionInDb(rawToken),
+        manager.rotateSessionInDb(rawToken),
+      ]);
+
+      const successfulRotations = rotationResults.filter(
+        (r): r is NonNullable<typeof r> => r !== null,
+      );
+      const rejectedRotations = rotationResults.filter((r) => r === null);
+
+      // Strictly 1 rotation succeeds; all 4 concurrent duplicates fail with null
+      expect(successfulRotations).toHaveLength(1);
+      expect(rejectedRotations).toHaveLength(4);
+
+      const winner = successfulRotations[0]!;
+      expect(winner.newRawToken).not.toBe(rawToken);
+      expect(winner.session.userId).toBe(userUuid);
+      expect(winner.session.email).toBe("admin@alpha.example.com");
+      expect(winner.session.ipAddress).toBe("10.20.30.40");
+      expect(winner.session.userAgent).toBe("AureliaClient/2.1");
+      expect(winner.session.createdAt).toBe(originalSession.createdAt);
+
+      // Old token is revoked in PostgreSQL; new token is active
+      expect(await manager.validateSessionInDb(rawToken)).toBeNull();
+      const validatedWinner = await manager.validateSessionInDb(winner.newRawToken);
+      expect(validatedWinner?.sessionId).toBe(winner.session.sessionId);
+
+      // Verify exactly 1 active session row exists in PostgreSQL for the user
+      const activeDbRows = await pg.query(
+        "SELECT session_id FROM user_sessions WHERE user_id = $1 AND revoked_at IS NULL;",
+        [userUuid],
+      );
+      expect(activeDbRows.rows).toHaveLength(1);
+
+      await pg.close();
+    });
+  });
+
+  describe("13. Phase 2.1: Fail-Closed Production Authentication & Database Outage Handling", () => {
+    it("never falls back to in-memory sessions, user records, or tenant memberships in production when PostgreSQL is unavailable", async () => {
+      // Seed an active in-memory session and user in `store`
+      const { rawToken } = sessionManager.createSession(adminUser.id, adminUser.email);
+      expect(sessionManager.validateSession(rawToken)).not.toBeNull();
+
+      const prodEnv = {
+        APP_ENV: "production",
+        NODE_ENV: "production",
+      };
+
+      // 1. Login in production without PostgreSQL fails closed with 503 DATABASE_UNAVAILABLE
+      //    even though `store` has the user and valid password hash
+      const prodLoginRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/login", {
+          method: "POST",
+          body: JSON.stringify({
+            email: adminUser.email,
+            password: defaultPassword,
+          }),
+        }),
+        { store, env: prodEnv },
+      );
+      expect(prodLoginRes?.status).toBe(503);
+      const prodLoginBody = (await prodLoginRes?.json()) as { error: string; message: string };
+      expect(prodLoginBody.error).toBe("DATABASE_UNAVAILABLE");
+      expect(prodLoginBody.message).toContain("In-memory fallback is disabled");
+
+      // 2. Protected session endpoint in production rejects valid in-memory session token with 503
+      const prodSessionRes = await handleApiRequest(
+        new Request("http://localhost/api/v1/auth/session", {
+          headers: { cookie: `aurelia_session=${rawToken}` },
+        }),
+        { store, env: prodEnv },
+      );
+      expect(prodSessionRes?.status).toBe(503);
+      const prodSessionBody = (await prodSessionRes?.json()) as { error: string };
+      expect(prodSessionBody.error).toBe("DATABASE_UNAVAILABLE");
+
+      // 3. Tenant-scoped endpoint in production rejects valid in-memory session and store membership with 503
+      const prodTeamRes = await handleApiRequest(
+        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/team`, {
+          headers: { cookie: `aurelia_session=${rawToken}` },
+        }),
+        { store, env: prodEnv },
+      );
+      expect(prodTeamRes?.status).toBe(503);
+      const prodTeamBody = (await prodTeamRes?.json()) as { error: string };
+      expect(prodTeamBody.error).toBe("DATABASE_UNAVAILABLE");
+    });
+
+    it("returns a safe, credential-redacted 503 DATABASE_UNAVAILABLE error during a PostgreSQL connection outage in production", async () => {
+      const { rawToken } = sessionManager.createSession(adminUser.id, adminUser.email);
+
+      const brokenClient: QueryableTransactionClient = {
+        query: async () => {
+          throw new Error(
+            "connect ECONNREFUSED 10.0.1.50:5432 for user=aurelia_app password=SuperSecretDbPass!99",
+          );
+        },
+        release: () => {},
+      };
+      const brokenPool: QueryableTransactionPool = {
+        connect: async () => brokenClient,
+      };
+      const brokenDb = drizzle(brokenClient as unknown as NodePgClient, {
+        schema,
+      }) as unknown as AureliaAwsDb;
+
+      const outageRes = await handleApiRequest(
+        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/projects`, {
+          headers: { cookie: `aurelia_session=${rawToken}` },
+        }),
+        {
+          pool: brokenPool,
+          db: brokenDb,
+          store,
+          env: { APP_ENV: "production", NODE_ENV: "production" },
+        },
+      );
+
+      expect(outageRes?.status).toBe(503);
+      const outageBody = (await outageRes?.json()) as { error: string; message: string };
+      expect(outageBody.error).toBe("DATABASE_UNAVAILABLE");
+      expect(outageBody.message).not.toContain("SuperSecretDbPass!99");
+      expect(outageBody.message).toContain("********");
+    });
+  });
+
+  describe("14. Phase 2.1: Concurrent Password Reset & Concurrent Email Verification Token Consumption", () => {
+    it("enforces atomic single-use password reset token consumption, transactional password update, and session revocation under concurrent requests", async () => {
+      const pg = new PGlite();
+      const migration1 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0001_initial_multi_tenant.sql"),
+        "utf8",
+      );
+      const migration2 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0002_auth_persistence.sql"),
+        "utf8",
+      );
+      await pg.exec(migration1);
+      await pg.exec(migration2);
+
+      const pgliteClient: QueryableTransactionClient = {
+        query: async (
+          textOrConfig: string | { text: string; values?: unknown[]; rowMode?: string },
+          values?: unknown[],
+        ) => {
+          const text = typeof textOrConfig === "string" ? textOrConfig : textOrConfig.text;
+          const params =
+            Array.isArray(values) && values.length > 0
+              ? values
+              : typeof textOrConfig === "object" && Array.isArray(textOrConfig.values)
+                ? textOrConfig.values
+                : [];
+          const rowMode =
+            typeof textOrConfig === "object" && textOrConfig.rowMode === "array"
+              ? ("array" as const)
+              : undefined;
+          const res = await pg.query(text, params, rowMode ? { rowMode } : undefined);
+          return {
+            rows: res.rows,
+            rowCount: res.affectedRows ?? res.rows.length,
+          } as unknown as QueryResult;
+        },
+        release: () => {},
+      };
+      const db = drizzle(pgliteClient as unknown as NodePgClient, {
+        schema,
+      }) as unknown as AureliaAwsDb;
+
+      const userUuid = "aaaaaaaa-2222-4222-8222-222222222222";
+      const initialHash = await hashPassword("InitialPass123!@#");
+      await pg.query(
+        `INSERT INTO users (id, email, full_name, password_hash, status, is_platform_admin)
+         VALUES ($1, 'reset-target@alpha.example.com', 'Reset User', $2, 'active', false);`,
+        [userUuid, initialHash],
+      );
+
+      // Create an active session in PostgreSQL that must be revoked on password reset
+      const activeSession = await sessionManager.createSessionInDb(
+        userUuid,
+        "reset-target@alpha.example.com",
+        { db },
+      );
+      expect(
+        await sessionManager.validateSessionInDb(activeSession.rawToken, { db }),
+      ).not.toBeNull();
+
+      // Request password reset
+      await authService.requestPasswordReset("reset-target@alpha.example.com", { db });
+      const emailRecord = defaultEmailDeliveryProvider.getLatestEmailFor(
+        "reset-target@alpha.example.com",
+        "password_reset",
+      );
+      expect(emailRecord?.token).toBeTruthy();
+
+      // Fire 4 concurrent confirmPasswordReset requests using the same single-use token
+      const concurrentOutcomes = await Promise.allSettled([
+        authService.confirmPasswordReset(emailRecord!.token, "ConcurrentPassA1!@#", { db }),
+        authService.confirmPasswordReset(emailRecord!.token, "ConcurrentPassB2!@#", { db }),
+        authService.confirmPasswordReset(emailRecord!.token, "ConcurrentPassC3!@#", { db }),
+        authService.confirmPasswordReset(emailRecord!.token, "ConcurrentPassD4!@#", { db }),
+      ]);
+
+      const fulfilled = concurrentOutcomes.filter((o) => o.status === "fulfilled");
+      const rejected = concurrentOutcomes.filter((o) => o.status === "rejected");
+
+      expect(fulfilled).toHaveLength(1);
+      expect(rejected).toHaveLength(3);
+
+      // Existing session was atomically revoked in PostgreSQL
+      expect(await sessionManager.validateSessionInDb(activeSession.rawToken, { db })).toBeNull();
+
+      await pg.close();
+    });
+
+    it("enforces atomic single-use email verification under concurrent requests and prevents activating the wrong tenant or user", async () => {
+      const pg = new PGlite();
+      const migration1 = readFileSync(
+        resolve(process.cwd(), "src/server/db/migrations/0001_initial_multi_tenant.sql"),
+        "utf8",
+      );
+      await pg.exec(migration1);
+
+      const pgliteClient: QueryableTransactionClient = {
+        query: async (text: string, values?: unknown[]) => {
+          const res = await pg.query(text, values);
+          return {
+            rows: res.rows,
+            rowCount: res.affectedRows ?? res.rows.length,
+          } as unknown as QueryResult;
+        },
+        release: () => {},
+      };
+      const pool: QueryableTransactionPool = {
+        connect: async () => pgliteClient,
+      };
+
+      const regA = await registerCompanyInDb(
+        { pool },
+        {
+          companyName: "Tenant One Pvt Ltd",
+          slug: "tenant-one",
+          adminEmail: "admin@tenant-one.example.com",
+          adminFullName: "Admin One",
+        },
+      );
+      const regB = await registerCompanyInDb(
+        { pool },
+        {
+          companyName: "Tenant Two Pvt Ltd",
+          slug: "tenant-two",
+          adminEmail: "admin@tenant-two.example.com",
+          adminFullName: "Admin Two",
+        },
+      );
+
+      // 1. Attempting to use Tenant One's verification token to activate Tenant Two is rejected
+      //    and rolls back so neither Tenant Two nor Tenant One is wrongly activated!
+      await expect(
+        verifyCompanyAdminEmailInDb({ pool }, regA.verificationToken, {
+          expectedTenantId: regB.tenant.id,
+        }),
+      ).rejects.toThrow(/does not belong to requested tenant/);
+
+      const statusCheckB = await pg.query<{ status: string }>(
+        "SELECT status FROM tenants WHERE id = $1;",
+        [regB.tenant.id],
+      );
+      expect(statusCheckB.rows[0]?.status).toBe("onboarding");
+
+      // 2. Attempting to verify with a mismatched email is rejected and rolled back
+      await expect(
+        verifyCompanyAdminEmailInDb({ pool }, regA.verificationToken, {
+          expectedEmail: "wrong-user@tenant-two.example.com",
+        }),
+      ).rejects.toThrow(/does not belong to the specified email address/);
+
+      // 3. Fire 4 concurrent verification requests with Tenant One's genuine token:
+      //    strictly 1 succeeds, 3 fail!
+      const verifyOutcomes = await Promise.allSettled([
+        verifyCompanyAdminEmailInDb({ pool }, regA.verificationToken),
+        verifyCompanyAdminEmailInDb({ pool }, regA.verificationToken),
+        verifyCompanyAdminEmailInDb({ pool }, regA.verificationToken),
+        verifyCompanyAdminEmailInDb({ pool }, regA.verificationToken),
+      ]);
+
+      const verifyFulfilled = verifyOutcomes.filter((o) => o.status === "fulfilled");
+      const verifyRejected = verifyOutcomes.filter((o) => o.status === "rejected");
+
+      expect(verifyFulfilled).toHaveLength(1);
+      expect(verifyRejected).toHaveLength(3);
+
+      // Tenant One is now active; Tenant Two remains in onboarding
+      const finalStatusA = await pg.query<{ status: string }>(
+        "SELECT status FROM tenants WHERE id = $1;",
+        [regA.tenant.id],
+      );
+      const finalStatusB = await pg.query<{ status: string }>(
+        "SELECT status FROM tenants WHERE id = $1;",
+        [regB.tenant.id],
+      );
+      expect(finalStatusA.rows[0]?.status).toBe("active");
+      expect(finalStatusB.rows[0]?.status).toBe("onboarding");
+
+      await pg.close();
+    });
+  });
+
+  describe("15. Phase 2.1: Complete End-to-End OIDC Authentication & Security Validation", () => {
+    const { privateKey, publicKey } = crypto.generateKeyPairSync("rsa", {
+      modulusLength: 2048,
+    });
+    const publicJwk = {
+      ...(publicKey.export({ format: "jwk" }) as Record<string, unknown>),
+      kid: "google_key_2026_01",
+      alg: "RS256",
+      use: "sig",
+      kty: "RSA",
+    };
+
+    function signTestIdToken(
+      claims: Record<string, unknown>,
+      options?: { kid?: string; alg?: string; signingKey?: crypto.KeyObject },
+    ): string {
+      const header = Buffer.from(
+        JSON.stringify({
+          alg: options?.alg ?? "RS256",
+          typ: "JWT",
+          kid: options?.kid ?? "google_key_2026_01",
+        }),
+      ).toString("base64url");
+      const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+      const signer = crypto.createSign("RSA-SHA256");
+      signer.update(`${header}.${payload}`);
+      signer.end();
+      const sig = signer.sign(options?.signingKey ?? privateKey).toString("base64url");
+      return `${header}.${payload}.${sig}`;
+    }
+
+    const oidcConfig: OidcProviderConfig = {
+      connectionId: "google",
+      provider: "google_oidc",
+      clientId: "aurelia-google-prod-client",
+      clientSecret: "aurelia-google-prod-secret",
+      issuerUrl: "https://accounts.google.com",
+      authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+      tokenEndpoint: "https://oauth2.googleapis.com/token",
+      jwksUri: "https://www.googleapis.com/oauth2/v3/certs",
+      redirectUri: "http://localhost/api/v1/auth/oidc/google/callback",
+      tenantId: tenantAlphaId,
+    };
+
+    it("completes end-to-end OIDC code exchange, JWKS key lookup, RS256 verification, and issues an authenticated Aurelia session", async () => {
+      ssoService.registerOidcConnection("google", oidcConfig);
+      const authReq = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      const nowSec = Math.floor(Date.now() / 1000);
+
+      let tokenEndpointCalled = false;
+      let jwksEndpointCalled = false;
+      let receivedCodeVerifier = "";
+
+      const mockOidcFetch: typeof fetch = async (input, init) => {
+        const urlStr = String(input);
+        if (urlStr === oidcConfig.tokenEndpoint) {
+          tokenEndpointCalled = true;
+          const form = new URLSearchParams(String(init?.body ?? ""));
+          receivedCodeVerifier = form.get("code_verifier") ?? "";
+          const idToken = signTestIdToken({
+            iss: oidcConfig.issuerUrl,
+            sub: "google_sub_admin_01",
+            aud: oidcConfig.clientId,
+            exp: nowSec + 3600,
+            iat: nowSec,
+            nonce: authReq.nonce,
+            email: adminUser.email,
+            email_verified: true,
+            name: adminUser.fullName,
+          });
+          return new Response(
+            JSON.stringify({
+              id_token: idToken,
+              access_token: "ya29.mock_access_token",
+              token_type: "Bearer",
+              expires_in: 3600,
+            }),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        }
+        if (urlStr === oidcConfig.jwksUri) {
+          jwksEndpointCalled = true;
+          return new Response(JSON.stringify({ keys: [publicJwk] }), {
+            status: 200,
+            headers: { "content-type": "application/json" },
+          });
+        }
+        return new Response("Not Found", { status: 404 });
+      };
+
+      const callbackRes = await handleApiRequest(
+        new Request(
+          `http://localhost/api/v1/auth/oidc/google/callback?code=valid_auth_code_999&state=${encodeURIComponent(authReq.state)}`,
+        ),
+        {
+          store,
+          oidcConfig,
+          oidcFetchFn: mockOidcFetch,
+        },
+      );
+
+      expect(callbackRes?.status).toBe(200);
+      expect(tokenEndpointCalled).toBe(true);
+      expect(jwksEndpointCalled).toBe(true);
+      expect(receivedCodeVerifier).toBe(authReq.codeVerifier);
+
+      const setCookie = callbackRes?.headers.get("set-cookie") ?? "";
+      expect(setCookie).toContain("aurelia_session=");
+      expect(setCookie).toContain("HttpOnly");
+
+      const callbackBody = (await callbackRes?.json()) as {
+        authenticated: boolean;
+        tenantId: string;
+        sessionToken: string;
+        user: { id: string; email: string };
+      };
+      expect(callbackBody.authenticated).toBe(true);
+      expect(callbackBody.tenantId).toBe(tenantAlphaId);
+      expect(callbackBody.user.id).toBe(adminUser.id);
+
+      // Verify the issued OIDC session works on protected tenant API endpoints
+      const projectsRes = await handleApiRequest(
+        new Request(`http://localhost/api/v1/tenants/${tenantAlphaId}/projects`, {
+          headers: { cookie: `aurelia_session=${callbackBody.sessionToken}` },
+        }),
+        { store },
+      );
+      expect(projectsRes?.status).toBe(200);
+    });
+
+    it("rejects OIDC callbacks with invalid signature, wrong issuer, wrong audience, wrong/missing nonce, expired token, replayed state, wrong redirect_uri, or invalid PKCE", async () => {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const { privateKey: wrongPrivateKey } = crypto.generateKeyPairSync("rsa", {
+        modulusLength: 2048,
+      });
+
+      function buildMockFetchWithToken(idTokenFactory: (nonce: string) => string): typeof fetch {
+        const currentNonce = "";
+        return async (input) => {
+          const urlStr = String(input);
+          if (urlStr === oidcConfig.tokenEndpoint) {
+            return new Response(
+              JSON.stringify({
+                id_token: idTokenFactory(currentNonce),
+                token_type: "Bearer",
+              }),
+              { status: 200 },
+            );
+          }
+          if (urlStr === oidcConfig.jwksUri) {
+            return new Response(JSON.stringify({ keys: [publicJwk] }), { status: 200 });
+          }
+          return new Response("Not Found", { status: 404 });
+        };
+      }
+
+      // 1. Invalid cryptographic signature (signed with wrong RSA private key)
+      const req1 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_1",
+          state: req1.state,
+          config: oidcConfig,
+          fetchFn: buildMockFetchWithToken(() =>
+            signTestIdToken(
+              {
+                iss: oidcConfig.issuerUrl,
+                sub: "sub_1",
+                aud: oidcConfig.clientId,
+                exp: nowSec + 3600,
+                iat: nowSec,
+                nonce: req1.nonce,
+                email: adminUser.email,
+              },
+              { signingKey: wrongPrivateKey },
+            ),
+          ),
+        }),
+      ).rejects.toThrow(/Invalid OIDC ID token cryptographic signature/);
+
+      // 2. State replay (reusing req1.state after it was already consumed)
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_1_replay",
+          state: req1.state,
+          config: oidcConfig,
+        }),
+      ).rejects.toThrow(/already been consumed/);
+
+      // 3. Wrong issuer
+      const req2 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_2",
+          state: req2.state,
+          config: oidcConfig,
+          fetchFn: buildMockFetchWithToken(() =>
+            signTestIdToken({
+              iss: "https://evil-issuer.example.com",
+              sub: "sub_2",
+              aud: oidcConfig.clientId,
+              exp: nowSec + 3600,
+              iat: nowSec,
+              nonce: req2.nonce,
+              email: adminUser.email,
+            }),
+          ),
+        }),
+      ).rejects.toThrow(/OIDC issuer mismatch/);
+
+      // 4. Wrong audience
+      const req3 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_3",
+          state: req3.state,
+          config: oidcConfig,
+          fetchFn: buildMockFetchWithToken(() =>
+            signTestIdToken({
+              iss: oidcConfig.issuerUrl,
+              sub: "sub_3",
+              aud: "other-unrelated-client-id",
+              exp: nowSec + 3600,
+              iat: nowSec,
+              nonce: req3.nonce,
+              email: adminUser.email,
+            }),
+          ),
+        }),
+      ).rejects.toThrow(/OIDC audience mismatch/);
+
+      // 5. Wrong or missing nonce
+      const req4 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_4",
+          state: req4.state,
+          config: oidcConfig,
+          fetchFn: buildMockFetchWithToken(() =>
+            signTestIdToken({
+              iss: oidcConfig.issuerUrl,
+              sub: "sub_4",
+              aud: oidcConfig.clientId,
+              exp: nowSec + 3600,
+              iat: nowSec,
+              nonce: "forged_wrong_nonce",
+              email: adminUser.email,
+            }),
+          ),
+        }),
+      ).rejects.toThrow(/OIDC ID token nonce mismatch/);
+
+      // 6. Expired ID token
+      const req5 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_5",
+          state: req5.state,
+          config: oidcConfig,
+          fetchFn: buildMockFetchWithToken(() =>
+            signTestIdToken({
+              iss: oidcConfig.issuerUrl,
+              sub: "sub_5",
+              aud: oidcConfig.clientId,
+              exp: nowSec - 60,
+              iat: nowSec - 3600,
+              nonce: req5.nonce,
+              email: adminUser.email,
+            }),
+          ),
+        }),
+      ).rejects.toThrow(/OIDC ID token has expired/);
+
+      // 7. Unauthorized redirect_uri mismatch
+      const req6 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_6",
+          state: req6.state,
+          redirectUri: "https://attacker.example.com/callback",
+          config: oidcConfig,
+        }),
+      ).rejects.toThrow(/OIDC redirect_uri mismatch/);
+
+      // 8. Invalid PKCE code_verifier
+      const req7 = ssoService.prepareGoogleOidcRequest(oidcConfig);
+      await expect(
+        ssoService.completeOidcCallbackExchange({
+          code: "code_7",
+          state: req7.state,
+          codeVerifierOverride: "wrong_pkce_code_verifier_that_does_not_match_s256_challenge_0000",
+          config: oidcConfig,
+        }),
+      ).rejects.toThrow(/PKCE verification failed/);
+    });
+  });
+
+  describe("18. Development Mode Email Outbox, Optional AWS SES & Production Fail-Closed Validation", () => {
+    it("allows AWS_SES_FROM_EMAIL and SES credentials to remain unset in development and routes password-reset and email-verification to the development outbox", async () => {
+      defaultEmailDeliveryProvider.clearOutbox();
+
+      const previewUrl =
+        "https://ais-dev-bsok7auxatxjzbrbx5nsra-808876545987.asia-northeast1.run.app";
+      const devEnv: Record<string, string | undefined> = {
+        APP_ENV: "development",
+        NODE_ENV: "development",
+        APP_PUBLIC_URL: previewUrl,
+        EMAIL_DELIVERY_MODE: "development_outbox",
+        AWS_SES_ENABLED: "false",
+        AWS_SES_FROM_EMAIL: "",
+      };
+
+      const validation = validateEmailDeliveryEnvironment(devEnv);
+      expect(validation.valid).toBe(true);
+      expect(validation.mode).toBe("development_outbox");
+      expect(validation.isProduction).toBe(false);
+      expect(validation.appPublicUrl).toBe(previewUrl);
+      expect(validation.fromEmail).toBeNull();
+
+      // 1. Self-service company registration succeeds without AWS SES or a purchased domain
+      const regRes = await handleApiRequest(
+        new Request(`${previewUrl}/api/v1/onboarding/self-service/register-company`, {
+          method: "POST",
+          body: JSON.stringify({
+            companyName: "Stealth Dev Labs",
+            slug: "stealth-dev-labs",
+            adminEmail: "founder@stealth-dev.test",
+            adminFullName: "Dev Founder",
+          }),
+        }),
+        { store, env: devEnv },
+      );
+
+      expect(regRes?.status).toBe(201);
+      const regBody = (await regRes?.json()) as Record<string, unknown>;
+      expect(regBody["verificationEmailDispatched"]).toBe(true);
+      // Production/API response invariant: verificationToken is NEVER returned in the API response
+      expect(regBody["verificationToken"]).toBeUndefined();
+
+      // 2. Password reset request succeeds without AWS SES and NEVER returns resetToken in the API response
+      const resetRes = await handleApiRequest(
+        new Request(`${previewUrl}/api/v1/auth/password-reset/request`, {
+          method: "POST",
+          body: JSON.stringify({ email: adminUser.email }),
+        }),
+        { store, env: devEnv },
+      );
+
+      expect(resetRes?.status).toBe(200);
+      const resetBody = (await resetRes?.json()) as Record<string, unknown>;
+      expect(resetBody["success"]).toBe(true);
+      expect(resetBody["resetToken"]).toBeUndefined();
+      expect(resetBody["token"]).toBeUndefined();
+
+      // 3. Development tokens and preview actionUrls are accessible ONLY through the isolated development mechanism
+      const outboxAccessor = getDevelopmentEmailOutbox(devEnv);
+      expect(outboxAccessor.mode).toBe("development_outbox");
+
+      const verifyRecord = outboxAccessor.getLatestEmailFor(
+        "founder@stealth-dev.test",
+        "email_verification",
+      );
+      expect(verifyRecord).toBeDefined();
+      expect(verifyRecord?.token).toMatch(/^[a-f0-9]{64}$/);
+      expect(verifyRecord?.actionUrl).toContain(`${previewUrl}/verify-email?token=`);
+
+      const resetRecord = outboxAccessor.getLatestEmailFor(adminUser.email, "password_reset");
+      expect(resetRecord).toBeDefined();
+      expect(resetRecord?.token).toMatch(/^[a-f0-9]{64}$/);
+      expect(resetRecord?.actionUrl).toContain(`${previewUrl}/reset-password?token=`);
+
+      // 4. Isolated development HTTP endpoint (/api/v1/dev/email-outbox) returns outbox items in development
+      const devOutboxHttpRes = await handleApiRequest(
+        new Request(
+          `${previewUrl}/api/v1/dev/email-outbox?recipient=${encodeURIComponent(adminUser.email)}&type=password_reset`,
+          { method: "GET" },
+        ),
+        { store, env: devEnv },
+      );
+      expect(devOutboxHttpRes?.status).toBe(200);
+      const devOutboxHttpBody = (await devOutboxHttpRes?.json()) as {
+        mode: string;
+        count: number;
+        emails: Array<{ to: string; token: string; actionUrl: string; type: string }>;
+      };
+      expect(devOutboxHttpBody.mode).toBe("development_outbox");
+      expect(devOutboxHttpBody.count).toBe(1);
+      expect(devOutboxHttpBody.emails[0]?.token).toBe(resetRecord?.token);
+      expect(devOutboxHttpBody.emails[0]?.actionUrl).toContain(previewUrl);
+    });
+
+    it("enforces fail-closed validation in production when AWS SES, verified sender, or APP_PUBLIC_URL is missing, and blocks development outbox access in production", async () => {
+      const prodEnvMissingSes: Record<string, string | undefined> = {
+        APP_ENV: "production",
+        NODE_ENV: "production",
+      };
+
+      // 1. Production environment validation fails closed when SES and APP_PUBLIC_URL are unset
+      const prodValidation = validateEmailDeliveryEnvironment(prodEnvMissingSes);
+      expect(prodValidation.valid).toBe(false);
+      expect(prodValidation.isProduction).toBe(true);
+      expect(prodValidation.errors.length).toBeGreaterThan(0);
+
+      // 2. Production rejects EMAIL_DELIVERY_MODE=development_outbox or AWS_SES_ENABLED=false
+      expect(() =>
+        resolveEmailDeliveryProvider({
+          APP_ENV: "production",
+          EMAIL_DELIVERY_MODE: "development_outbox",
+          AWS_SES_ENABLED: "false",
+        }),
+      ).toThrow(/Email delivery cannot be disabled/);
+
+      // 3. Production requires an explicit https:// APP_PUBLIC_URL (no hardcoded domain fallback)
+      expect(() =>
+        loadAwsSesConfig({
+          APP_ENV: "production",
+          AWS_SES_REGION: "ap-south-1",
+          AWS_SES_FROM_EMAIL: "verified@company.example.com",
+          AWS_SES_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+          AWS_SES_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+          // APP_PUBLIC_URL intentionally omitted
+        }),
+      ).toThrow(/Missing required APP_PUBLIC_URL/);
+
+      expect(() =>
+        resolveAppPublicUrl({
+          APP_ENV: "production",
+          APP_PUBLIC_URL: "http://localhost:3000",
+        }),
+      ).toThrow(/Production APP_PUBLIC_URL must use https:\/\//);
+
+      // 4. Rejects placeholder sender email addresses containing angle brackets
+      expect(() =>
+        loadAwsSesConfig({
+          APP_ENV: "production",
+          APP_PUBLIC_URL: "https://app.company.example.com",
+          AWS_SES_FROM_EMAIL: "<replace-with-verified-ses-sender@your-domain.com>",
+          AWS_SES_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+          AWS_SES_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        }),
+      ).toThrow(/Missing or invalid AWS_SES_FROM_EMAIL/);
+
+      // 5. Development email outbox helper and HTTP endpoint fail closed (403) in production
+      expect(() => getDevelopmentEmailOutbox({ APP_ENV: "production" })).toThrow(
+        /Development email outbox is strictly disabled in production/,
+      );
+
+      const prodOutboxHttpRes = await handleApiRequest(
+        new Request("https://app.company.example.com/api/v1/dev/email-outbox", {
+          method: "GET",
+        }),
+        { store, env: { APP_ENV: "production", NODE_ENV: "production" } },
+      );
+      expect(prodOutboxHttpRes?.status).toBe(403);
+      const prodOutboxBody = (await prodOutboxHttpRes?.json()) as Record<string, unknown>;
+      expect(prodOutboxBody["error"]).toBe("DEVELOPMENT_ONLY_ENDPOINT");
+    });
+
+    it("supports EMAIL_DELIVERY_MODE=development and AWS_SES_ENABLED=false with APP_PUBLIC_URL and AWS_SES_FROM_EMAIL omitted, and never initializes AWS SES when disabled", async () => {
+      defaultEmailDeliveryProvider.clearOutbox();
+
+      const devConfigWithoutOptionalVars: Record<string, string | undefined> = {
+        APP_ENV: "development",
+        NODE_ENV: "development",
+        EMAIL_DELIVERY_MODE: "development",
+        AWS_SES_ENABLED: "false",
+        AWS_SES_REGION: "ap-south-1",
+        AWS_SES_FROM_NAME: "Aurelia TimeFlow",
+        // APP_PUBLIC_URL and AWS_SES_FROM_EMAIL intentionally omitted
+      };
+
+      // 1. Validation succeeds with APP_PUBLIC_URL and AWS_SES_FROM_EMAIL completely omitted
+      const validation = validateEmailDeliveryEnvironment(devConfigWithoutOptionalVars);
+      expect(validation.valid).toBe(true);
+      expect(validation.mode).toBe("development_outbox");
+      expect(validation.isProduction).toBe(false);
+      expect(validation.appPublicUrl).toBe("http://localhost:3000");
+      expect(validation.fromEmail).toBeNull();
+      expect(validation.errors).toHaveLength(0);
+
+      // 2. When AWS_SES_ENABLED=false, isAwsSesConfigured returns false and loadAwsSesConfig refuses to initialize SES even if credentials exist
+      const disabledWithCreds: Record<string, string | undefined> = {
+        ...devConfigWithoutOptionalVars,
+        AWS_SES_FROM_EMAIL: "sender@example.com",
+        AWS_SES_ACCESS_KEY_ID: "AKIAIOSFODNN7EXAMPLE",
+        AWS_SES_SECRET_ACCESS_KEY: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+      };
+      expect(isAwsSesConfigured(disabledWithCreds)).toBe(false);
+      expect(() => loadAwsSesConfig(disabledWithCreds)).toThrow(
+        /AWS SES email delivery is disabled/,
+      );
+
+      // 3. resolveEmailDeliveryProvider returns the development outbox and never instantiates AwsSesEmailProvider
+      const resolvedProvider = resolveEmailDeliveryProvider(disabledWithCreds);
+      expect(resolvedProvider).toBe(defaultEmailDeliveryProvider);
+      expect(resolvedProvider).not.toBeInstanceOf(AwsSesEmailProvider);
+
+      // 4. End-to-end password-reset and verification work using the development outbox when APP_PUBLIC_URL and AWS_SES_FROM_EMAIL are omitted
+      const regRes = await handleApiRequest(
+        new Request("http://localhost:3000/api/v1/onboarding/self-service/register-company", {
+          method: "POST",
+          body: JSON.stringify({
+            companyName: "NoDomain Startup",
+            slug: "nodomain-startup",
+            adminEmail: "founder@nodomain.local",
+            adminFullName: "Founder One",
+          }),
+        }),
+        { store, env: devConfigWithoutOptionalVars },
+      );
+      expect(regRes?.status).toBe(201);
+
+      const outbox = getDevelopmentEmailOutbox(devConfigWithoutOptionalVars);
+      const email = outbox.getLatestEmailFor("founder@nodomain.local", "email_verification");
+      expect(email).toBeDefined();
+      expect(email?.actionUrl).toContain("http://localhost:3000/verify-email?token=");
     });
   });
 });

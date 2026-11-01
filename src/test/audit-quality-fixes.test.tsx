@@ -123,11 +123,7 @@ describe("Phase 4: Leave Management Working Days, Holidays, Cross-Year & Availab
     expect(leaveDaysInYear(crossYearReq, 2025, [])).toBe(3);
     expect(leaveDaysInYear(crossYearReq, 2026, [])).toBe(2);
     // If 2026-01-01 is a New Year's Day holiday, 2026 only counts 1 day:
-    expect(
-      leaveDaysInYear(crossYearReq, 2026, [
-        { id: "h_ny", name: "New Year's Day", date: "2026-01-01" },
-      ]),
-    ).toBe(1);
+    expect(leaveDaysInYear(crossYearReq, 2026, [{ date: "2026-01-01" }])).toBe(1);
   });
 
   it("calculates half-day requests accurately as 0.5 days on a working day and 0 on a holiday/weekend", () => {
@@ -228,9 +224,9 @@ describe("Phase 5: Audit Trail & Notification Consistency", () => {
 
     const afterState = getState();
     expect(afterState.auditLogs.length).toBe(beforeCount + 1);
-    expect(afterState.auditLogs[0].category).toBe("approval");
-    expect(afterState.auditLogs[0].action).toBe("Timesheet Approved");
-    expect(afterState.auditLogs[0].actorName).toBe("Vikram Joshi");
+    expect(afterState.auditLogs[0]!.category).toBe("approval");
+    expect(afterState.auditLogs[0]!.action).toBe("Timesheet Approved");
+    expect(afterState.auditLogs[0]!.actorName).toBe("Vikram Joshi");
   });
 
   it("records audit log events for bulk timesheet and bulk leave decisions", () => {
@@ -248,6 +244,6 @@ describe("Phase 5: Audit Trail & Notification Consistency", () => {
 
     bulkReviewLeaves(leaveIds, "rejected", "m6", "Vikram Joshi", "Quarter close freeze");
     expect(getState().auditLogs.length).toBe(midLogs + leaveIds.length);
-    expect(getState().auditLogs[0].action).toBe("Leave Rejected");
+    expect(getState().auditLogs[0]!.action).toBe("Leave Rejected");
   });
 });

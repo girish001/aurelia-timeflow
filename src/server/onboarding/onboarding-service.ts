@@ -1,5 +1,10 @@
 import crypto from "node:crypto";
-import { defaultEmailDeliveryProvider } from "../auth/email-provider";
+import {
+  defaultEmailDeliveryProvider,
+  EmailDeliveryError,
+  resolveEmailDeliveryProvider,
+  type EmailDeliveryProvider,
+} from "../auth/email-provider";
 import {
   AuthorizationError,
   TenantIsolationError,
@@ -21,7 +26,7 @@ export interface SelfServiceRegistrationInput {
   slug: string;
   adminEmail: string;
   adminFullName: string;
-  adminJobTitle?: string;
+  adminJobTitle?: string | undefined;
 }
 
 export interface SelfServiceRegistrationResult {
@@ -29,6 +34,8 @@ export interface SelfServiceRegistrationResult {
   adminUser: UserRecord;
   adminMembership: MembershipRecord;
   verificationToken: string;
+  verificationEmailDispatched?: boolean | undefined;
+  emailMessageId?: string | undefined;
 }
 
 export interface CsvTeamRow {
@@ -101,7 +108,7 @@ export function normalizeTenantSlug(raw: string): string {
 export function registerSelfServiceCompany(
   store: MultiTenantDataStore,
   input: SelfServiceRegistrationInput,
-  options?: { now?: number; ttlMs?: number },
+  options?: { now?: number; ttlMs?: number; skipAsyncDispatch?: boolean },
 ): SelfServiceRegistrationResult {
   const slug = normalizeTenantSlug(input.slug || input.companyName);
   if (slug.length < 2) {
@@ -166,13 +173,15 @@ export function registerSelfServiceCompany(
     expiresAt,
   });
 
-  void defaultEmailDeliveryProvider.sendEmailVerificationEmail({
-    to: email,
-    companyName: tenant.name,
-    tenantId: tenant.id,
-    verificationToken,
-    expiresAt,
-  });
+  if (!options?.skipAsyncDispatch) {
+    void defaultEmailDeliveryProvider.sendEmailVerificationEmail({
+      to: email,
+      companyName: tenant.name,
+      tenantId: tenant.id,
+      verificationToken,
+      expiresAt,
+    });
+  }
 
   return {
     tenant,
@@ -183,16 +192,87 @@ export function registerSelfServiceCompany(
 }
 
 /**
+ * Async variant of `registerSelfServiceCompany` that awaits email delivery confirmation
+ * from the configured `EmailDeliveryProvider` before reporting `verificationEmailDispatched: true`.
+ * If email delivery fails, invalidates the pending verification token and throws `EmailDeliveryError`.
+ */
+export async function registerSelfServiceCompanyAsync(
+  store: MultiTenantDataStore,
+  input: SelfServiceRegistrationInput,
+  options?: {
+    now?: number | undefined;
+    ttlMs?: number | undefined;
+    env?: Record<string, string | undefined> | undefined;
+    emailProvider?: EmailDeliveryProvider | undefined;
+  },
+): Promise<
+  SelfServiceRegistrationResult & { verificationEmailDispatched: true; emailMessageId: string }
+> {
+  const now = options?.now ?? Date.now();
+  const ttlMs = options?.ttlMs ?? EMAIL_VERIFICATION_TTL_MS;
+  const expiresAt = now + ttlMs;
+
+  const reg = registerSelfServiceCompany(store, input, {
+    now,
+    ttlMs,
+    skipAsyncDispatch: true,
+  });
+  const tokenHash = hashVerificationToken(reg.verificationToken);
+  const emailProvider = resolveEmailDeliveryProvider(options?.env, options?.emailProvider);
+
+  try {
+    const delivery = await emailProvider.sendEmailVerificationEmail({
+      to: reg.adminUser.email,
+      companyName: reg.tenant.name,
+      tenantId: reg.tenant.id,
+      verificationToken: reg.verificationToken,
+      expiresAt,
+    });
+
+    if (!delivery || !delivery.accepted || !delivery.messageId?.trim()) {
+      throw new EmailDeliveryError(
+        "Email provider did not confirm verification email acceptance.",
+        502,
+      );
+    }
+
+    return {
+      ...reg,
+      verificationEmailDispatched: true,
+      emailMessageId: delivery.messageId,
+    };
+  } catch (err) {
+    pendingVerificationTokens.delete(tokenHash);
+    throw err;
+  }
+}
+
+/**
  * Step 2 (Self-Service): Verifies the founding administrator's email token
- * (checking SHA-256 hash, expiration, and single-use status) and transitions
- * the tenant from `onboarding` to `active`.
+ * (checking SHA-256 hash, expiration, atomic single-use status, and strict tenant/user binding)
+ * and transitions the tenant from `onboarding` to `active`.
  */
 export function verifyCompanyAdminEmail(
   store: MultiTenantDataStore,
   verificationToken: string,
-  now = Date.now(),
+  nowOrOptions?:
+    | number
+    | {
+        now?: number | undefined;
+        expectedTenantId?: string | undefined;
+        expectedEmail?: string | undefined;
+      },
 ): ResolvedTenantContext {
-  if (!verificationToken || typeof verificationToken !== "string") {
+  const now = typeof nowOrOptions === "number" ? nowOrOptions : (nowOrOptions?.now ?? Date.now());
+  const expectedTenantId =
+    typeof nowOrOptions === "object" ? nowOrOptions?.expectedTenantId : undefined;
+  const expectedEmail = typeof nowOrOptions === "object" ? nowOrOptions?.expectedEmail : undefined;
+
+  if (
+    !verificationToken ||
+    typeof verificationToken !== "string" ||
+    verificationToken.startsWith("vtok_")
+  ) {
     throw new Error("Invalid, expired, or already used email verification token.");
   }
 
@@ -209,11 +289,34 @@ export function verifyCompanyAdminEmail(
     throw new Error("Invalid, expired, or already used email verification token.");
   }
 
+  if (expectedTenantId && expectedTenantId !== record.tenantId) {
+    throw new TenantIsolationError(
+      `Verification token does not belong to requested tenant "${expectedTenantId}".`,
+    );
+  }
+  if (expectedEmail && expectedEmail.trim().toLowerCase() !== record.email) {
+    throw new AuthorizationError(
+      "Verification token does not belong to the specified email address.",
+    );
+  }
+
+  const ctx = store.resolveTenantContext(record.userId, record.tenantId);
+
+  if (ctx.user.email.trim().toLowerCase() !== record.email) {
+    throw new AuthorizationError(
+      "Email verification rejected: target user email does not match verification token.",
+    );
+  }
+
+  if (ctx.tenant.status !== "onboarding") {
+    throw new Error(
+      `Tenant workspace ${record.tenantId} is not in onboarding state or was already activated.`,
+    );
+  }
+
   // Mark single-use token as consumed immediately before activating tenant
   record.usedAt = now;
   pendingVerificationTokens.set(tokenHash, record);
-
-  const ctx = store.resolveTenantContext(record.userId, record.tenantId);
 
   store.registerTenant({
     ...ctx.tenant,

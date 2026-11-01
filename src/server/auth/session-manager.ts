@@ -44,6 +44,31 @@ export interface RotateSessionOptions {
 }
 
 const initializedDbs = new WeakSet<object>();
+const dbTransactionLocks = new WeakMap<object, Promise<void>>();
+
+export async function withDbTransactionLock<T>(
+  db: AureliaAwsDb,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const prev = dbTransactionLocks.get(db) ?? Promise.resolve();
+  let releaseLock!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  dbTransactionLocks.set(
+    db,
+    prev.then(
+      () => current,
+      () => current,
+    ),
+  );
+  await prev;
+  try {
+    return await operation();
+  } finally {
+    releaseLock();
+  }
+}
 
 export async function ensureSessionTableInDb(db: AureliaAwsDb): Promise<void> {
   if (initializedDbs.has(db)) return;
@@ -65,6 +90,20 @@ export async function ensureSessionTableInDb(db: AureliaAwsDb): Promise<void> {
     CREATE INDEX IF NOT EXISTS user_sessions_user_idx ON user_sessions (user_id)
   `);
   initializedDbs.add(db);
+}
+
+function parseDbTimestampMs(val: unknown): number {
+  if (val instanceof Date) return val.getTime();
+  if (typeof val === "number") return val;
+  if (
+    typeof val === "object" &&
+    val !== null &&
+    "getTime" in val &&
+    typeof (val as { getTime: unknown }).getTime === "function"
+  ) {
+    return (val as { getTime: () => number }).getTime();
+  }
+  return new Date(String(val)).getTime();
 }
 
 export class SessionManager {
@@ -110,7 +149,11 @@ export class SessionManager {
   public createSession(
     userId: string,
     email: string,
-    metadata?: { ipAddress?: string; userAgent?: string; now?: number },
+    metadata?: {
+      ipAddress?: string | undefined;
+      userAgent?: string | undefined;
+      now?: number | undefined;
+    },
   ): { rawToken: string; session: UserSession } {
     const now = metadata?.now ?? Date.now();
     const rawToken = this.generateRawToken();
@@ -139,10 +182,10 @@ export class SessionManager {
     userId: string,
     email: string,
     metadata?: {
-      ipAddress?: string;
-      userAgent?: string;
-      now?: number;
-      db?: AureliaAwsDb;
+      ipAddress?: string | undefined;
+      userAgent?: string | undefined;
+      now?: number | undefined;
+      db?: AureliaAwsDb | undefined;
     },
   ): Promise<{ rawToken: string; session: UserSession }> {
     const { rawToken, session } = this.createSession(userId, email, metadata);
@@ -253,9 +296,9 @@ export class SessionManager {
       return null;
     }
 
-    const createdAt = new Date(String(row["created_at"])).getTime();
-    const lastActiveAt = new Date(String(row["last_active_at"])).getTime();
-    const expiresAt = new Date(String(row["expires_at"])).getTime();
+    const createdAt = parseDbTimestampMs(row["created_at"]);
+    const lastActiveAt = parseDbTimestampMs(row["last_active_at"]);
+    const expiresAt = parseDbTimestampMs(row["expires_at"]);
 
     if (expiresAt <= now || now - lastActiveAt > this.idleTimeoutMs) {
       await this.destroySessionInDb(rawToken, { db, now });
@@ -316,58 +359,137 @@ export class SessionManager {
   }
 
   /**
-   * Rotates a session token in PostgreSQL (`user_sessions`), revoking the old token hash
-   * and persisting the new token hash atomically.
+   * Rotates a session token in PostgreSQL (`user_sessions`) inside a single atomic
+   * PostgreSQL transaction.
+   *
+   * Security Invariants:
+   * - Executes inside a single transaction (`BEGIN` ... `COMMIT` / `ROLLBACK`).
+   * - Uses a data-modifying CTE (`WITH revoked_session AS (UPDATE ... WHERE token_hash = $old AND revoked_at IS NULL ...) INSERT INTO user_sessions ... SELECT ... FROM revoked_session`)
+   *   so revoking the old token and inserting the new token happen atomically.
+   * - Concurrent requests attempting to rotate the same old token cannot both succeed:
+   *   at most one caller matches `revoked_at IS NULL`, and all others receive `null`.
+   * - Preserves original session metadata (`user_id`, `email`, `ip_address`, `user_agent`, `created_at`)
+   *   and enforces absolute and idle expiration rules.
    */
   public async rotateSessionInDb(
     oldRawToken: string,
     options?: { db?: AureliaAwsDb; now?: number },
   ): Promise<{ newRawToken: string; session: UserSession } | null> {
+    if (!oldRawToken || typeof oldRawToken !== "string") return null;
     const now = options?.now ?? Date.now();
     const db = options?.db ?? this.defaultDb;
     if (!db) {
       return this.rotateSession(oldRawToken, now);
     }
 
-    const existing = await this.validateSessionInDb(oldRawToken, { db, now });
-    if (!existing) return null;
+    await ensureSessionTableInDb(db);
 
-    await this.destroySessionInDb(oldRawToken, { db, now });
-
+    const oldTokenHash = this.hashToken(oldRawToken);
     const newRawToken = this.generateRawToken();
     const newTokenHash = this.hashToken(newRawToken);
-    const updatedSession: UserSession = {
-      ...existing,
-      sessionId: `sess_${crypto.randomUUID()}`,
-      tokenHash: newTokenHash,
-      lastActiveAt: now,
-      expiresAt: now + this.sessionTtlMs,
-    };
+    const newSessionId = `sess_${crypto.randomUUID()}`;
+    const nowIso = new Date(now).toISOString();
+    const idleCutoffIso = new Date(now - this.idleTimeoutMs).toISOString();
+    const newExpiresAt = now + this.sessionTtlMs;
+    const newExpiresAtIso = new Date(newExpiresAt).toISOString();
 
-    const createdAtIso = new Date(updatedSession.createdAt).toISOString();
-    const lastActiveAtIso = new Date(updatedSession.lastActiveAt).toISOString();
-    const expiresAtIso = new Date(updatedSession.expiresAt).toISOString();
+    return withDbTransactionLock(db, async () => {
+      await db.execute(sql`BEGIN`);
+      try {
+        const res = await db.execute(sql`
+          WITH revoked_session AS (
+            UPDATE user_sessions
+            SET revoked_at = ${nowIso}::timestamptz
+            WHERE token_hash = ${oldTokenHash}
+              AND revoked_at IS NULL
+              AND expires_at > ${nowIso}::timestamptz
+              AND last_active_at >= ${idleCutoffIso}::timestamptz
+            RETURNING
+              session_id,
+              user_id,
+              email,
+              ip_address,
+              user_agent,
+              created_at
+          )
+          INSERT INTO user_sessions (
+            session_id,
+            token_hash,
+            user_id,
+            email,
+            ip_address,
+            user_agent,
+            created_at,
+            last_active_at,
+            expires_at,
+            revoked_at
+          )
+          SELECT
+            ${newSessionId},
+            ${newTokenHash},
+            user_id,
+            email,
+            ip_address,
+            user_agent,
+            created_at,
+            ${nowIso}::timestamptz,
+            ${newExpiresAtIso}::timestamptz,
+            NULL
+          FROM revoked_session
+          RETURNING
+            session_id,
+            token_hash,
+            user_id,
+            email,
+            ip_address,
+            user_agent,
+            created_at,
+            last_active_at,
+            expires_at
+        `);
 
-    await db.execute(sql`
-      INSERT INTO user_sessions (
-        session_id, token_hash, user_id, email, ip_address, user_agent,
-        created_at, last_active_at, expires_at, revoked_at
-      ) VALUES (
-        ${updatedSession.sessionId},
-        ${updatedSession.tokenHash},
-        ${updatedSession.userId}::uuid,
-        ${updatedSession.email},
-        ${updatedSession.ipAddress ?? null},
-        ${updatedSession.userAgent ?? null},
-        ${createdAtIso}::timestamptz,
-        ${lastActiveAtIso}::timestamptz,
-        ${expiresAtIso}::timestamptz,
-        NULL
-      )
-    `);
+        const rows = (res as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+        const inserted = rows[0];
 
-    this.indexSessionInMemory(updatedSession);
-    return { newRawToken, session: updatedSession };
+        if (!inserted) {
+          // Ensure any expired/idle session with this token hash is marked revoked
+          await db.execute(sql`
+            UPDATE user_sessions
+            SET revoked_at = ${nowIso}::timestamptz
+            WHERE token_hash = ${oldTokenHash} AND revoked_at IS NULL
+          `);
+          await db.execute(sql`COMMIT`);
+          this.destroySession(oldRawToken);
+          return null;
+        }
+
+        await db.execute(sql`COMMIT`);
+
+        this.destroySession(oldRawToken);
+
+        const updatedSession: UserSession = {
+          sessionId: String(inserted["session_id"]),
+          tokenHash: String(inserted["token_hash"]),
+          userId: String(inserted["user_id"]),
+          email: String(inserted["email"]),
+          ipAddress: inserted["ip_address"] ? String(inserted["ip_address"]) : undefined,
+          userAgent: inserted["user_agent"] ? String(inserted["user_agent"]) : undefined,
+          createdAt: parseDbTimestampMs(inserted["created_at"]),
+          lastActiveAt: now,
+          expiresAt: newExpiresAt,
+        };
+
+        this.indexSessionInMemory(updatedSession);
+        return { newRawToken, session: updatedSession };
+      } catch (err) {
+        try {
+          await db.execute(sql`ROLLBACK`);
+        } catch {
+          // Ignore rollback error
+        }
+        throw err;
+      }
+    });
   }
 
   /**

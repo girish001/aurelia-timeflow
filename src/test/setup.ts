@@ -1,5 +1,9 @@
 import "@testing-library/jest-dom/vitest";
 
+if (typeof process !== "undefined" && process.env) {
+  process.env["APP_ENV"] = "test";
+}
+
 // jsdom has no ResizeObserver; recharts' ResponsiveContainer needs one on mount.
 class ResizeObserverStub {
   observe() {}

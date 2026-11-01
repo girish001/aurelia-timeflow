@@ -2,7 +2,11 @@ import crypto from "node:crypto";
 import { and, asc, count, desc, eq, ilike, inArray, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
-import { defaultEmailDeliveryProvider } from "../auth/email-provider";
+import {
+  EmailDeliveryError,
+  resolveEmailDeliveryProvider,
+  type EmailDeliveryProvider,
+} from "../auth/email-provider";
 import {
   assertCanAccessTeamMember,
   assertCanManageProject,
@@ -18,6 +22,7 @@ import {
   getAwsPostgresPool,
   withTenantDatabaseScope,
   type AureliaAwsDb,
+  type QueryableTransactionClient,
   type QueryableTransactionPool,
 } from "../db/aws-postgres";
 import * as schema from "../db/schema";
@@ -335,7 +340,9 @@ export async function listProjectsFromDb(
         .where(eq(schema.projectMemberships.tenantId, verifiedTenantId));
 
       const isBusinessAdmin =
-        ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:projects:manage");
+        ctx.roleKeys.has("business_admin") ||
+        ctx.permissions.has("project:read:all") ||
+        ctx.permissions.has("project:write:all");
 
       // Build WHERE conditions
       const conditions = [eq(schema.projects.tenantId, verifiedTenantId)];
@@ -467,6 +474,7 @@ export async function getProjectByIdFromDb(
         membershipId: pm.membershipId,
         projectRole: pm.projectRole,
         canManageAllocations: pm.canManageAllocations,
+        canApproveTimesheets: pm.canApproveTimesheets,
       }));
 
       if (!canViewProject(ctx, convertedProject, convertedPms)) {
@@ -536,6 +544,7 @@ export async function updateProjectBudgetInDb(
         membershipId: pm.membershipId,
         projectRole: pm.projectRole,
         canManageAllocations: pm.canManageAllocations,
+        canApproveTimesheets: pm.canApproveTimesheets,
       }));
 
       assertCanManageProject(ctx, convertedProject, convertedPms);
@@ -781,6 +790,7 @@ export async function approveTimesheetInDb(
         membershipId: ts.membershipId,
         projectId,
         weekStartDate: ts.weekStart,
+        totalHours: 0,
         status: ts.status as TimesheetRecord["status"],
       };
 
@@ -802,6 +812,7 @@ export async function approveTimesheetInDb(
         membershipId: pm.membershipId,
         projectRole: pm.projectRole,
         canManageAllocations: pm.canManageAllocations,
+        canApproveTimesheets: pm.canApproveTimesheets,
       }));
 
       if (!canApproveTimesheetRecord(ctx, convertedTs, convertedProject, convertedPms)) {
@@ -956,6 +967,7 @@ export async function rejectTimesheetInDb(
         membershipId: ts.membershipId,
         projectId,
         weekStartDate: ts.weekStart,
+        totalHours: 0,
         status: "rejected",
       };
     },
@@ -1021,13 +1033,13 @@ export async function listTenantAuditLogsFromDb(
       const data: AuditLogRecord[] = rows.map((r) => ({
         id: r.id,
         tenantId: r.tenantId,
-        actorUserId: r.actorUserId,
+        actorUserId: r.actorUserId ?? "",
         actorMembershipId: r.actorMembershipId ?? "",
         impersonatedByPlatformUserId: r.impersonatedByPlatformUserId ?? undefined,
         category: r.category,
         action: r.action,
         targetType: r.targetType,
-        targetId: r.targetId,
+        targetId: r.targetId ?? "",
         createdAt: r.createdAt.toISOString(),
       }));
 
@@ -1079,16 +1091,49 @@ export async function recordAuditLogToDb(
   });
 }
 
+const clientTransactionLocks = new WeakMap<object, Promise<void>>();
+
+async function withClientTransactionLock<T>(
+  client: QueryableTransactionClient,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const prev = clientTransactionLocks.get(client) ?? Promise.resolve();
+  let releaseLock!: () => void;
+  const current = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  clientTransactionLocks.set(
+    client,
+    prev.then(
+      () => current,
+      () => current,
+    ),
+  );
+  await prev;
+  try {
+    return await operation();
+  } finally {
+    releaseLock();
+  }
+}
+
 /**
  * Self-service company registration in PostgreSQL.
  * Inserts tenant, administrator user, membership, business_admin role, and SHA-256 hashed
- * single-use email verification token inside a database transaction.
+ * single-use email verification token inside a database transaction, then dispatches the
+ * verification email via the configured EmailDeliveryProvider.
+ *
+ * Security Invariants:
+ * - Never reports `verificationEmailDispatched: true` unless the email provider confirms
+ *   acceptance with a non-empty `messageId`.
+ * - Fails safely when email delivery fails.
  */
 export async function registerCompanyInDb(
   poolOrDb: {
-    pool?: QueryableTransactionPool;
-    db?: AureliaAwsDb;
-    env?: Record<string, string | undefined>;
+    pool?: QueryableTransactionPool | undefined;
+    db?: AureliaAwsDb | undefined;
+    env?: Record<string, string | undefined> | undefined;
+    emailProvider?: EmailDeliveryProvider | undefined;
   },
   input: {
     companyName: string;
@@ -1104,6 +1149,8 @@ export async function registerCompanyInDb(
   adminUser: UserRecord;
   adminMembership: MembershipRecord;
   verificationToken: string;
+  verificationEmailDispatched: boolean;
+  emailMessageId: string;
 }> {
   const slug = input.slug
     .trim()
@@ -1123,184 +1170,203 @@ export async function registerCompanyInDb(
   const ttlMs = input.ttlMs ?? 24 * 60 * 60 * 1000;
   const expiresAt = now + ttlMs;
 
+  const emailProvider = resolveEmailDeliveryProvider(poolOrDb.env, poolOrDb.emailProvider);
   const pool = poolOrDb.pool ?? getAwsPostgresPool(poolOrDb.env);
   const client = await pool.connect();
+
   try {
-    await client.query("BEGIN");
+    return await withClientTransactionLock(client, async () => {
+      await client.query("BEGIN");
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS email_verification_tokens (
+            token_hash VARCHAR(64) PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            email VARCHAR(255) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            used_at TIMESTAMPTZ
+          );
+        `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS email_verification_tokens (
-        token_hash VARCHAR(64) PRIMARY KEY,
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        email VARCHAR(255) NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        expires_at TIMESTAMPTZ NOT NULL,
-        used_at TIMESTAMPTZ
-      );
-    `);
-
-    // 1. Insert Tenant in 'onboarding' status (activated ONLY after email verification)
-    const tenantRes = await client.query(
-      `INSERT INTO tenants (slug, name, status, onboarding_mode) 
-       VALUES ($1, $2, 'onboarding', 'self_service') 
-       RETURNING id, slug, name, status, onboarding_mode;`,
-      [slug, input.companyName.trim()],
-    );
-    const tenantRow = tenantRes.rows[0] as {
-      id: string;
-      slug: string;
-      name: string;
-      status: TenantRecord["status"];
-      onboarding_mode: TenantRecord["onboardingMode"];
-    };
-
-    // Scope transaction-local RLS context to the newly created tenant
-    await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantRow.id]);
-
-    // 2. Insert or find User
-    const existingUserRes = await client.query(
-      `SELECT id, email, full_name, email_verified_at, is_platform_admin, status FROM users WHERE email = $1;`,
-      [email],
-    );
-    let userRow = existingUserRes.rows[0] as
-      | {
+        // 1. Insert Tenant in 'onboarding' status (activated ONLY after email verification)
+        const tenantRes = await client.query(
+          `INSERT INTO tenants (slug, name, status, onboarding_mode) 
+           VALUES ($1, $2, 'onboarding', 'self_service') 
+           RETURNING id, slug, name, status, onboarding_mode;`,
+          [slug, input.companyName.trim()],
+        );
+        const tenantRow = tenantRes.rows[0] as {
           id: string;
-          email: string;
-          full_name: string;
-          email_verified_at: string | Date | null;
-          is_platform_admin: boolean;
-          status: UserRecord["status"];
+          slug: string;
+          name: string;
+          status: TenantRecord["status"];
+          onboarding_mode: TenantRecord["onboardingMode"];
+        };
+
+        // Scope transaction-local RLS context to the newly created tenant
+        await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantRow.id]);
+
+        // 2. Insert or find User
+        const existingUserRes = await client.query(
+          `SELECT id, email, full_name, email_verified_at, is_platform_admin, status FROM users WHERE email = $1;`,
+          [email],
+        );
+        let userRow = existingUserRes.rows[0] as
+          | {
+              id: string;
+              email: string;
+              full_name: string;
+              email_verified_at: string | Date | null;
+              is_platform_admin: boolean;
+              status: UserRecord["status"];
+            }
+          | undefined;
+        if (!userRow) {
+          const newUserRes = await client.query(
+            `INSERT INTO users (email, full_name, is_platform_admin, status) 
+             VALUES ($1, $2, false, 'active') 
+             RETURNING id, email, full_name, email_verified_at, is_platform_admin, status;`,
+            [email, input.adminFullName.trim()],
+          );
+          userRow = newUserRes.rows[0] as {
+            id: string;
+            email: string;
+            full_name: string;
+            email_verified_at: string | Date | null;
+            is_platform_admin: boolean;
+            status: UserRecord["status"];
+          };
         }
-      | undefined;
-    if (!userRow) {
-      const newUserRes = await client.query(
-        `INSERT INTO users (email, full_name, is_platform_admin, status) 
-         VALUES ($1, $2, false, 'active') 
-         RETURNING id, email, full_name, email_verified_at, is_platform_admin, status;`,
-        [email, input.adminFullName.trim()],
-      );
-      userRow = newUserRes.rows[0] as {
-        id: string;
-        email: string;
-        full_name: string;
-        email_verified_at: string | Date | null;
-        is_platform_admin: boolean;
-        status: UserRecord["status"];
-      };
-    }
 
-    // 3. Insert Membership
-    const memberRes = await client.query(
-      `INSERT INTO memberships (tenant_id, user_id, job_title, status) 
-       VALUES ($1, $2, $3, 'active') 
-       RETURNING id, tenant_id, user_id, job_title, status;`,
-      [tenantRow.id, userRow.id, input.adminJobTitle?.trim() || "Business Administrator"],
-    );
-    const memberRow = memberRes.rows[0] as {
-      id: string;
-      tenant_id: string;
-      user_id: string;
-      job_title: string;
-      status: MembershipRecord["status"];
-    };
+        // 3. Insert Membership
+        const memberRes = await client.query(
+          `INSERT INTO memberships (tenant_id, user_id, job_title, status) 
+           VALUES ($1, $2, $3, 'active') 
+           RETURNING id, tenant_id, user_id, job_title, status;`,
+          [tenantRow.id, userRow.id, input.adminJobTitle?.trim() || "Business Administrator"],
+        );
+        const memberRow = memberRes.rows[0] as {
+          id: string;
+          tenant_id: string;
+          user_id: string;
+          job_title: string;
+          status: MembershipRecord["status"];
+        };
 
-    // 4. Ensure System Role business_admin exists & link membership
-    const roleRes = await client.query(
-      `SELECT id FROM roles WHERE key = 'business_admin' AND is_system_role = true LIMIT 1;`,
-    );
-    let roleId = (roleRes.rows[0] as { id?: string } | undefined)?.id;
-    if (!roleId) {
-      const newRoleRes = await client.query(
-        `INSERT INTO roles (key, name, description, is_system_role) 
-         VALUES ('business_admin', 'Business Admin', 'Full workspace admin', true) 
-         RETURNING id;`,
-      );
-      roleId = (newRoleRes.rows[0] as { id: string }).id;
-    }
+        // 4. Ensure System Role business_admin exists & link membership
+        const roleRes = await client.query(
+          `SELECT id FROM roles WHERE key = 'business_admin' AND is_system_role = true LIMIT 1;`,
+        );
+        let roleId = (roleRes.rows[0] as { id?: string } | undefined)?.id;
+        if (!roleId) {
+          const newRoleRes = await client.query(
+            `INSERT INTO roles (key, name, description, is_system_role) 
+             VALUES ('business_admin', 'Business Admin', 'Full workspace admin', true) 
+             RETURNING id;`,
+          );
+          roleId = (newRoleRes.rows[0] as { id: string }).id;
+        }
 
-    await client.query(
-      `INSERT INTO membership_roles (tenant_id, membership_id, role_id) 
-       VALUES ($1, $2, $3) 
-       ON CONFLICT DO NOTHING;`,
-      [tenantRow.id, memberRow.id, roleId],
-    );
+        await client.query(
+          `INSERT INTO membership_roles (tenant_id, membership_id, role_id) 
+           VALUES ($1, $2, $3) 
+           ON CONFLICT DO NOTHING;`,
+          [tenantRow.id, memberRow.id, roleId],
+        );
 
-    // 5. Generate cryptographically random 256-bit verification token; store ONLY SHA-256 hash
-    const verificationToken = crypto.randomBytes(32).toString("hex");
-    const tokenHash = crypto.createHash("sha256").update(verificationToken).digest("hex");
-    const createdAtIso = new Date(now).toISOString();
-    const expiresAtIso = new Date(expiresAt).toISOString();
+        // 5. Generate cryptographically random 256-bit verification token; store ONLY SHA-256 hash
+        const verificationToken = crypto.randomBytes(32).toString("hex");
+        const tokenHash = crypto.createHash("sha256").update(verificationToken).digest("hex");
+        const createdAtIso = new Date(now).toISOString();
+        const expiresAtIso = new Date(expiresAt).toISOString();
 
-    await client.query(
-      `INSERT INTO email_verification_tokens (
-         token_hash, tenant_id, user_id, email, created_at, expires_at, used_at
-       ) VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, NULL);`,
-      [tokenHash, tenantRow.id, userRow.id, email, createdAtIso, expiresAtIso],
-    );
+        await client.query(
+          `INSERT INTO email_verification_tokens (
+             token_hash, tenant_id, user_id, email, created_at, expires_at, used_at
+           ) VALUES ($1, $2, $3, $4, $5::timestamptz, $6::timestamptz, NULL);`,
+          [tokenHash, tenantRow.id, userRow.id, email, createdAtIso, expiresAtIso],
+        );
 
-    await client.query("SELECT set_config('app.current_tenant_id', '', true)");
-    await client.query("COMMIT");
+        // 6. Dispatch verification email and confirm provider delivery acceptance BEFORE committing
+        const delivery = await emailProvider.sendEmailVerificationEmail({
+          to: email,
+          companyName: tenantRow.name,
+          tenantId: tenantRow.id,
+          verificationToken,
+          expiresAt,
+        });
 
-    await defaultEmailDeliveryProvider.sendEmailVerificationEmail({
-      to: email,
-      companyName: tenantRow.name,
-      tenantId: tenantRow.id,
-      verificationToken,
-      expiresAt,
+        if (!delivery || !delivery.accepted || !delivery.messageId?.trim()) {
+          throw new EmailDeliveryError(
+            "Email provider did not confirm verification email acceptance.",
+            502,
+          );
+        }
+
+        await client.query("SELECT set_config('app.current_tenant_id', '', true)");
+        await client.query("COMMIT");
+
+        return {
+          tenant: {
+            id: tenantRow.id,
+            slug: tenantRow.slug,
+            name: tenantRow.name,
+            status: tenantRow.status,
+            onboardingMode: tenantRow.onboarding_mode,
+          },
+          adminUser: {
+            id: userRow.id,
+            email: userRow.email,
+            fullName: userRow.full_name,
+            emailVerifiedAt: userRow.email_verified_at
+              ? new Date(userRow.email_verified_at).toISOString()
+              : null,
+            isPlatformAdmin: userRow.is_platform_admin,
+            status: userRow.status,
+          },
+          adminMembership: {
+            id: memberRow.id,
+            tenantId: memberRow.tenant_id,
+            userId: memberRow.user_id,
+            jobTitle: memberRow.job_title,
+            status: memberRow.status,
+          },
+          verificationToken,
+          verificationEmailDispatched: true,
+          emailMessageId: delivery.messageId,
+        };
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          // Ignore rollback error
+        }
+        throw err;
+      }
     });
-
-    return {
-      tenant: {
-        id: tenantRow.id,
-        slug: tenantRow.slug,
-        name: tenantRow.name,
-        status: tenantRow.status,
-        onboardingMode: tenantRow.onboarding_mode,
-      },
-      adminUser: {
-        id: userRow.id,
-        email: userRow.email,
-        fullName: userRow.full_name,
-        emailVerifiedAt: userRow.email_verified_at
-          ? new Date(userRow.email_verified_at).toISOString()
-          : null,
-        isPlatformAdmin: userRow.is_platform_admin,
-        status: userRow.status,
-      },
-      adminMembership: {
-        id: memberRow.id,
-        tenantId: memberRow.tenant_id,
-        userId: memberRow.user_id,
-        jobTitle: memberRow.job_title,
-        status: memberRow.status,
-      },
-      verificationToken,
-    };
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // Ignore rollback error
-    }
-    throw err;
   } finally {
     client.release();
   }
 }
 
 /**
- * Verifies email verification token hash (enforcing expiration and single-use consumption)
- * and activates the tenant in PostgreSQL.
+ * Verifies email verification token hash (enforcing atomic single-use consumption,
+ * expiration, and strict tenant/user/membership binding) and activates the tenant in PostgreSQL.
  */
 export async function verifyCompanyAdminEmailInDb(
   poolOrDb: {
-    pool?: QueryableTransactionPool;
-    db?: AureliaAwsDb;
-    env?: Record<string, string | undefined>;
+    pool?: QueryableTransactionPool | undefined;
+    db?: AureliaAwsDb | undefined;
+    env?: Record<string, string | undefined> | undefined;
   },
   verificationToken: string,
-  options?: { now?: number },
+  options?: {
+    now?: number | undefined;
+    expectedTenantId?: string | undefined;
+    expectedEmail?: string | undefined;
+  },
 ): Promise<{ tenant: TenantRecord; user: UserRecord; membership: MembershipRecord }> {
   if (
     !verificationToken ||
@@ -1316,160 +1382,167 @@ export async function verifyCompanyAdminEmailInDb(
 
   const pool = poolOrDb.pool ?? getAwsPostgresPool(poolOrDb.env);
   const client = await pool.connect();
+
   try {
-    await client.query("BEGIN");
+    return await withClientTransactionLock(client, async () => {
+      await client.query("BEGIN");
+      try {
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS email_verification_tokens (
+            token_hash VARCHAR(64) PRIMARY KEY,
+            tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+            user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            email VARCHAR(255) NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            expires_at TIMESTAMPTZ NOT NULL,
+            used_at TIMESTAMPTZ
+          );
+        `);
 
-    await client.query(`
-      CREATE TABLE IF NOT EXISTS email_verification_tokens (
-        token_hash VARCHAR(64) PRIMARY KEY,
-        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
-        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        email VARCHAR(255) NOT NULL,
-        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        expires_at TIMESTAMPTZ NOT NULL,
-        used_at TIMESTAMPTZ
-      );
-    `);
+        // 1. Atomically consume single-use token ONLY if unused and unexpired
+        const consumeRes = await client.query(
+          `UPDATE email_verification_tokens
+           SET used_at = $2::timestamptz
+           WHERE token_hash = $1
+             AND used_at IS NULL
+             AND expires_at > $2::timestamptz
+           RETURNING token_hash, tenant_id, user_id, email, expires_at;`,
+          [tokenHash, nowIso],
+        );
 
-    const tokenRes = await client.query(
-      `SELECT token_hash, tenant_id, user_id, expires_at, used_at
-       FROM email_verification_tokens
-       WHERE token_hash = $1
-       LIMIT 1;`,
-      [tokenHash],
-    );
+        const tokenRow = consumeRes.rows[0] as
+          | {
+              token_hash: string;
+              tenant_id: string;
+              user_id: string;
+              email: string;
+              expires_at: string | Date;
+            }
+          | undefined;
 
-    const tokenRow = tokenRes.rows[0] as
-      | {
-          token_hash: string;
-          tenant_id: string;
-          user_id: string;
-          expires_at: string | Date;
-          used_at: string | Date | null;
+        if (!tokenRow) {
+          throw new Error("Invalid, expired, or already used email verification token.");
         }
-      | undefined;
 
-    if (!tokenRow) {
-      throw new Error("Invalid, expired, or already used email verification token.");
-    }
+        const tenantId = tokenRow.tenant_id;
+        const userId = tokenRow.user_id;
+        const tokenEmail = tokenRow.email.trim().toLowerCase();
 
-    if (tokenRow.used_at !== null && tokenRow.used_at !== undefined) {
-      throw new Error("Invalid, expired, or already used email verification token.");
-    }
+        // 2. Enforce caller-provided tenant/email binding if supplied
+        if (options?.expectedTenantId && options.expectedTenantId !== tenantId) {
+          throw new TenantIsolationError(
+            `Verification token does not belong to requested tenant "${options.expectedTenantId}".`,
+          );
+        }
+        if (options?.expectedEmail && options.expectedEmail.trim().toLowerCase() !== tokenEmail) {
+          throw new AuthorizationError(
+            "Verification token does not belong to the specified email address.",
+          );
+        }
 
-    const expiresAtMs = new Date(tokenRow.expires_at).getTime();
-    if (expiresAtMs <= now) {
-      throw new Error("Invalid, expired, or already used email verification token.");
-    }
+        await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
 
-    // Consume single-use token atomically
-    const consumeRes = await client.query(
-      `UPDATE email_verification_tokens
-       SET used_at = $2::timestamptz
-       WHERE token_hash = $1 AND used_at IS NULL
-       RETURNING tenant_id, user_id;`,
-      [tokenHash, nowIso],
-    );
-    if (consumeRes.rowCount === 0) {
-      throw new Error("Invalid, expired, or already used email verification token.");
-    }
+        // 3. Verify an explicit active membership binds userId to tenantId
+        const memberRes = await client.query(
+          `SELECT id, tenant_id, user_id, job_title, status FROM memberships 
+           WHERE tenant_id = $1 AND user_id = $2 AND status = 'active' LIMIT 1;`,
+          [tenantId, userId],
+        );
+        const memberRow = memberRes.rows[0] as
+          | {
+              id: string;
+              tenant_id: string;
+              user_id: string;
+              job_title: string;
+              status: MembershipRecord["status"];
+            }
+          | undefined;
 
-    const tenantId = tokenRow.tenant_id;
-    const userId = tokenRow.user_id;
+        if (!memberRow) {
+          throw new TenantIsolationError(
+            "Email verification rejected: token user has no active membership in target tenant.",
+          );
+        }
 
-    await client.query("SELECT set_config('app.current_tenant_id', $1, true)", [tenantId]);
-
-    const tenantRes = await client.query(
-      `UPDATE tenants SET status = 'active', updated_at = $2::timestamptz 
-       WHERE id = $1 
-       RETURNING id, slug, name, status, onboarding_mode;`,
-      [tenantId, nowIso],
-    );
-    if (tenantRes.rowCount === 0) {
-      throw new Error(`Tenant workspace ${tenantId} not found.`);
-    }
-    const tenantRow = tenantRes.rows[0] as {
-      id: string;
-      slug: string;
-      name: string;
-      status: TenantRecord["status"];
-      onboarding_mode: TenantRecord["onboardingMode"];
-    };
-
-    const userRes = await client.query(
-      `UPDATE users SET email_verified_at = $2::timestamptz, updated_at = $2::timestamptz 
-       WHERE id = $1 
-       RETURNING id, email, full_name, email_verified_at, is_platform_admin, status;`,
-      [userId, nowIso],
-    );
-    const userRow = userRes.rows[0] as {
-      id: string;
-      email: string;
-      full_name: string;
-      email_verified_at: string | Date | null;
-      is_platform_admin: boolean;
-      status: UserRecord["status"];
-    };
-
-    const memberRes = await client.query(
-      `SELECT id, tenant_id, user_id, job_title, status FROM memberships 
-       WHERE tenant_id = $1 AND user_id = $2 LIMIT 1;`,
-      [tenantId, userId],
-    );
-    const memberRow = memberRes.rows[0] as
-      | {
+        // 4. Activate ONLY a tenant currently in 'onboarding' status matching tenantId
+        const tenantRes = await client.query(
+          `UPDATE tenants SET status = 'active', updated_at = $2::timestamptz 
+           WHERE id = $1 AND status = 'onboarding'
+           RETURNING id, slug, name, status, onboarding_mode;`,
+          [tenantId, nowIso],
+        );
+        if (tenantRes.rowCount === 0 || !tenantRes.rows[0]) {
+          throw new Error(
+            `Tenant workspace ${tenantId} is not in onboarding state or was already activated.`,
+          );
+        }
+        const tenantRow = tenantRes.rows[0] as {
           id: string;
-          tenant_id: string;
-          user_id: string;
-          job_title: string;
-          status: MembershipRecord["status"];
+          slug: string;
+          name: string;
+          status: TenantRecord["status"];
+          onboarding_mode: TenantRecord["onboardingMode"];
+        };
+
+        // 5. Verify and update ONLY the user matching both userId and tokenEmail
+        const userRes = await client.query(
+          `UPDATE users SET email_verified_at = $2::timestamptz, updated_at = $2::timestamptz 
+           WHERE id = $1 AND LOWER(email) = LOWER($3)
+           RETURNING id, email, full_name, email_verified_at, is_platform_admin, status;`,
+          [userId, nowIso, tokenEmail],
+        );
+        if (userRes.rowCount === 0 || !userRes.rows[0]) {
+          throw new AuthorizationError(
+            "Email verification rejected: target user email does not match verification token.",
+          );
         }
-      | undefined;
+        const userRow = userRes.rows[0] as {
+          id: string;
+          email: string;
+          full_name: string;
+          email_verified_at: string | Date | null;
+          is_platform_admin: boolean;
+          status: UserRecord["status"];
+        };
 
-    await client.query("SELECT set_config('app.current_tenant_id', '', true)");
-    await client.query("COMMIT");
+        await client.query("SELECT set_config('app.current_tenant_id', '', true)");
+        await client.query("COMMIT");
 
-    return {
-      tenant: {
-        id: tenantRow.id,
-        slug: tenantRow.slug,
-        name: tenantRow.name,
-        status: tenantRow.status,
-        onboardingMode: tenantRow.onboarding_mode,
-      },
-      user: {
-        id: userRow.id,
-        email: userRow.email,
-        fullName: userRow.full_name,
-        emailVerifiedAt: userRow.email_verified_at
-          ? new Date(userRow.email_verified_at).toISOString()
-          : null,
-        isPlatformAdmin: userRow.is_platform_admin,
-        status: userRow.status,
-      },
-      membership: memberRow
-        ? {
+        return {
+          tenant: {
+            id: tenantRow.id,
+            slug: tenantRow.slug,
+            name: tenantRow.name,
+            status: tenantRow.status,
+            onboardingMode: tenantRow.onboarding_mode,
+          },
+          user: {
+            id: userRow.id,
+            email: userRow.email,
+            fullName: userRow.full_name,
+            emailVerifiedAt: userRow.email_verified_at
+              ? new Date(userRow.email_verified_at).toISOString()
+              : null,
+            isPlatformAdmin: userRow.is_platform_admin,
+            status: userRow.status,
+          },
+          membership: {
             id: memberRow.id,
             tenantId: memberRow.tenant_id,
             userId: memberRow.user_id,
             jobTitle: memberRow.job_title,
             status: memberRow.status,
-          }
-        : {
-            id: `m_${tenantId}_${userId}`,
-            tenantId,
-            userId,
-            jobTitle: "Business Administrator",
-            status: "active",
           },
-    };
-  } catch (err) {
-    try {
-      await client.query("ROLLBACK");
-    } catch {
-      // Ignore rollback error
-    }
-    throw err;
+        };
+      } catch (err) {
+        try {
+          await client.query("ROLLBACK");
+        } catch {
+          // Ignore rollback error
+        }
+        throw err;
+      }
+    });
   } finally {
     client.release();
   }

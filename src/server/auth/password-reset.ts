@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import { sql } from "drizzle-orm";
 import type { AureliaAwsDb } from "../db/aws-postgres";
 import { hashPassword, validatePasswordStrength } from "./password";
-import { defaultSessionManager, SessionManager } from "./session-manager";
+import {
+  defaultSessionManager,
+  ensureSessionTableInDb,
+  SessionManager,
+  withDbTransactionLock,
+} from "./session-manager";
 
 export const DEFAULT_RESET_TOKEN_TTL_MS = 60 * 60 * 1000; // 1 hour
 
@@ -123,82 +128,129 @@ export class PasswordResetService {
 
   /**
    * Completes a password reset.
-   * Consumes token (single-use), hashes new password, and revokes all active sessions for that user.
+   *
+   * Security Invariants:
+   * - Enforces single-use and expiration atomically under concurrent requests.
+   * - In PostgreSQL mode, executes token consumption, user password hash update,
+   *   and active session revocation inside a single database transaction.
+   * - In in-memory mode, claims the single-use token synchronously before async scrypt hashing
+   *   so concurrent in-memory callers cannot consume the same token twice.
    */
   public async executePasswordReset(
     rawToken: string,
     newPassword: string,
-    options?: { db?: AureliaAwsDb; now?: number },
-  ): Promise<{ userId: string; newPasswordHash: string }> {
+    options?: { db?: AureliaAwsDb | undefined; now?: number | undefined },
+  ): Promise<{ userId: string; newPasswordHash: string; updatedInDb: boolean }> {
     const now = options?.now ?? Date.now();
     const validation = validatePasswordStrength(newPassword);
     if (!validation.valid) {
       throw new Error(validation.reason ?? "Password does not meet complexity requirements.");
     }
 
-    const tokenHash = this.hashToken(rawToken || "");
-
-    if (options?.db) {
-      await ensurePasswordResetTableInDb(options.db);
-      const res = await options.db.execute(sql`
-        SELECT token_hash, user_id, email, created_at, expires_at, used_at
-        FROM password_reset_tokens
-        WHERE token_hash = ${tokenHash}
-        LIMIT 1
-      `);
-      const rows = (res as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
-      const row = rows[0];
-      if (!row) {
-        throw new Error("Invalid or expired password reset token.");
-      }
-      if (row["used_at"] !== null && row["used_at"] !== undefined) {
-        throw new Error("Invalid or expired password reset token.");
-      }
-      const expiresAt = new Date(String(row["expires_at"])).getTime();
-      if (expiresAt <= now) {
-        throw new Error("Invalid or expired password reset token.");
-      }
-
-      const nowIso = new Date(now).toISOString();
-      await options.db.execute(sql`
-        UPDATE password_reset_tokens
-        SET used_at = ${nowIso}::timestamptz
-        WHERE token_hash = ${tokenHash} AND used_at IS NULL
-      `);
-
-      const userId = String(row["user_id"]);
-      const newPasswordHash = await hashPassword(newPassword);
-
-      // Update in-memory record if present
-      const memRecord = this.resetTokens.get(tokenHash);
-      if (memRecord) {
-        memRecord.usedAt = now;
-      }
-
-      // Security invariant: Invalidate all existing sessions on password change
-      await this.sessionManager.destroyAllUserSessionsInDb(userId, { db: options.db, now });
-
-      return { userId, newPasswordHash };
-    }
-
-    const record = this.validateToken(rawToken, now);
-    if (!record) {
+    if (!rawToken || typeof rawToken !== "string") {
       throw new Error("Invalid or expired password reset token.");
     }
 
-    const newPasswordHash = await hashPassword(newPassword);
+    const tokenHash = this.hashToken(rawToken.trim());
 
-    // Mark token as used
+    if (options?.db) {
+      const db = options.db;
+      await ensurePasswordResetTableInDb(db);
+      await ensureSessionTableInDb(db);
+
+      const newPasswordHash = await hashPassword(newPassword);
+      const nowIso = new Date(now).toISOString();
+
+      return withDbTransactionLock(db, async () => {
+        await db.execute(sql`BEGIN`);
+        try {
+          // 1. Atomically consume single-use token ONLY if unused and unexpired
+          const consumeRes = await db.execute(sql`
+            UPDATE password_reset_tokens
+            SET used_at = ${nowIso}::timestamptz
+            WHERE token_hash = ${tokenHash}
+              AND used_at IS NULL
+              AND expires_at > ${nowIso}::timestamptz
+            RETURNING user_id, email
+          `);
+          const rows =
+            (consumeRes as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+          const consumedRow = rows[0];
+          if (!consumedRow) {
+            await db.execute(sql`ROLLBACK`);
+            throw new Error("Invalid or expired password reset token.");
+          }
+
+          const userId = String(consumedRow["user_id"]);
+          const tokenEmail = String(consumedRow["email"]);
+
+          // 2. Update user's password hash inside the same transaction
+          const updateUserRes = await db.execute(sql`
+            UPDATE users
+            SET password_hash = ${newPasswordHash},
+                updated_at = ${nowIso}::timestamptz
+            WHERE id = ${userId}::uuid
+              AND LOWER(email) = LOWER(${tokenEmail})
+            RETURNING id
+          `);
+          const updatedUsers =
+            (updateUserRes as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+          if (updatedUsers.length === 0) {
+            await db.execute(sql`ROLLBACK`);
+            throw new Error("Password reset failed: target user account does not match token.");
+          }
+
+          // 3. Revoke all active sessions for the user inside the same transaction
+          await db.execute(sql`
+            UPDATE user_sessions
+            SET revoked_at = ${nowIso}::timestamptz
+            WHERE user_id = ${userId}::uuid AND revoked_at IS NULL
+          `);
+
+          await db.execute(sql`COMMIT`);
+
+          // Synchronize in-memory cache
+          const memRecord = this.resetTokens.get(tokenHash);
+          if (memRecord) {
+            memRecord.usedAt = now;
+          }
+          this.sessionManager.destroyAllUserSessions(userId);
+
+          return { userId, newPasswordHash, updatedInDb: true };
+        } catch (err) {
+          try {
+            await db.execute(sql`ROLLBACK`);
+          } catch {
+            // Ignore rollback error
+          }
+          throw err;
+        }
+      });
+    }
+
+    // In-memory mode: claim single-use token synchronously BEFORE async scrypt hashing
+    // so concurrent Promise.all requests cannot both pass validateToken()
+    const record = this.validateToken(rawToken.trim(), now);
+    if (!record) {
+      throw new Error("Invalid or expired password reset token.");
+    }
     record.usedAt = now;
     this.resetTokens.set(record.tokenHash, record);
 
-    // Security invariant: Invalidate all existing sessions on password change
-    this.sessionManager.destroyAllUserSessions(record.userId);
-
-    return {
-      userId: record.userId,
-      newPasswordHash,
-    };
+    try {
+      const newPasswordHash = await hashPassword(newPassword);
+      // Security invariant: Invalidate all existing sessions on password change
+      this.sessionManager.destroyAllUserSessions(record.userId);
+      return {
+        userId: record.userId,
+        newPasswordHash,
+        updatedInDb: false,
+      };
+    } catch (err) {
+      record.usedAt = undefined;
+      this.resetTokens.set(record.tokenHash, record);
+      throw err;
+    }
   }
 
   /**

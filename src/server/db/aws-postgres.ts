@@ -45,13 +45,13 @@ export interface AwsPostgresConfig {
 }
 
 export interface AwsSecretsManagerRdsPayload {
-  host?: string;
-  port?: number | string;
-  dbname?: string;
-  database?: string;
-  username?: string;
-  user?: string;
-  password?: string;
+  host?: string | undefined;
+  port?: number | string | undefined;
+  dbname?: string | undefined;
+  database?: string | undefined;
+  username?: string | undefined;
+  user?: string | undefined;
+  password?: string | undefined;
 }
 
 export interface AwsDatabaseHealthReport {
@@ -586,11 +586,11 @@ export async function withTenantDatabaseScope<T>(
   ctx: ResolvedTenantContext,
   callback: (verifiedTenantId: string, txContext: TenantTransactionContext) => Promise<T>,
   options?: {
-    claimedFrontendTenantId?: string;
-    pool?: QueryableTransactionPool;
-    env?: Record<string, string | undefined>;
-    enforceLeastPrivilegeRole?: boolean;
-    executeRlsInit?: (tenantId: string) => Promise<void>;
+    claimedFrontendTenantId?: string | undefined;
+    pool?: QueryableTransactionPool | undefined;
+    env?: Record<string, string | undefined> | undefined;
+    enforceLeastPrivilegeRole?: boolean | undefined;
+    executeRlsInit?: ((tenantId: string) => Promise<void>) | undefined;
   },
 ): Promise<T> {
   // Step 1: Validate authenticated tenant & membership before touching the database pool
@@ -697,8 +697,8 @@ export function classifyAwsRdsConnectivityError(errorMessage: string): string | 
  * Performs a credential-redacted health check for the AWS RDS PostgreSQL connection.
  */
 export async function checkAwsDatabaseHealth(options?: {
-  env?: Record<string, string | undefined>;
-  pingExecutor?: (config: AwsPostgresConfig) => Promise<void>;
+  env?: Record<string, string | undefined> | undefined;
+  pingExecutor?: ((config: AwsPostgresConfig) => Promise<void>) | undefined;
 }): Promise<AwsDatabaseHealthReport> {
   const env = options?.env ?? (typeof process !== "undefined" ? process.env : {});
   const environment = getAppEnvironment(env);

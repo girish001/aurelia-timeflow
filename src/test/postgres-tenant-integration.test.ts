@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { PGlite } from "@electric-sql/pglite";
-import { drizzle } from "drizzle-orm/node-postgres";
+import { drizzle, type NodePgClient } from "drizzle-orm/node-postgres";
 import type { QueryResult } from "pg";
 import { describe, expect, it } from "vitest";
 
@@ -132,7 +132,7 @@ describe(
         connect: async () => pgliteClient,
       };
 
-      const db = drizzle(pgliteClient as unknown as Parameters<typeof drizzle>[0], {
+      const db = drizzle(pgliteClient as unknown as NodePgClient, {
         schema,
       }) as unknown as AureliaAwsDb;
 

@@ -5,6 +5,7 @@ import {
   getAwsPostgresDb,
   getAwsPostgresPool,
   isAwsPostgresConfigured,
+  redactPostgresCredentials,
   type AureliaAwsDb,
   type QueryableTransactionPool,
 } from "../db/aws-postgres";
@@ -12,28 +13,36 @@ import * as schema from "../db/schema";
 import {
   importTeamCsvIntoTenant,
   provisionEnterpriseTenant,
-  registerSelfServiceCompany,
+  registerSelfServiceCompanyAsync,
   startSupportImpersonationSession,
   verifyCompanyAdminEmail,
 } from "../onboarding/onboarding-service";
 import {
   approveTimesheetInDb,
-  getProjectByIdFromDb,
-  getTeamMemberProfileFromDb,
   listAccessibleTeamMembersFromDb,
   listProjectsFromDb,
   listTenantAuditLogsFromDb,
   listUserTenantsFromDb,
-  recordAuditLogToDb,
   registerCompanyInDb,
-  resolveTenantContextFromDb,
   updateProjectBudgetInDb,
   verifyCompanyAdminEmailInDb,
 } from "../repositories/postgres-tenant-store";
 import { MultiTenantDataStore } from "../repositories/tenant-scoped-store";
-import { defaultAuthService } from "../auth/auth-service";
+import {
+  DatabaseUnavailableError,
+  defaultAuthService,
+  extractSafeDatabaseErrorMessage,
+  isProductionEnvironment,
+} from "../auth/auth-service";
+import {
+  EmailDeliveryError,
+  getDevelopmentEmailOutbox,
+  isProductionEmailEnvironment,
+  redactSensitiveEmailTokens,
+  type EmailDeliveryProvider,
+} from "../auth/email-provider";
 import { defaultSessionManager, type UserSession } from "../auth/session-manager";
-import { defaultSsoService } from "../auth/sso-service";
+import { defaultSsoService, type OidcProviderConfig } from "../auth/sso-service";
 import {
   AuthorizationError,
   TenantIsolationError,
@@ -48,6 +57,8 @@ import {
  * 2. Active tenant membership resolved from PostgreSQL (`resolveTenantContextFromDb`)
  * 3. Rejection of untrusted body `tenantId` mismatches (`assertValidTenantExecutionContext`)
  * 4. Endpoint permission / scope guard (`requiredPermission` + resource-level ABAC)
+ * 5. Fail-closed production authentication: in production (`APP_ENV=production` or `NODE_ENV=production`),
+ *    requests NEVER fall back to in-memory sessions, user records, or tenant memberships.
  */
 export interface ApiRouteContract {
   method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
@@ -238,6 +249,13 @@ export const API_ROUTE_CONTRACTS: ApiRouteContract[] = [
     description:
       "Returns credential-redacted PostgreSQL connectivity, SSL enforcement, and latency health status.",
   },
+  {
+    method: "GET",
+    path: "/api/v1/dev/email-outbox",
+    scope: "public",
+    description:
+      "Isolated development/test email outbox endpoint for inspecting password-reset and email-verification tokens when AWS SES is disabled. Strictly disabled (403) in production.",
+  },
 ];
 
 export interface MatchedApiRoute {
@@ -327,21 +345,38 @@ export interface AuthenticatedIdentity {
  * Security Invariants:
  * - NEVER trusts `x-aurelia-user-id` headers.
  * - NEVER trusts `Authorization: Bearer user:<id>` tokens.
- * - Requires a valid, non-expired, non-revoked session token verified against PostgreSQL
- *   (when `db` is provided) or `defaultSessionManager`.
+ * - In production mode (`APP_ENV=production` or `NODE_ENV=production`), requires
+ *   PostgreSQL (`options.db`) and NEVER falls back to in-memory session validation.
+ * - If PostgreSQL is unreachable or throws a connection error during session validation,
+ *   throws `DatabaseUnavailableError` (HTTP 503).
  */
 export async function extractAuthenticatedIdentity(
   request: Request,
-  options?: { db?: AureliaAwsDb },
+  options?: { db?: AureliaAwsDb | undefined; env?: Record<string, string | undefined> | undefined },
 ): Promise<AuthenticatedIdentity | null> {
+  const isProd = isProductionEnvironment(options?.env);
+  if (isProd && !options?.db) {
+    throw new DatabaseUnavailableError();
+  }
+
   const token = defaultSessionManager.extractTokenFromRequest(request);
   if (!token) {
     return null;
   }
 
-  const session = options?.db
-    ? await defaultSessionManager.validateSessionInDb(token, { db: options.db })
-    : defaultSessionManager.validateSession(token);
+  let session: UserSession | null = null;
+  if (options?.db) {
+    try {
+      session = await defaultSessionManager.validateSessionInDb(token, { db: options.db });
+    } catch (err) {
+      const safeMsg = extractSafeDatabaseErrorMessage(err, "Database session validation error");
+      throw new DatabaseUnavailableError(`PostgreSQL session store is unavailable: ${safeMsg}`);
+    }
+  } else if (!isProd) {
+    session = defaultSessionManager.validateSession(token);
+  } else {
+    throw new DatabaseUnavailableError();
+  }
 
   if (!session) {
     return null;
@@ -357,24 +392,38 @@ export async function extractAuthenticatedIdentity(
 
 async function resolveVerifiedServerUser(
   userId: string,
-  options: { db?: AureliaAwsDb; store: MultiTenantDataStore },
+  options: {
+    db?: AureliaAwsDb | undefined;
+    store: MultiTenantDataStore;
+    env?: Record<string, string | undefined> | undefined;
+  },
 ): Promise<UserRecord | null> {
+  const isProd = isProductionEnvironment(options.env);
+  if (isProd && !options.db) {
+    throw new DatabaseUnavailableError();
+  }
+
   if (options.db) {
-    const rows = await options.db
-      .select()
-      .from(schema.users)
-      .where(eq(schema.users.id, userId))
-      .limit(1);
-    const row = rows[0];
-    if (!row) return null;
-    return {
-      id: row.id,
-      email: row.email,
-      fullName: row.fullName,
-      emailVerifiedAt: row.emailVerifiedAt ? row.emailVerifiedAt.toISOString() : null,
-      isPlatformAdmin: row.isPlatformAdmin,
-      status: row.status as UserRecord["status"],
-    };
+    try {
+      const rows = await options.db
+        .select()
+        .from(schema.users)
+        .where(eq(schema.users.id, userId))
+        .limit(1);
+      const row = rows[0];
+      if (!row) return null;
+      return {
+        id: row.id,
+        email: row.email,
+        fullName: row.fullName,
+        emailVerifiedAt: row.emailVerifiedAt ? row.emailVerifiedAt.toISOString() : null,
+        isPlatformAdmin: row.isPlatformAdmin,
+        status: row.status as UserRecord["status"],
+      };
+    } catch (err) {
+      const safeMsg = extractSafeDatabaseErrorMessage(err, "Database user lookup failed");
+      throw new DatabaseUnavailableError(`PostgreSQL user directory is unavailable: ${safeMsg}`);
+    }
   }
   return options.store.getUser(userId) ?? null;
 }
@@ -403,6 +452,9 @@ export async function handleApiRequest(
     env?: Record<string, string | undefined>;
     pool?: QueryableTransactionPool;
     db?: AureliaAwsDb;
+    emailProvider?: EmailDeliveryProvider;
+    oidcConfig?: OidcProviderConfig;
+    oidcFetchFn?: typeof fetch;
   },
 ): Promise<Response | null> {
   const url = new URL(request.url);
@@ -423,16 +475,21 @@ export async function handleApiRequest(
 
   const { contract, params } = matched;
   const env = options?.env;
+  const isProd = isProductionEnvironment(env);
+
   let targetPool = options?.pool;
   let targetDb = options?.db;
-  if (!targetPool && !options?.store && isAwsPostgresConfigured(env)) {
+  let dbInitError: Error | null = null;
+
+  if (!targetPool && !targetDb && (isProd || (!options?.store && isAwsPostgresConfigured(env)))) {
     try {
       targetPool = getAwsPostgresPool(env);
-      targetDb = options?.db ?? getAwsPostgresDb(env);
-    } catch {
-      // Caught VPC network boundary check or configuration validation; handled safely per route
+      targetDb = getAwsPostgresDb(env);
+    } catch (err) {
+      dbInitError = err instanceof Error ? err : new Error("Failed to initialize PostgreSQL pool");
     }
   }
+
   const useDatabase = Boolean(targetPool || targetDb);
   const store = options?.store ?? getDefaultApiStore();
 
@@ -442,15 +499,26 @@ export async function handleApiRequest(
       const health = await checkAwsDatabaseHealth({ env: options?.env });
       const status = health.status === "unhealthy" ? 503 : 200;
 
-      const callerIdentity = await extractAuthenticatedIdentity(request, { db: targetDb });
+      let callerIdentity: AuthenticatedIdentity | null = null;
+      try {
+        callerIdentity = await extractAuthenticatedIdentity(request, { db: targetDb, env });
+      } catch {
+        callerIdentity = null;
+      }
+
       let isAuthorizedPlatformAdmin = false;
       if (callerIdentity) {
-        const verifiedUser = await resolveVerifiedServerUser(callerIdentity.userId, {
-          db: targetDb,
-          store,
-        });
-        if (verifiedUser && verifiedUser.status === "active" && verifiedUser.isPlatformAdmin) {
-          isAuthorizedPlatformAdmin = true;
+        try {
+          const verifiedUser = await resolveVerifiedServerUser(callerIdentity.userId, {
+            db: targetDb,
+            store,
+            env,
+          });
+          if (verifiedUser && verifiedUser.status === "active" && verifiedUser.isPlatformAdmin) {
+            isAuthorizedPlatformAdmin = true;
+          }
+        } catch {
+          isAuthorizedPlatformAdmin = false;
         }
       }
 
@@ -469,12 +537,69 @@ export async function handleApiRequest(
       );
     }
 
+    // Isolated Development/Test Email Outbox Endpoint (Strictly disabled in production)
+    if (contract.path === "/api/v1/dev/email-outbox") {
+      if (isProd || isProductionEmailEnvironment(env)) {
+        return jsonResponse(
+          {
+            error: "DEVELOPMENT_ONLY_ENDPOINT",
+            message: "The development email outbox is strictly disabled in production.",
+          },
+          403,
+        );
+      }
+
+      const outbox = getDevelopmentEmailOutbox(env);
+      const filterRecipient = (
+        url.searchParams.get("recipient") ??
+        url.searchParams.get("email") ??
+        ""
+      )
+        .trim()
+        .toLowerCase();
+      const filterType = url.searchParams.get("type")?.trim();
+
+      const emails = outbox.getOutbox().filter((item) => {
+        if (filterRecipient && item.to !== filterRecipient) {
+          return false;
+        }
+        if (
+          filterType &&
+          (filterType === "password_reset" || filterType === "email_verification") &&
+          item.type !== filterType
+        ) {
+          return false;
+        }
+        return true;
+      });
+
+      return jsonResponse({
+        mode: outbox.mode,
+        count: emails.length,
+        emails,
+      });
+    }
+
+    // Fail-closed production safeguard: In production mode, ALL authentication, onboarding,
+    // and workspace endpoints require PostgreSQL and MUST NEVER fall back to in-memory state.
+    if (isProd && (!useDatabase || !targetDb)) {
+      const detail = dbInitError ? `: ${redactPostgresCredentials(dbInitError.message)}` : ".";
+      throw new DatabaseUnavailableError(
+        `Production mode requires an active private AWS RDS PostgreSQL connection${detail} In-memory fallback is disabled.`,
+      );
+    }
+
     // 2. Public Self-Service Onboarding & Auth Endpoints
     if (contract.path === "/api/v1/onboarding/self-service/register-company") {
       const body = await safeReadJsonBody(request);
       if (useDatabase && (targetPool || targetDb)) {
         const result = await registerCompanyInDb(
-          { pool: targetPool, db: targetDb, env },
+          {
+            pool: targetPool,
+            db: targetDb,
+            env,
+            emailProvider: options?.emailProvider,
+          },
           {
             companyName: String(body["companyName"] ?? ""),
             slug: String(body["slug"] ?? ""),
@@ -488,24 +613,28 @@ export async function handleApiRequest(
             tenant: result.tenant,
             adminUser: result.adminUser,
             adminMembership: result.adminMembership,
-            verificationEmailDispatched: true,
+            verificationEmailDispatched: result.verificationEmailDispatched,
           },
           201,
         );
       }
-      const result = registerSelfServiceCompany(store, {
-        companyName: String(body["companyName"] ?? ""),
-        slug: String(body["slug"] ?? ""),
-        adminEmail: String(body["adminEmail"] ?? ""),
-        adminFullName: String(body["adminFullName"] ?? ""),
-        adminJobTitle: body["adminJobTitle"] ? String(body["adminJobTitle"]) : undefined,
-      });
+      const result = await registerSelfServiceCompanyAsync(
+        store,
+        {
+          companyName: String(body["companyName"] ?? ""),
+          slug: String(body["slug"] ?? ""),
+          adminEmail: String(body["adminEmail"] ?? ""),
+          adminFullName: String(body["adminFullName"] ?? ""),
+          adminJobTitle: body["adminJobTitle"] ? String(body["adminJobTitle"]) : undefined,
+        },
+        { env, emailProvider: options?.emailProvider },
+      );
       return jsonResponse(
         {
           tenant: result.tenant,
           adminUser: result.adminUser,
           adminMembership: result.adminMembership,
-          verificationEmailDispatched: true,
+          verificationEmailDispatched: result.verificationEmailDispatched,
         },
         201,
       );
@@ -514,14 +643,27 @@ export async function handleApiRequest(
     if (contract.path === "/api/v1/onboarding/self-service/verify-email") {
       const body = await safeReadJsonBody(request);
       const token = String(body["verificationToken"] ?? "");
+      const expectedTenantId =
+        typeof body["tenantId"] === "string" && body["tenantId"].trim()
+          ? body["tenantId"].trim()
+          : undefined;
+      const expectedEmail =
+        typeof body["email"] === "string" && body["email"].trim()
+          ? body["email"].trim()
+          : undefined;
+
       if (useDatabase && (targetPool || targetDb)) {
         const result = await verifyCompanyAdminEmailInDb(
           { pool: targetPool, db: targetDb, env },
           token,
+          { expectedTenantId, expectedEmail },
         );
         return jsonResponse(result);
       }
-      const ctx = verifyCompanyAdminEmail(store, token);
+      const ctx = verifyCompanyAdminEmail(store, token, {
+        expectedTenantId,
+        expectedEmail,
+      });
       return jsonResponse({
         tenant: ctx.tenant,
         user: ctx.user,
@@ -553,7 +695,7 @@ export async function handleApiRequest(
           ipAddress,
           userAgent,
         },
-        { db: targetDb, store, isSecureRequest },
+        { db: targetDb, store, isSecureRequest, env },
       );
 
       return jsonResponse(
@@ -573,6 +715,7 @@ export async function handleApiRequest(
       const isSecure = url.protocol === "https:";
       const logoutResult = await defaultAuthService.logout(token || "", isSecure, {
         db: targetDb,
+        env,
       });
       return jsonResponse({ success: true, message: "Logged out successfully." }, 200, {
         "set-cookie": logoutResult.clearCookieHeader,
@@ -588,7 +731,12 @@ export async function handleApiRequest(
           400,
         );
       }
-      await defaultAuthService.requestPasswordReset(email, { db: targetDb, store });
+      await defaultAuthService.requestPasswordReset(email, {
+        db: targetDb,
+        store,
+        env,
+        emailProvider: options?.emailProvider,
+      });
       // Security Invariant: NEVER return password reset tokens in HTTP API responses.
       return jsonResponse({
         success: true,
@@ -609,6 +757,7 @@ export async function handleApiRequest(
       const result = await defaultAuthService.confirmPasswordReset(token, newPassword, {
         db: targetDb,
         store,
+        env,
       });
       return jsonResponse({
         success: true,
@@ -625,28 +774,40 @@ export async function handleApiRequest(
       const domain = email.includes("@") ? email.split("@")[1] : String(body["domain"] ?? "");
       const provider = domain?.includes("microsoft") ? "entra_oidc" : "google_oidc";
       const tenantId = String(body["tenantId"] ?? "t_discovery");
+      const connectionId = provider === "entra_oidc" ? "entra" : "google";
+
+      const registeredCfg =
+        options?.oidcConfig ?? defaultSsoService.getOidcConnection(connectionId, tenantId);
 
       const oidcRequest =
         provider === "entra_oidc"
-          ? defaultSsoService.prepareEntraOidcRequest({
-              provider: "entra_oidc",
-              clientId: "aurelia-entra-client-id",
-              issuerUrl: "https://login.microsoftonline.com/common/v2.0",
-              authorizationEndpoint:
-                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
-              tokenEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
-              redirectUri: `${url.origin}/api/v1/auth/oidc/entra/callback`,
-              tenantId,
-            })
-          : defaultSsoService.prepareGoogleOidcRequest({
-              provider: "google_oidc",
-              clientId: "aurelia-google-client-id",
-              issuerUrl: "https://accounts.google.com",
-              authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
-              tokenEndpoint: "https://oauth2.googleapis.com/token",
-              redirectUri: `${url.origin}/api/v1/auth/oidc/google/callback`,
-              tenantId,
-            });
+          ? defaultSsoService.prepareEntraOidcRequest(
+              registeredCfg ?? {
+                connectionId,
+                provider: "entra_oidc",
+                clientId: "aurelia-entra-client-id",
+                issuerUrl: "https://login.microsoftonline.com/common/v2.0",
+                authorizationEndpoint:
+                  "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+                tokenEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                jwksUri: "https://login.microsoftonline.com/common/discovery/v2.0/keys",
+                redirectUri: `${url.origin}/api/v1/auth/oidc/entra/callback`,
+                tenantId,
+              },
+            )
+          : defaultSsoService.prepareGoogleOidcRequest(
+              registeredCfg ?? {
+                connectionId,
+                provider: "google_oidc",
+                clientId: "aurelia-google-client-id",
+                issuerUrl: "https://accounts.google.com",
+                authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+                tokenEndpoint: "https://oauth2.googleapis.com/token",
+                jwksUri: "https://www.googleapis.com/oauth2/v3/certs",
+                redirectUri: `${url.origin}/api/v1/auth/oidc/google/callback`,
+                tenantId,
+              },
+            );
 
       return jsonResponse({
         provider,
@@ -661,29 +822,65 @@ export async function handleApiRequest(
       const state = url.searchParams.get("state") ?? undefined;
       const error = url.searchParams.get("error") ?? undefined;
       const errorDescription = url.searchParams.get("error_description") ?? undefined;
+      const redirectUri = `${url.origin}${url.pathname}`;
+      const connectionId = params["connectionId"] ?? undefined;
+      const ipAddress =
+        request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "127.0.0.1";
+      const userAgent = request.headers.get("user-agent") ?? undefined;
+      const isSecureRequest = url.protocol === "https:";
 
-      const validation = defaultSsoService.validateOidcCallback({
-        code,
-        state,
-        error,
-        errorDescription,
-      });
+      try {
+        const oidcAuth = await defaultAuthService.authenticateWithOidcCallback(
+          {
+            code,
+            state,
+            error,
+            errorDescription,
+            redirectUri,
+            connectionId,
+            config: options?.oidcConfig,
+            fetchFn: options?.oidcFetchFn,
+            ipAddress,
+            userAgent,
+          },
+          {
+            db: targetDb,
+            store,
+            isSecureRequest,
+            env,
+          },
+        );
 
-      if (!validation.valid) {
-        return jsonResponse({ error: "OIDC_VALIDATION_FAILED", message: validation.error }, 400);
+        return jsonResponse(
+          {
+            authenticated: true,
+            provider: oidcAuth.provider,
+            tenantId: oidcAuth.tenantContext.tenant.id,
+            user: oidcAuth.user,
+            session: oidcAuth.session,
+            sessionToken: oidcAuth.sessionToken,
+            tenants: oidcAuth.tenants,
+          },
+          200,
+          { "set-cookie": oidcAuth.setCookieHeader },
+        );
+      } catch (err) {
+        if (
+          err instanceof TenantIsolationError ||
+          err instanceof AuthorizationError ||
+          err instanceof DatabaseUnavailableError
+        ) {
+          throw err;
+        }
+        const message = err instanceof Error ? err.message : "OIDC authentication failed.";
+        return jsonResponse(
+          {
+            error: "OIDC_VALIDATION_FAILED",
+            message,
+          },
+          400,
+        );
       }
-
-      // Security invariant: Real token exchange required; do not simulate fake authentication
-      return jsonResponse(
-        {
-          status: "oidc_callback_validated",
-          tenantId: validation.tenantId,
-          codeReceived: true,
-          message:
-            "OIDC state and authorization code validated. Production IdP token exchange required.",
-        },
-        200,
-      );
     }
 
     if (contract.path === "/api/v1/auth/saml/:connectionId/acs") {
@@ -711,7 +908,7 @@ export async function handleApiRequest(
     }
 
     // 3. Authenticated Endpoints Requiring Valid Server-Side Session
-    const identity = await extractAuthenticatedIdentity(request, { db: targetDb });
+    const identity = await extractAuthenticatedIdentity(request, { db: targetDb, env });
     if (!identity) {
       return jsonResponse(
         {
@@ -731,6 +928,7 @@ export async function handleApiRequest(
       const isSecure = url.protocol === "https:";
       const rotated = await defaultAuthService.rotateSession(identity.sessionToken, isSecure, {
         db: targetDb,
+        env,
       });
       if (!rotated) {
         return jsonResponse(
@@ -748,6 +946,9 @@ export async function handleApiRequest(
         const tenants = await listUserTenantsFromDb(targetDb, userId);
         return jsonResponse({ tenants });
       }
+      if (isProd) {
+        throw new DatabaseUnavailableError();
+      }
       return jsonResponse({ tenants: store.listUserTenants(userId) });
     }
 
@@ -757,6 +958,7 @@ export async function handleApiRequest(
       const platformAdminUser = await resolveVerifiedServerUser(userId, {
         db: targetDb,
         store,
+        env,
       });
 
       if (
@@ -795,10 +997,45 @@ export async function handleApiRequest(
       }
 
       if (contract.path === "/api/v1/platform-admin/tenants/:tenantId/sso-connections") {
+        const provider = body["provider"] === "google_oidc" ? "google_oidc" : "entra_oidc";
+        const tenantId = String(params["tenantId"] ?? "");
+        const connectionId = String(body["connectionId"] ?? `${tenantId}_${provider}`);
+
+        if (
+          typeof body["clientId"] === "string" &&
+          typeof body["issuerUrl"] === "string" &&
+          typeof body["redirectUri"] === "string"
+        ) {
+          defaultSsoService.registerOidcConnection(connectionId, {
+            connectionId,
+            provider,
+            clientId: String(body["clientId"]),
+            clientSecret:
+              typeof body["clientSecret"] === "string" ? body["clientSecret"] : undefined,
+            issuerUrl: String(body["issuerUrl"]),
+            authorizationEndpoint:
+              typeof body["authorizationEndpoint"] === "string"
+                ? body["authorizationEndpoint"]
+                : provider === "google_oidc"
+                  ? "https://accounts.google.com/o/oauth2/v2/auth"
+                  : "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+            tokenEndpoint:
+              typeof body["tokenEndpoint"] === "string"
+                ? body["tokenEndpoint"]
+                : provider === "google_oidc"
+                  ? "https://oauth2.googleapis.com/token"
+                  : "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+            jwksUri: typeof body["jwksUri"] === "string" ? body["jwksUri"] : undefined,
+            redirectUri: String(body["redirectUri"]),
+            tenantId,
+          });
+        }
+
         return jsonResponse(
           {
-            tenantId: params["tenantId"],
-            provider: body["provider"] ?? "entra_oidc",
+            connectionId,
+            tenantId,
+            provider,
             status: "draft",
           },
           201,
@@ -816,7 +1053,7 @@ export async function handleApiRequest(
       const ctx = await defaultAuthService.resolveAuthenticatedTenantContext(
         identity.sessionToken,
         pathTenantId,
-        { db: targetDb, store },
+        { db: targetDb, store, env },
       );
 
       // Reject any mismatch between URL :tenantId, authenticated membership, and body tenantId
@@ -843,6 +1080,7 @@ export async function handleApiRequest(
         await defaultAuthService.updateAccountStatus(targetUserId, newStatus, {
           db: targetDb,
           store,
+          env,
         });
         return jsonResponse({ success: true, targetUserId, status: newStatus });
       }
@@ -980,6 +1218,15 @@ export async function handleApiRequest(
 
     return jsonResponse({ error: "NOT_IMPLEMENTED" }, 501);
   } catch (error) {
+    if (error instanceof DatabaseUnavailableError || error instanceof EmailDeliveryError) {
+      return jsonResponse(
+        {
+          error: error.code,
+          message: redactSensitiveEmailTokens(redactPostgresCredentials(error.message)),
+        },
+        error.statusCode,
+      );
+    }
     if (error instanceof TenantIsolationError || error instanceof AuthorizationError) {
       return jsonResponse(
         {
@@ -990,6 +1237,12 @@ export async function handleApiRequest(
       );
     }
     const message = error instanceof Error ? error.message : "Bad request";
-    return jsonResponse({ error: "BAD_REQUEST", message }, 400);
+    return jsonResponse(
+      {
+        error: "BAD_REQUEST",
+        message: redactSensitiveEmailTokens(redactPostgresCredentials(message)),
+      },
+      400,
+    );
   }
 }

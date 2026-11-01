@@ -54,14 +54,14 @@ export default defineConfig({
                 }
               }
 
-              const webReq = new Request(fullUrl, {
-                method: req.method,
+              const reqInit: RequestInit = {
+                method: req.method ?? "GET",
                 headers,
-                body:
-                  req.method !== "GET" && req.method !== "HEAD" && bodyBuffer.length > 0
-                    ? bodyBuffer
-                    : undefined,
-              });
+              };
+              if (req.method !== "GET" && req.method !== "HEAD" && bodyBuffer.length > 0) {
+                reqInit.body = new Uint8Array(bodyBuffer);
+              }
+              const webReq = new Request(fullUrl, reqInit);
 
               const { handleApiRequest } = await import("./src/server/api/routes");
               const response = await handleApiRequest(webReq);

@@ -198,6 +198,30 @@ export function parseAwsSecretsManagerRdsJson(rawSecretJson: string): AwsSecrets
 }
 
 /**
+ * Returns true if AWS RDS PostgreSQL host, user, and password are configured
+ * either via environment variables or AWS Secrets Manager JSON.
+ */
+export function isAwsPostgresConfigured(
+  env: Record<string, string | undefined> = typeof process !== "undefined" ? process.env : {},
+): boolean {
+  const secretJsonRaw = (env["AWS_RDS_SECRET_JSON"] ?? "").trim();
+  let secretPayload: AwsSecretsManagerRdsPayload | undefined;
+  if (secretJsonRaw) {
+    try {
+      secretPayload = parseAwsSecretsManagerRdsJson(secretJsonRaw);
+    } catch {
+      return false;
+    }
+  }
+
+  const host = (env["AWS_RDS_HOST"] ?? secretPayload?.host ?? "").trim();
+  const user = (env["AWS_RDS_USER"] ?? secretPayload?.username ?? secretPayload?.user ?? "").trim();
+  const password = env["AWS_RDS_PASSWORD"] ?? secretPayload?.password ?? "";
+
+  return Boolean(host && user && password);
+}
+
+/**
  * Validates AWS RDS PostgreSQL configuration from server environment variables
  * or AWS Secrets Manager JSON (`AWS_RDS_SECRET_JSON`).
  * Never silently downgrades SSL or masks invalid pool configurations.

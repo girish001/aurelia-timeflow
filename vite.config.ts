@@ -24,6 +24,64 @@ export default defineConfig({
       host: "0.0.0.0",
       port: 3000,
     },
+    plugins: [
+      {
+        name: "aurelia-api-dev-middleware",
+        configureServer(server) {
+          server.middlewares.use(async (req, res, next) => {
+            if (!req.url || !req.url.startsWith("/api/v1/")) {
+              return next();
+            }
+            try {
+              const protocol = req.headers["x-forwarded-proto"] || "http";
+              const host = req.headers.host || "localhost:3000";
+              const fullUrl = `${protocol}://${host}${req.url}`;
+
+              const chunks: Buffer[] = [];
+              for await (const chunk of req) {
+                chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+              }
+              const bodyBuffer = Buffer.concat(chunks);
+
+              const headers = new Headers();
+              for (const [k, v] of Object.entries(req.headers)) {
+                if (v) {
+                  if (Array.isArray(v)) {
+                    v.forEach((val) => headers.append(k, val));
+                  } else {
+                    headers.set(k, v);
+                  }
+                }
+              }
+
+              const webReq = new Request(fullUrl, {
+                method: req.method,
+                headers,
+                body:
+                  req.method !== "GET" && req.method !== "HEAD" && bodyBuffer.length > 0
+                    ? bodyBuffer
+                    : undefined,
+              });
+
+              const { handleApiRequest } = await import("./src/server/api/routes");
+              const response = await handleApiRequest(webReq);
+              if (!response) {
+                return next();
+              }
+
+              res.statusCode = response.status;
+              response.headers.forEach((value, key) => {
+                res.setHeader(key, value);
+              });
+              const arrayBuffer = await response.arrayBuffer();
+              res.end(Buffer.from(arrayBuffer));
+            } catch (err) {
+              next(err);
+            }
+          });
+        },
+      },
+    ],
     optimizeDeps: {
       include: [
         "@tanstack/react-query",

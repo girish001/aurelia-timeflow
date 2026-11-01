@@ -11,14 +11,19 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as AppRouteImport } from './routes/app'
+import { Route as DemoRouteImport } from './routes/demo'
 import { Route as LoginRouteImport } from './routes/login'
+import { Route as OnboardingRouteImport } from './routes/onboarding'
 import { Route as AppIndexRouteImport } from './routes/app.index'
 import { Route as AppApprovalsRouteImport } from './routes/app.approvals'
+import { Route as AppAuditRouteImport } from './routes/app.audit'
+import { Route as AppCalendarRouteImport } from './routes/app.calendar'
 import { Route as AppClientsRouteImport } from './routes/app.clients'
 import { Route as AppProjectsRouteImport } from './routes/app.projects'
 import { Route as AppReportsRouteImport } from './routes/app.reports'
 import { Route as AppSettingsRouteImport } from './routes/app.settings'
 import { Route as AppTeamRouteImport } from './routes/app.team'
+import { Route as AppTimeoffRouteImport } from './routes/app.timeoff'
 import { Route as AppTimesheetRouteImport } from './routes/app.timesheet'
 
 const IndexRoute = IndexRouteImport.update({
@@ -31,9 +36,19 @@ const AppRoute = AppRouteImport.update({
   path: '/app',
   getParentRoute: () => rootRouteImport,
 } as any)
+const DemoRoute = DemoRouteImport.update({
+  id: '/demo',
+  path: '/demo',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const LoginRoute = LoginRouteImport.update({
   id: '/login',
   path: '/login',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const OnboardingRoute = OnboardingRouteImport.update({
+  id: '/onboarding',
+  path: '/onboarding',
   getParentRoute: () => rootRouteImport,
 } as any)
 const AppIndexRoute = AppIndexRouteImport.update({
@@ -44,6 +59,16 @@ const AppIndexRoute = AppIndexRouteImport.update({
 const AppApprovalsRoute = AppApprovalsRouteImport.update({
   id: '/approvals',
   path: '/approvals',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppAuditRoute = AppAuditRouteImport.update({
+  id: '/audit',
+  path: '/audit',
+  getParentRoute: () => AppRoute,
+} as any)
+const AppCalendarRoute = AppCalendarRouteImport.update({
+  id: '/calendar',
+  path: '/calendar',
   getParentRoute: () => AppRoute,
 } as any)
 const AppClientsRoute = AppClientsRouteImport.update({
@@ -71,6 +96,11 @@ const AppTeamRoute = AppTeamRouteImport.update({
   path: '/team',
   getParentRoute: () => AppRoute,
 } as any)
+const AppTimeoffRoute = AppTimeoffRouteImport.update({
+  id: '/timeoff',
+  path: '/timeoff',
+  getParentRoute: () => AppRoute,
+} as any)
 const AppTimesheetRoute = AppTimesheetRouteImport.update({
   id: '/timesheet',
   path: '/timesheet',
@@ -80,25 +110,35 @@ const AppTimesheetRoute = AppTimesheetRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/app': typeof AppRouteWithChildren
+  '/demo': typeof DemoRoute
   '/login': typeof LoginRoute
+  '/onboarding': typeof OnboardingRoute
   '/app/approvals': typeof AppApprovalsRoute
+  '/app/audit': typeof AppAuditRoute
+  '/app/calendar': typeof AppCalendarRoute
   '/app/clients': typeof AppClientsRoute
   '/app/projects': typeof AppProjectsRoute
   '/app/reports': typeof AppReportsRoute
   '/app/settings': typeof AppSettingsRoute
   '/app/team': typeof AppTeamRoute
+  '/app/timeoff': typeof AppTimeoffRoute
   '/app/timesheet': typeof AppTimesheetRoute
   '/app/': typeof AppIndexRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/demo': typeof DemoRoute
   '/login': typeof LoginRoute
+  '/onboarding': typeof OnboardingRoute
   '/app/approvals': typeof AppApprovalsRoute
+  '/app/audit': typeof AppAuditRoute
+  '/app/calendar': typeof AppCalendarRoute
   '/app/clients': typeof AppClientsRoute
   '/app/projects': typeof AppProjectsRoute
   '/app/reports': typeof AppReportsRoute
   '/app/settings': typeof AppSettingsRoute
   '/app/team': typeof AppTeamRoute
+  '/app/timeoff': typeof AppTimeoffRoute
   '/app/timesheet': typeof AppTimesheetRoute
   '/app': typeof AppIndexRoute
 }
@@ -106,13 +146,18 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/app': typeof AppRouteWithChildren
+  '/demo': typeof DemoRoute
   '/login': typeof LoginRoute
+  '/onboarding': typeof OnboardingRoute
   '/app/approvals': typeof AppApprovalsRoute
+  '/app/audit': typeof AppAuditRoute
+  '/app/calendar': typeof AppCalendarRoute
   '/app/clients': typeof AppClientsRoute
   '/app/projects': typeof AppProjectsRoute
   '/app/reports': typeof AppReportsRoute
   '/app/settings': typeof AppSettingsRoute
   '/app/team': typeof AppTeamRoute
+  '/app/timeoff': typeof AppTimeoffRoute
   '/app/timesheet': typeof AppTimesheetRoute
   '/app/': typeof AppIndexRoute
 }
@@ -121,38 +166,53 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/app'
+    | '/demo'
     | '/login'
+    | '/onboarding'
     | '/app/approvals'
+    | '/app/audit'
+    | '/app/calendar'
     | '/app/clients'
     | '/app/projects'
     | '/app/reports'
     | '/app/settings'
     | '/app/team'
+    | '/app/timeoff'
     | '/app/timesheet'
     | '/app/'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/demo'
     | '/login'
+    | '/onboarding'
     | '/app/approvals'
+    | '/app/audit'
+    | '/app/calendar'
     | '/app/clients'
     | '/app/projects'
     | '/app/reports'
     | '/app/settings'
     | '/app/team'
+    | '/app/timeoff'
     | '/app/timesheet'
     | '/app'
   id:
     | '__root__'
     | '/'
     | '/app'
+    | '/demo'
     | '/login'
+    | '/onboarding'
     | '/app/approvals'
+    | '/app/audit'
+    | '/app/calendar'
     | '/app/clients'
     | '/app/projects'
     | '/app/reports'
     | '/app/settings'
     | '/app/team'
+    | '/app/timeoff'
     | '/app/timesheet'
     | '/app/'
   fileRoutesById: FileRoutesById
@@ -160,7 +220,9 @@ export interface FileRouteTypes {
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   AppRoute: typeof AppRouteWithChildren
+  DemoRoute: typeof DemoRoute
   LoginRoute: typeof LoginRoute
+  OnboardingRoute: typeof OnboardingRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -179,11 +241,25 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/demo': {
+      id: '/demo'
+      path: '/demo'
+      fullPath: '/demo'
+      preLoaderRoute: typeof DemoRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/login': {
       id: '/login'
       path: '/login'
       fullPath: '/login'
       preLoaderRoute: typeof LoginRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/onboarding': {
+      id: '/onboarding'
+      path: '/onboarding'
+      fullPath: '/onboarding'
+      preLoaderRoute: typeof OnboardingRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/app/': {
@@ -198,6 +274,20 @@ declare module '@tanstack/react-router' {
       path: '/approvals'
       fullPath: '/app/approvals'
       preLoaderRoute: typeof AppApprovalsRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/audit': {
+      id: '/app/audit'
+      path: '/audit'
+      fullPath: '/app/audit'
+      preLoaderRoute: typeof AppAuditRouteImport
+      parentRoute: typeof AppRoute
+    }
+    '/app/calendar': {
+      id: '/app/calendar'
+      path: '/calendar'
+      fullPath: '/app/calendar'
+      preLoaderRoute: typeof AppCalendarRouteImport
       parentRoute: typeof AppRoute
     }
     '/app/clients': {
@@ -235,6 +325,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppTeamRouteImport
       parentRoute: typeof AppRoute
     }
+    '/app/timeoff': {
+      id: '/app/timeoff'
+      path: '/timeoff'
+      fullPath: '/app/timeoff'
+      preLoaderRoute: typeof AppTimeoffRouteImport
+      parentRoute: typeof AppRoute
+    }
     '/app/timesheet': {
       id: '/app/timesheet'
       path: '/timesheet'
@@ -247,22 +344,28 @@ declare module '@tanstack/react-router' {
 
 interface AppRouteChildren {
   AppApprovalsRoute: typeof AppApprovalsRoute
+  AppAuditRoute: typeof AppAuditRoute
+  AppCalendarRoute: typeof AppCalendarRoute
   AppClientsRoute: typeof AppClientsRoute
   AppProjectsRoute: typeof AppProjectsRoute
   AppReportsRoute: typeof AppReportsRoute
   AppSettingsRoute: typeof AppSettingsRoute
   AppTeamRoute: typeof AppTeamRoute
+  AppTimeoffRoute: typeof AppTimeoffRoute
   AppTimesheetRoute: typeof AppTimesheetRoute
   AppIndexRoute: typeof AppIndexRoute
 }
 
 const AppRouteChildren: AppRouteChildren = {
   AppApprovalsRoute: AppApprovalsRoute,
+  AppAuditRoute: AppAuditRoute,
+  AppCalendarRoute: AppCalendarRoute,
   AppClientsRoute: AppClientsRoute,
   AppProjectsRoute: AppProjectsRoute,
   AppReportsRoute: AppReportsRoute,
   AppSettingsRoute: AppSettingsRoute,
   AppTeamRoute: AppTeamRoute,
+  AppTimeoffRoute: AppTimeoffRoute,
   AppTimesheetRoute: AppTimesheetRoute,
   AppIndexRoute: AppIndexRoute,
 }
@@ -272,7 +375,9 @@ const AppRouteWithChildren = AppRoute._addFileChildren(AppRouteChildren)
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   AppRoute: AppRouteWithChildren,
+  DemoRoute: DemoRoute,
   LoginRoute: LoginRoute,
+  OnboardingRoute: OnboardingRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

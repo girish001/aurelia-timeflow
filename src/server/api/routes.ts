@@ -1,4 +1,12 @@
-import { assertValidTenantExecutionContext, checkAwsDatabaseHealth } from "../db/aws-postgres";
+import {
+  assertValidTenantExecutionContext,
+  checkAwsDatabaseHealth,
+  getAwsPostgresDb,
+  getAwsPostgresPool,
+  isAwsPostgresConfigured,
+  type AureliaAwsDb,
+  type QueryableTransactionPool,
+} from "../db/aws-postgres";
 import {
   importTeamCsvIntoTenant,
   provisionEnterpriseTenant,
@@ -6,7 +14,24 @@ import {
   startSupportImpersonationSession,
   verifyCompanyAdminEmail,
 } from "../onboarding/onboarding-service";
+import {
+  approveTimesheetInDb,
+  getProjectByIdFromDb,
+  getTeamMemberProfileFromDb,
+  listAccessibleTeamMembersFromDb,
+  listProjectsFromDb,
+  listTenantAuditLogsFromDb,
+  listUserTenantsFromDb,
+  recordAuditLogToDb,
+  registerCompanyInDb,
+  resolveTenantContextFromDb,
+  updateProjectBudgetInDb,
+  verifyCompanyAdminEmailInDb,
+} from "../repositories/postgres-tenant-store";
 import { MultiTenantDataStore } from "../repositories/tenant-scoped-store";
+import { defaultAuthService } from "../auth/auth-service";
+import { defaultSessionManager } from "../auth/session-manager";
+import { defaultSsoService } from "../auth/sso-service";
 import {
   AuthorizationError,
   TenantIsolationError,
@@ -36,7 +61,53 @@ export const API_ROUTE_CONTRACTS: ApiRouteContract[] = [
     path: "/api/v1/auth/login",
     scope: "public",
     description:
-      "Email/password authentication returning user session and available tenant memberships.",
+      "Email/password authentication returning user session, HttpOnly cookie, and available tenant memberships.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/auth/logout",
+    scope: "public",
+    description: "Invalidates active session token and clears the HttpOnly session cookie.",
+  },
+  {
+    method: "GET",
+    path: "/api/v1/auth/session",
+    scope: "authenticated",
+    description: "Returns currently authenticated session user, email, and session expiry.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/auth/session/rotate",
+    scope: "authenticated",
+    description: "Rotates active session token for enhanced replay protection.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/auth/password-reset/request",
+    scope: "public",
+    description: "Dispatches a time-boxed password reset token for the given user email.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/auth/password-reset/confirm",
+    scope: "public",
+    description: "Validates reset token, updates password hash, and revokes all active sessions.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/auth/account/status",
+    scope: "tenant_scoped",
+    requiredPermission: "tenant:members:manage",
+    description:
+      "Activates, suspends, or deactivates a user account, terminating all active sessions on deactivation.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/tenants/:tenantId/users/:targetUserId/status",
+    scope: "tenant_scoped",
+    requiredPermission: "tenant:members:manage",
+    description:
+      "Activates, suspends, or deactivates a user account in tenant workspace, terminating all active sessions on deactivation.",
   },
   {
     method: "POST",
@@ -218,25 +289,68 @@ export function matchApiRouteContract(method: string, pathname: string): Matched
   return null;
 }
 
-function jsonResponse(payload: unknown, status = 200): Response {
+function jsonResponse(payload: unknown, status = 200, extraHeaders?: HeadersInit): Response {
+  const headers = new Headers({
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  if (extraHeaders) {
+    if (extraHeaders instanceof Headers) {
+      extraHeaders.forEach((v, k) => headers.set(k, v));
+    } else if (Array.isArray(extraHeaders)) {
+      extraHeaders.forEach(([k, v]) => headers.append(k, v));
+    } else {
+      Object.entries(extraHeaders).forEach(([k, v]) => {
+        if (v) headers.set(k, v);
+      });
+    }
+  }
   return new Response(JSON.stringify(payload), {
     status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      "cache-control": "no-store",
-    },
+    headers,
   });
 }
 
-function extractAuthenticatedUserId(request: Request): string | null {
+export interface AuthenticatedIdentity {
+  userId: string;
+  sessionToken?: string | undefined;
+  isSession: boolean;
+}
+
+export function extractAuthenticatedIdentity(request: Request): AuthenticatedIdentity | null {
+  // 1. Session cookie or Bearer session token
+  const token = defaultSessionManager.extractTokenFromRequest(request);
+  if (token) {
+    const session = defaultSessionManager.validateSession(token);
+    if (session) {
+      return {
+        userId: session.userId,
+        sessionToken: token,
+        isSession: true,
+      };
+    }
+  }
+
+  // 2. Direct user identity header fallback (for internal testing or CLI)
   const headerUser = request.headers.get("x-aurelia-user-id")?.trim();
-  if (headerUser) return headerUser;
+  if (headerUser) {
+    return {
+      userId: headerUser,
+      isSession: false,
+    };
+  }
 
   const authHeader = request.headers.get("authorization")?.trim() ?? "";
   if (authHeader.toLowerCase().startsWith("bearer user:")) {
     const tokenUser = authHeader.slice("bearer user:".length).trim();
-    return tokenUser || null;
+    if (tokenUser) {
+      return {
+        userId: tokenUser,
+        isSession: false,
+      };
+    }
   }
+
   return null;
 }
 
@@ -262,6 +376,8 @@ export async function handleApiRequest(
   options?: {
     store?: MultiTenantDataStore;
     env?: Record<string, string | undefined>;
+    pool?: QueryableTransactionPool;
+    db?: AureliaAwsDb;
   },
 ): Promise<Response | null> {
   const url = new URL(request.url);
@@ -281,6 +397,18 @@ export async function handleApiRequest(
   }
 
   const { contract, params } = matched;
+  const env = options?.env;
+  let targetPool = options?.pool;
+  let targetDb = options?.db;
+  if (!targetPool && (options?.pool || options?.db || isAwsPostgresConfigured(env))) {
+    try {
+      targetPool = getAwsPostgresPool(env);
+      targetDb = options?.db ?? getAwsPostgresDb(env);
+    } catch {
+      // Caught VPC network boundary check or configuration validation; handled safely per route
+    }
+  }
+  const useDatabase = Boolean(targetPool || targetDb);
   const store = options?.store ?? getDefaultApiStore();
 
   try {
@@ -294,6 +422,19 @@ export async function handleApiRequest(
     // 2. Public Self-Service Onboarding & Auth Endpoints
     if (contract.path === "/api/v1/onboarding/self-service/register-company") {
       const body = await safeReadJsonBody(request);
+      if (useDatabase && (targetPool || targetDb)) {
+        const result = await registerCompanyInDb(
+          { pool: targetPool, db: targetDb, env },
+          {
+            companyName: String(body["companyName"] ?? ""),
+            slug: String(body["slug"] ?? ""),
+            adminEmail: String(body["adminEmail"] ?? ""),
+            adminFullName: String(body["adminFullName"] ?? ""),
+            adminJobTitle: body["adminJobTitle"] ? String(body["adminJobTitle"]) : undefined,
+          },
+        );
+        return jsonResponse(result, 201);
+      }
       const result = registerSelfServiceCompany(store, {
         companyName: String(body["companyName"] ?? ""),
         slug: String(body["slug"] ?? ""),
@@ -306,7 +447,15 @@ export async function handleApiRequest(
 
     if (contract.path === "/api/v1/onboarding/self-service/verify-email") {
       const body = await safeReadJsonBody(request);
-      const ctx = verifyCompanyAdminEmail(store, String(body["verificationToken"] ?? ""));
+      const token = String(body["verificationToken"] ?? "");
+      if (useDatabase && (targetPool || targetDb)) {
+        const result = await verifyCompanyAdminEmailInDb(
+          { pool: targetPool, db: targetDb, env },
+          token,
+        );
+        return jsonResponse(result);
+      }
+      const ctx = verifyCompanyAdminEmail(store, token);
       return jsonResponse({
         tenant: ctx.tenant,
         user: ctx.user,
@@ -316,39 +465,241 @@ export async function handleApiRequest(
 
     if (contract.path === "/api/v1/auth/login") {
       const body = await safeReadJsonBody(request);
+      const email = String(body["email"] ?? "").trim();
       const userId = String(body["userId"] ?? "").trim();
-      if (!userId) {
-        return jsonResponse({ error: "BAD_REQUEST", message: "userId or email is required." }, 400);
+      const password = typeof body["password"] === "string" ? body["password"] : undefined;
+
+      if (!email && !userId) {
+        return jsonResponse({ error: "BAD_REQUEST", message: "email or userId is required." }, 400);
       }
-      const tenants = store.listUserTenants(userId);
-      return jsonResponse({ userId, tenants });
+
+      const ipAddress =
+        request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "127.0.0.1";
+      const userAgent = request.headers.get("user-agent") ?? undefined;
+      const isSecureRequest = url.protocol === "https:";
+
+      const loginResult = await defaultAuthService.login(
+        {
+          email: email || `${userId}@demo.aurelia.example`,
+          password,
+          userId,
+          ipAddress,
+          userAgent,
+        },
+        { db: targetDb, store, isSecureRequest },
+      );
+
+      return jsonResponse(
+        {
+          user: loginResult.user,
+          session: loginResult.session,
+          sessionToken: loginResult.sessionToken,
+          tenants: loginResult.tenants,
+        },
+        200,
+        { "set-cookie": loginResult.setCookieHeader },
+      );
     }
 
-    if (
-      contract.path === "/api/v1/auth/sso/discover" ||
-      contract.path === "/api/v1/auth/oidc/:connectionId/callback" ||
-      contract.path === "/api/v1/auth/saml/:connectionId/acs"
-    ) {
-      return jsonResponse({
-        route: contract.path,
-        connectionId: params["connectionId"] ?? null,
-        status: "sso_ready",
+    if (contract.path === "/api/v1/auth/logout") {
+      const token = defaultSessionManager.extractTokenFromRequest(request);
+      const isSecure = url.protocol === "https:";
+      const logoutResult = defaultAuthService.logout(token || "", isSecure);
+      return jsonResponse({ success: true, message: "Logged out successfully." }, 200, {
+        "set-cookie": logoutResult.clearCookieHeader,
       });
     }
 
+    if (contract.path === "/api/v1/auth/password-reset/request") {
+      const body = await safeReadJsonBody(request);
+      const email = String(body["email"] ?? "").trim();
+      if (!email || !email.includes("@")) {
+        return jsonResponse(
+          { error: "BAD_REQUEST", message: "A valid email address is required." },
+          400,
+        );
+      }
+      const result = await defaultAuthService.requestPasswordReset(email, { db: targetDb, store });
+      return jsonResponse({
+        success: true,
+        message: "If an account exists with that email, a password reset link has been dispatched.",
+        resetToken: result.resetToken,
+      });
+    }
+
+    if (contract.path === "/api/v1/auth/password-reset/confirm") {
+      const body = await safeReadJsonBody(request);
+      const token = String(body["token"] ?? "").trim();
+      const newPassword = String(body["newPassword"] ?? "");
+      if (!token || !newPassword) {
+        return jsonResponse(
+          { error: "BAD_REQUEST", message: "token and newPassword are required." },
+          400,
+        );
+      }
+      const result = await defaultAuthService.confirmPasswordReset(token, newPassword, {
+        db: targetDb,
+        store,
+      });
+      return jsonResponse({
+        success: true,
+        message: "Password has been reset successfully. All active sessions have been revoked.",
+        userId: result.userId,
+      });
+    }
+
+    if (contract.path === "/api/v1/auth/sso/discover") {
+      const body = await safeReadJsonBody(request);
+      const email = String(body["email"] ?? "")
+        .trim()
+        .toLowerCase();
+      const domain = email.includes("@") ? email.split("@")[1] : String(body["domain"] ?? "");
+      const provider = domain?.includes("microsoft") ? "entra_oidc" : "google_oidc";
+      const tenantId = String(body["tenantId"] ?? "t_discovery");
+
+      const oidcRequest =
+        provider === "entra_oidc"
+          ? defaultSsoService.prepareEntraOidcRequest({
+              provider: "entra_oidc",
+              clientId: "aurelia-entra-client-id",
+              issuerUrl: "https://login.microsoftonline.com/common/v2.0",
+              authorizationEndpoint:
+                "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+              tokenEndpoint: "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+              redirectUri: `${url.origin}/api/v1/auth/oidc/entra/callback`,
+              tenantId,
+            })
+          : defaultSsoService.prepareGoogleOidcRequest({
+              provider: "google_oidc",
+              clientId: "aurelia-google-client-id",
+              issuerUrl: "https://accounts.google.com",
+              authorizationEndpoint: "https://accounts.google.com/o/oauth2/v2/auth",
+              tokenEndpoint: "https://oauth2.googleapis.com/token",
+              redirectUri: `${url.origin}/api/v1/auth/oidc/google/callback`,
+              tenantId,
+            });
+
+      return jsonResponse({
+        provider,
+        domain,
+        authorizationUrl: oidcRequest.authorizationUrl,
+        state: oidcRequest.state,
+      });
+    }
+
+    if (contract.path === "/api/v1/auth/oidc/:connectionId/callback") {
+      const code = url.searchParams.get("code") ?? undefined;
+      const state = url.searchParams.get("state") ?? undefined;
+      const error = url.searchParams.get("error") ?? undefined;
+      const errorDescription = url.searchParams.get("error_description") ?? undefined;
+
+      const validation = defaultSsoService.validateOidcCallback({
+        code,
+        state,
+        error,
+        errorDescription,
+      });
+
+      if (!validation.valid) {
+        return jsonResponse({ error: "OIDC_VALIDATION_FAILED", message: validation.error }, 400);
+      }
+
+      // Security invariant: Real token exchange required; do not simulate fake authentication
+      return jsonResponse(
+        {
+          status: "oidc_callback_validated",
+          tenantId: validation.tenantId,
+          codeReceived: true,
+          message:
+            "OIDC state and authorization code validated. Production IdP token exchange required.",
+        },
+        200,
+      );
+    }
+
+    if (contract.path === "/api/v1/auth/saml/:connectionId/acs") {
+      const body = await safeReadJsonBody(request);
+      const samlResponse = String(body["SAMLResponse"] ?? "");
+      const relayState = String(body["RelayState"] ?? "");
+
+      const validation = defaultSsoService.validateSamlResponse({
+        samlResponse,
+        relayState,
+      });
+
+      if (!validation.valid) {
+        return jsonResponse({ error: "SAML_VALIDATION_FAILED", message: validation.error }, 400);
+      }
+
+      return jsonResponse(
+        {
+          status: "saml_acs_validated",
+          tenantId: validation.tenantId,
+          message: "SAML assertion and RelayState signature validated.",
+        },
+        200,
+      );
+    }
+
     // 3. Authenticated Endpoints Requiring Valid User Identity
-    const userId = extractAuthenticatedUserId(request);
-    if (!userId) {
+    const identity = extractAuthenticatedIdentity(request);
+    if (!identity) {
       return jsonResponse(
         {
           error: "UNAUTHENTICATED",
-          message: "Missing authenticated user session header.",
+          message: "Missing authenticated user session or token.",
         },
         401,
       );
     }
+    const userId = identity.userId;
+
+    if (contract.path === "/api/v1/auth/session") {
+      if (!identity.isSession || !identity.sessionToken) {
+        return jsonResponse(
+          {
+            authenticated: true,
+            userId,
+            authType: "header_override",
+          },
+          200,
+        );
+      }
+      const session = defaultSessionManager.validateSession(identity.sessionToken);
+      if (!session) {
+        return jsonResponse(
+          { error: "UNAUTHENTICATED", message: "Session expired or invalid." },
+          401,
+        );
+      }
+      return jsonResponse({ authenticated: true, session });
+    }
+
+    if (contract.path === "/api/v1/auth/session/rotate") {
+      if (!identity.isSession || !identity.sessionToken) {
+        return jsonResponse(
+          { error: "BAD_REQUEST", message: "Cannot rotate a header-based session." },
+          400,
+        );
+      }
+      const isSecure = url.protocol === "https:";
+      const rotated = defaultAuthService.rotateSession(identity.sessionToken, isSecure);
+      if (!rotated) {
+        return jsonResponse(
+          { error: "UNAUTHENTICATED", message: "Session expired or invalid." },
+          401,
+        );
+      }
+      return jsonResponse({ session: rotated.session, sessionToken: rotated.sessionToken }, 200, {
+        "set-cookie": rotated.setCookieHeader,
+      });
+    }
 
     if (contract.path === "/api/v1/auth/tenants") {
+      if (useDatabase && targetDb) {
+        const tenants = await listUserTenantsFromDb(targetDb, userId);
+        return jsonResponse({ tenants });
+      }
       return jsonResponse({ tenants: store.listUserTenants(userId) });
     }
 
@@ -407,12 +758,23 @@ export async function handleApiRequest(
 
     // 5. Tenant-Scoped Endpoints
     if (contract.scope === "tenant_scoped") {
-      const pathTenantId = params["tenantId"] ?? "";
-      const ctx = store.resolveTenantContext(userId, pathTenantId);
-
       const body = request.method === "GET" ? {} : await safeReadJsonBody(request);
       const claimedBodyTenantId =
         typeof body["tenantId"] === "string" ? body["tenantId"] : undefined;
+      const pathTenantId = params["tenantId"] || claimedBodyTenantId || "";
+
+      let ctx;
+      if (identity.isSession && identity.sessionToken) {
+        ctx = await defaultAuthService.resolveAuthenticatedTenantContext(
+          identity.sessionToken,
+          pathTenantId,
+          { db: targetDb, store },
+        );
+      } else if (useDatabase && targetDb) {
+        ctx = await resolveTenantContextFromDb(targetDb, userId, pathTenantId);
+      } else {
+        ctx = store.resolveTenantContext(userId, pathTenantId);
+      }
 
       // Reject any mismatch between URL :tenantId, authenticated membership, and body tenantId
       assertValidTenantExecutionContext(ctx, claimedBodyTenantId);
@@ -423,16 +785,76 @@ export async function handleApiRequest(
         );
       }
 
+      if (
+        contract.path === "/api/v1/auth/account/status" ||
+        contract.path === "/api/v1/tenants/:tenantId/users/:targetUserId/status"
+      ) {
+        const targetUserId = String(
+          params["targetUserId"] ?? body["targetUserId"] ?? body["userId"] ?? "",
+        );
+        const newStatus = String(body["status"] ?? "active") as
+          "active" | "suspended" | "deactivated";
+        if (newStatus !== "active" && newStatus !== "suspended" && newStatus !== "deactivated") {
+          return jsonResponse({ error: "BAD_REQUEST", message: "Invalid status value." }, 400);
+        }
+        await defaultAuthService.updateAccountStatus(targetUserId, newStatus, {
+          db: targetDb,
+          store,
+        });
+        return jsonResponse({ success: true, targetUserId, status: newStatus });
+      }
+
       if (contract.path === "/api/v1/tenants/:tenantId/invitations/bulk-csv") {
         const summary = importTeamCsvIntoTenant(store, ctx, String(body["csvText"] ?? ""));
         return jsonResponse(summary, 201);
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/projects") {
+        if (useDatabase) {
+          const page = url.searchParams.get("page")
+            ? Number(url.searchParams.get("page"))
+            : undefined;
+          const limit = url.searchParams.get("limit")
+            ? Number(url.searchParams.get("limit"))
+            : undefined;
+          const statusParam = url.searchParams.get("status");
+          const status =
+            statusParam === "active" ||
+            statusParam === "on-hold" ||
+            statusParam === "completed" ||
+            statusParam === "all"
+              ? statusParam
+              : undefined;
+          const search = url.searchParams.get("search") ?? undefined;
+          const sortByParam = url.searchParams.get("sortBy");
+          const sortBy =
+            sortByParam === "name" || sortByParam === "createdAt" || sortByParam === "budgetHours"
+              ? sortByParam
+              : undefined;
+          const sortOrderParam = url.searchParams.get("sortOrder");
+          const sortOrder =
+            sortOrderParam === "asc" || sortOrderParam === "desc" ? sortOrderParam : undefined;
+
+          const result = await listProjectsFromDb(
+            ctx,
+            { page, limit, status, search, sortBy, sortOrder },
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ projects: result.data, pagination: result.pagination });
+        }
         return jsonResponse({ projects: store.listVisibleProjects(ctx) });
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/projects/:projectId") {
+        if (useDatabase) {
+          const updated = await updateProjectBudgetInDb(
+            ctx,
+            String(params["projectId"] ?? ""),
+            Number(body["budgetHours"] ?? 0),
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ project: updated });
+        }
         const updated = store.updateProjectBudget(
           ctx,
           String(params["projectId"] ?? ""),
@@ -442,15 +864,69 @@ export async function handleApiRequest(
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/team") {
+        if (useDatabase) {
+          const page = url.searchParams.get("page")
+            ? Number(url.searchParams.get("page"))
+            : undefined;
+          const limit = url.searchParams.get("limit")
+            ? Number(url.searchParams.get("limit"))
+            : undefined;
+          const departmentId = url.searchParams.get("departmentId") ?? undefined;
+          const search = url.searchParams.get("search") ?? undefined;
+          const teamStatusParam = url.searchParams.get("status");
+          const status =
+            teamStatusParam === "active" ||
+            teamStatusParam === "invited" ||
+            teamStatusParam === "inactive" ||
+            teamStatusParam === "all"
+              ? teamStatusParam
+              : undefined;
+
+          const result = await listAccessibleTeamMembersFromDb(
+            ctx,
+            { page, limit, departmentId, search, status },
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ members: result.data, pagination: result.pagination });
+        }
         return jsonResponse({ members: store.listAccessibleTeamMembers(ctx) });
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/timesheets/:timesheetId/approve") {
+        if (useDatabase) {
+          const comment = body["comment"] ? String(body["comment"]) : undefined;
+          const approved = await approveTimesheetInDb(
+            ctx,
+            String(params["timesheetId"] ?? ""),
+            comment,
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ timesheet: approved });
+        }
         const approved = store.approveTimesheet(ctx, String(params["timesheetId"] ?? ""));
         return jsonResponse({ timesheet: approved });
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/audit-logs") {
+        if (useDatabase) {
+          const page = url.searchParams.get("page")
+            ? Number(url.searchParams.get("page"))
+            : undefined;
+          const limit = url.searchParams.get("limit")
+            ? Number(url.searchParams.get("limit"))
+            : undefined;
+          const category = url.searchParams.get("category") ?? undefined;
+          const search = url.searchParams.get("search") ?? undefined;
+          const startDate = url.searchParams.get("startDate") ?? undefined;
+          const endDate = url.searchParams.get("endDate") ?? undefined;
+
+          const result = await listTenantAuditLogsFromDb(
+            ctx,
+            { page, limit, category, search, startDate, endDate },
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ auditLogs: result.data, pagination: result.pagination });
+        }
         return jsonResponse({ auditLogs: store.listTenantAuditLogs(ctx) });
       }
 

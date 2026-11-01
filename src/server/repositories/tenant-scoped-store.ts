@@ -38,6 +38,7 @@ export class MultiTenantDataStore {
   private tenants = new Map<string, TenantRecord>();
   private tenantDomains = new Map<string, TenantDomainRecord>();
   private users = new Map<string, UserRecord>();
+  private userPasswordHashes = new Map<string, string>();
   private memberships = new Map<string, MembershipRecord>();
   private customRoles = new Map<string, RoleRecord>();
   private membershipRoles: MembershipRoleAssignment[] = [];
@@ -61,9 +62,28 @@ export class MultiTenantDataStore {
     return domain;
   }
 
-  public registerUser(user: UserRecord): UserRecord {
+  public registerUser(user: UserRecord, passwordHash?: string): UserRecord {
     this.users.set(user.id, user);
+    if (passwordHash) {
+      this.userPasswordHashes.set(user.id, passwordHash);
+    }
     return user;
+  }
+
+  public getUser(userId: string): UserRecord | undefined {
+    return this.users.get(userId);
+  }
+
+  public listAllUsers(): UserRecord[] {
+    return Array.from(this.users.values());
+  }
+
+  public setUserPasswordHash(userId: string, hash: string): void {
+    this.userPasswordHashes.set(userId, hash);
+  }
+
+  public getUserPasswordHash(userId: string): string | null {
+    return this.userPasswordHashes.get(userId) ?? null;
   }
 
   public createMembership(membership: MembershipRecord): MembershipRecord {

@@ -393,102 +393,89 @@ export class SessionManager {
     const newExpiresAt = now + this.sessionTtlMs;
     const newExpiresAtIso = new Date(newExpiresAt).toISOString();
 
-    return withDbTransactionLock(db, async () => {
-      await db.execute(sql`BEGIN`);
-      try {
-        const res = await db.execute(sql`
-          WITH revoked_session AS (
-            UPDATE user_sessions
-            SET revoked_at = ${nowIso}::timestamptz
-            WHERE token_hash = ${oldTokenHash}
-              AND revoked_at IS NULL
-              AND expires_at > ${nowIso}::timestamptz
-              AND last_active_at >= ${idleCutoffIso}::timestamptz
-            RETURNING
-              session_id,
-              user_id,
-              email,
-              ip_address,
-              user_agent,
-              created_at
-          )
-          INSERT INTO user_sessions (
-            session_id,
-            token_hash,
-            user_id,
-            email,
-            ip_address,
-            user_agent,
-            created_at,
-            last_active_at,
-            expires_at,
-            revoked_at
-          )
-          SELECT
-            ${newSessionId},
-            ${newTokenHash},
-            user_id,
-            email,
-            ip_address,
-            user_agent,
-            created_at,
-            ${nowIso}::timestamptz,
-            ${newExpiresAtIso}::timestamptz,
-            NULL
-          FROM revoked_session
+    return db.transaction(async (tx) => {
+      const res = await tx.execute(sql`
+        WITH revoked_session AS (
+          UPDATE user_sessions
+          SET revoked_at = ${nowIso}::timestamptz
+          WHERE token_hash = ${oldTokenHash}
+            AND revoked_at IS NULL
+            AND expires_at > ${nowIso}::timestamptz
+            AND last_active_at >= ${idleCutoffIso}::timestamptz
           RETURNING
             session_id,
-            token_hash,
             user_id,
             email,
             ip_address,
             user_agent,
-            created_at,
-            last_active_at,
-            expires_at
+            created_at
+        )
+        INSERT INTO user_sessions (
+          session_id,
+          token_hash,
+          user_id,
+          email,
+          ip_address,
+          user_agent,
+          created_at,
+          last_active_at,
+          expires_at,
+          revoked_at
+        )
+        SELECT
+          ${newSessionId},
+          ${newTokenHash},
+          user_id,
+          email,
+          ip_address,
+          user_agent,
+          created_at,
+          ${nowIso}::timestamptz,
+          ${newExpiresAtIso}::timestamptz,
+          NULL
+        FROM revoked_session
+        RETURNING
+          session_id,
+          token_hash,
+          user_id,
+          email,
+          ip_address,
+          user_agent,
+          created_at,
+          last_active_at,
+          expires_at
+      `);
+
+      const rows = (res as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+      const inserted = rows[0];
+
+      if (!inserted) {
+        // Ensure any expired/idle session with this token hash is marked revoked
+        await tx.execute(sql`
+          UPDATE user_sessions
+          SET revoked_at = ${nowIso}::timestamptz
+          WHERE token_hash = ${oldTokenHash} AND revoked_at IS NULL
         `);
-
-        const rows = (res as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
-        const inserted = rows[0];
-
-        if (!inserted) {
-          // Ensure any expired/idle session with this token hash is marked revoked
-          await db.execute(sql`
-            UPDATE user_sessions
-            SET revoked_at = ${nowIso}::timestamptz
-            WHERE token_hash = ${oldTokenHash} AND revoked_at IS NULL
-          `);
-          await db.execute(sql`COMMIT`);
-          this.destroySession(oldRawToken);
-          return null;
-        }
-
-        await db.execute(sql`COMMIT`);
-
         this.destroySession(oldRawToken);
-
-        const updatedSession: UserSession = {
-          sessionId: String(inserted["session_id"]),
-          tokenHash: String(inserted["token_hash"]),
-          userId: String(inserted["user_id"]),
-          email: String(inserted["email"]),
-          ipAddress: inserted["ip_address"] ? String(inserted["ip_address"]) : undefined,
-          userAgent: inserted["user_agent"] ? String(inserted["user_agent"]) : undefined,
-          createdAt: parseDbTimestampMs(inserted["created_at"]),
-          lastActiveAt: now,
-          expiresAt: newExpiresAt,
-        };
-
-        this.indexSessionInMemory(updatedSession);
-        return { newRawToken, session: updatedSession };
-      } catch (err) {
-        try {
-          await db.execute(sql`ROLLBACK`);
-        } catch {
-          // Ignore rollback error
-        }
-        throw err;
+        return null;
       }
+
+      this.destroySession(oldRawToken);
+
+      const updatedSession: UserSession = {
+        sessionId: String(inserted["session_id"]),
+        tokenHash: String(inserted["token_hash"]),
+        userId: String(inserted["user_id"]),
+        email: String(inserted["email"]),
+        ipAddress: inserted["ip_address"] ? String(inserted["ip_address"]) : undefined,
+        userAgent: inserted["user_agent"] ? String(inserted["user_agent"]) : undefined,
+        createdAt: parseDbTimestampMs(inserted["created_at"]),
+        lastActiveAt: now,
+        expiresAt: newExpiresAt,
+      };
+
+      this.indexSessionInMemory(updatedSession);
+      return { newRawToken, session: updatedSession };
     });
   }
 
@@ -624,7 +611,9 @@ export class SessionManager {
    * Builds the Set-Cookie header for an authenticated session.
    */
   public buildSessionCookie(rawToken: string, options?: SessionCookieOptions): string {
-    const secure = options?.secure ?? process.env["NODE_ENV"] === "production";
+    const secure =
+      options?.secure ??
+      (process.env["APP_ENV"] === "production" || process.env["NODE_ENV"] === "production");
     const sameSite = options?.sameSite ?? "Lax";
     const path = options?.path ?? "/";
     const maxAge = options?.maxAgeSeconds ?? Math.floor(this.sessionTtlMs / 1000);
@@ -648,7 +637,9 @@ export class SessionManager {
    * Builds the deletion Set-Cookie header to clear session cookies on logout.
    */
   public buildLogoutCookie(options?: { secure?: boolean; path?: string }): string {
-    const secure = options?.secure ?? process.env["NODE_ENV"] === "production";
+    const secure =
+      options?.secure ??
+      (process.env["APP_ENV"] === "production" || process.env["NODE_ENV"] === "production");
     const path = options?.path ?? "/";
 
     const parts = [

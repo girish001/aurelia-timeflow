@@ -161,70 +161,56 @@ export class PasswordResetService {
       const newPasswordHash = await hashPassword(newPassword);
       const nowIso = new Date(now).toISOString();
 
-      return withDbTransactionLock(db, async () => {
-        await db.execute(sql`BEGIN`);
-        try {
-          // 1. Atomically consume single-use token ONLY if unused and unexpired
-          const consumeRes = await db.execute(sql`
-            UPDATE password_reset_tokens
-            SET used_at = ${nowIso}::timestamptz
-            WHERE token_hash = ${tokenHash}
-              AND used_at IS NULL
-              AND expires_at > ${nowIso}::timestamptz
-            RETURNING user_id, email
-          `);
-          const rows =
-            (consumeRes as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
-          const consumedRow = rows[0];
-          if (!consumedRow) {
-            await db.execute(sql`ROLLBACK`);
-            throw new Error("Invalid or expired password reset token.");
-          }
-
-          const userId = String(consumedRow["user_id"]);
-          const tokenEmail = String(consumedRow["email"]);
-
-          // 2. Update user's password hash inside the same transaction
-          const updateUserRes = await db.execute(sql`
-            UPDATE users
-            SET password_hash = ${newPasswordHash},
-                updated_at = ${nowIso}::timestamptz
-            WHERE id = ${userId}::uuid
-              AND LOWER(email) = LOWER(${tokenEmail})
-            RETURNING id
-          `);
-          const updatedUsers =
-            (updateUserRes as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
-          if (updatedUsers.length === 0) {
-            await db.execute(sql`ROLLBACK`);
-            throw new Error("Password reset failed: target user account does not match token.");
-          }
-
-          // 3. Revoke all active sessions for the user inside the same transaction
-          await db.execute(sql`
-            UPDATE user_sessions
-            SET revoked_at = ${nowIso}::timestamptz
-            WHERE user_id = ${userId}::uuid AND revoked_at IS NULL
-          `);
-
-          await db.execute(sql`COMMIT`);
-
-          // Synchronize in-memory cache
-          const memRecord = this.resetTokens.get(tokenHash);
-          if (memRecord) {
-            memRecord.usedAt = now;
-          }
-          this.sessionManager.destroyAllUserSessions(userId);
-
-          return { userId, newPasswordHash, updatedInDb: true };
-        } catch (err) {
-          try {
-            await db.execute(sql`ROLLBACK`);
-          } catch {
-            // Ignore rollback error
-          }
-          throw err;
+      return db.transaction(async (tx) => {
+        // 1. Atomically consume single-use token ONLY if unused and unexpired
+        const consumeRes = await tx.execute(sql`
+          UPDATE password_reset_tokens
+          SET used_at = ${nowIso}::timestamptz
+          WHERE token_hash = ${tokenHash}
+            AND used_at IS NULL
+            AND expires_at > ${nowIso}::timestamptz
+          RETURNING user_id, email
+        `);
+        const rows =
+          (consumeRes as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+        const consumedRow = rows[0];
+        if (!consumedRow) {
+          throw new Error("Invalid or expired password reset token.");
         }
+
+        const userId = String(consumedRow["user_id"]);
+        const tokenEmail = String(consumedRow["email"]);
+
+        // 2. Update user's password hash inside the same transaction
+        const updateUserRes = await tx.execute(sql`
+          UPDATE users
+          SET password_hash = ${newPasswordHash},
+              updated_at = ${nowIso}::timestamptz
+          WHERE id = ${userId}::uuid
+            AND LOWER(email) = LOWER(${tokenEmail})
+          RETURNING id
+        `);
+        const updatedUsers =
+          (updateUserRes as unknown as { rows?: Array<Record<string, unknown>> }).rows ?? [];
+        if (updatedUsers.length === 0) {
+          throw new Error("Password reset failed: target user account does not match token.");
+        }
+
+        // 3. Revoke all active sessions for the user inside the same transaction
+        await tx.execute(sql`
+          UPDATE user_sessions
+          SET revoked_at = ${nowIso}::timestamptz
+          WHERE user_id = ${userId}::uuid AND revoked_at IS NULL
+        `);
+
+        // Synchronize in-memory cache
+        const memRecord = this.resetTokens.get(tokenHash);
+        if (memRecord) {
+          memRecord.usedAt = now;
+        }
+        this.sessionManager.destroyAllUserSessions(userId);
+
+        return { userId, newPasswordHash, updatedInDb: true };
       });
     }
 

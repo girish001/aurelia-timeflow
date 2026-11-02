@@ -441,6 +441,78 @@ async function safeReadJsonBody(request: Request): Promise<Record<string, unknow
   }
 }
 
+function verifyApiCsrfProtection(request: Request, url: URL): { valid: boolean; reason?: string } {
+  // Safe HTTP read methods are exempt
+  if (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS") {
+    return { valid: true };
+  }
+
+  // Token-based bearer authentication is not vulnerable to ambient browser credentials
+  const authHeader = request.headers.get("authorization") ?? "";
+  if (authHeader.toLowerCase().startsWith("bearer ")) {
+    return { valid: true };
+  }
+
+  // If request has no cookies at all, ambient browser credential risk does not apply
+  const cookieHeader = request.headers.get("cookie") ?? "";
+  if (!cookieHeader.includes("aurelia_session=")) {
+    return { valid: true };
+  }
+
+  // State-changing request authenticated via ambient cookie:
+  // 1. Check Sec-Fetch-Site (modern browsers)
+  const secFetchSite = request.headers.get("sec-fetch-site");
+  if (secFetchSite === "cross-site") {
+    return { valid: false, reason: "Cross-site request blocked by Sec-Fetch-Site policy." };
+  }
+
+  // 2. Custom headers (standard defense-in-depth: cross-site form post cannot set custom headers)
+  if (
+    request.headers.get("x-requested-with") ||
+    request.headers.get("x-aurelia-csrf") ||
+    request.headers.get("x-csrf-token")
+  ) {
+    return { valid: true };
+  }
+
+  // 3. Origin header check
+  const origin = request.headers.get("origin");
+  if (origin) {
+    try {
+      const originUrl = new URL(origin);
+      if (originUrl.host === url.host) {
+        return { valid: true };
+      }
+      // Allow localhost dev variants
+      if (
+        (originUrl.hostname === "localhost" || originUrl.hostname === "127.0.0.1") &&
+        (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+      ) {
+        return { valid: true };
+      }
+    } catch {
+      return { valid: false, reason: "Malformed Origin header in state-changing request." };
+    }
+    return { valid: false, reason: "Cross-origin request rejected." };
+  }
+
+  // If no Origin, check Referer
+  const referer = request.headers.get("referer");
+  if (referer) {
+    try {
+      const refererUrl = new URL(referer);
+      if (refererUrl.host === url.host) {
+        return { valid: true };
+      }
+    } catch {
+      return { valid: false, reason: "Malformed Referer header in state-changing request." };
+    }
+    return { valid: false, reason: "Cross-origin referer rejected." };
+  }
+
+  return { valid: true };
+}
+
 /**
  * Production API request handler registered in `src/server.ts`.
  * Returns `null` for non-`/api/v1/*` paths so TanStack Start SSR handles page routes.
@@ -460,6 +532,19 @@ export async function handleApiRequest(
   const url = new URL(request.url);
   if (!url.pathname.startsWith("/api/v1/")) {
     return null;
+  }
+
+  // CSRF Protection for state-changing endpoints authenticated via ambient cookies
+  const csrfResult = verifyApiCsrfProtection(request, url);
+  if (!csrfResult.valid) {
+    return jsonResponse(
+      {
+        error: "CSRF_DETECTED",
+        message:
+          csrfResult.reason ?? "Cross-site request forgery protection rejected this request.",
+      },
+      403,
+    );
   }
 
   const matched = matchApiRouteContract(request.method, url.pathname);

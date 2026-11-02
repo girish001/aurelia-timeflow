@@ -2019,5 +2019,63 @@ describe("Phase 2: Production Authentication & Security Remediation", { timeout:
       expect(email).toBeDefined();
       expect(email?.actionUrl).toContain("http://localhost:3000/verify-email?token=");
     });
+
+    it("enforces CSRF protection on cookie-authenticated state-changing requests and blocks cross-origin attacks", async () => {
+      const store = new MultiTenantDataStore();
+      const adminUser: UserRecord = {
+        id: "usr_csrf_test_01",
+        email: "csrf-target@company.example.com",
+        fullName: "CSRF Target",
+        status: "active",
+        isPlatformAdmin: false,
+        createdAt: "2026-03-01T00:00:00.000Z",
+      };
+      store.registerUser(adminUser, "dummy_hash");
+      const { rawToken } = defaultSessionManager.createSession(adminUser.id, adminUser.email);
+
+      // 1. Cross-site request with cookie but attacker origin is rejected with 403 CSRF_DETECTED
+      const crossSiteReq = new Request("http://localhost:3000/api/v1/auth/session/rotate", {
+        method: "POST",
+        headers: {
+          cookie: `aurelia_session=${rawToken}`,
+          origin: "https://evil-attacker.example.com",
+          "sec-fetch-site": "cross-site",
+        },
+      });
+      const crossSiteRes = await handleApiRequest(crossSiteReq, { store });
+      expect(crossSiteRes?.status).toBe(403);
+      const crossSiteBody = (await crossSiteRes?.json()) as { error?: string };
+      expect(crossSiteBody.error).toBe("CSRF_DETECTED");
+
+      // 2. Same-origin request with cookie succeeds (or proceeds past CSRF guard)
+      const sameOriginReq = new Request("http://localhost:3000/api/v1/auth/session/rotate", {
+        method: "POST",
+        headers: {
+          cookie: `aurelia_session=${rawToken}`,
+          origin: "http://localhost:3000",
+          "sec-fetch-site": "same-origin",
+        },
+      });
+      const sameOriginRes = await handleApiRequest(sameOriginReq, { store });
+      expect(sameOriginRes?.status).not.toBe(403);
+
+      // 3. Bearer token request is immune to ambient credential CSRF and bypasses CSRF check
+      const bearerReq = new Request("http://localhost:3000/api/v1/auth/session/rotate", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${rawToken}`,
+          origin: "https://external-client.example.com",
+        },
+      });
+      const bearerRes = await handleApiRequest(bearerReq, { store });
+      expect(bearerRes?.status).not.toBe(403);
+    });
+
+    it("verifies auth persistence tables are exported in Drizzle schema", async () => {
+      const dbSchema = await import("../server/db/schema");
+      expect(dbSchema.userSessions).toBeDefined();
+      expect(dbSchema.passwordResetTokens).toBeDefined();
+      expect(dbSchema.emailVerificationTokens).toBeDefined();
+    });
   });
 });

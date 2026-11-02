@@ -606,8 +606,10 @@ export async function withTenantDatabaseScope<T>(
     await client.query("BEGIN");
     transactionStarted = true;
 
-    // Step 4: Optional strict role verification (NOSUPERUSER + NOBYPASSRLS)
-    if (options?.enforceLeastPrivilegeRole) {
+    // Step 4: Strict role verification (NOSUPERUSER + NOBYPASSRLS) in production or when explicitly enabled
+    const shouldEnforceLeastPrivilege =
+      options?.enforceLeastPrivilegeRole ?? getAppEnvironment(options?.env) === "production";
+    if (shouldEnforceLeastPrivilege) {
       await assertApplicationDatabaseRoleSecurity(client);
     }
 

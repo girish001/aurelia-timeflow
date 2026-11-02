@@ -41,6 +41,7 @@ import {
   AlertDialogTrigger,
 } from "@/components/ui/alert-dialog";
 import { Initials, Logo } from "./common";
+import { logoutServerSession } from "@/lib/auth-client";
 import {
   endDemoSession,
   resetDemo,
@@ -251,6 +252,7 @@ function SidebarBody({
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
+  const navigate = useNavigate();
   const [mobileOpen, setMobileOpen] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const me = useMe();
@@ -509,15 +511,22 @@ export function AppShell({ children }: { children: ReactNode }) {
                         size="sm"
                         className="w-full justify-start text-xs"
                       >
-                        <Link to="/login">Full demo login page</Link>
+                        <Link to="/login">Switch workspace / Login</Link>
                       </Button>
                       <Button
                         variant="ghost"
                         size="sm"
-                        onClick={() => endDemoSession()}
+                        onClick={async () => {
+                          try {
+                            await logoutServerSession();
+                          } finally {
+                            endDemoSession();
+                            void navigate({ to: "/login" });
+                          }
+                        }}
                         className="w-full justify-start text-xs text-destructive hover:text-destructive"
                       >
-                        Exit demo session
+                        Sign out / Exit session
                       </Button>
                     </div>
                   </PopoverContent>

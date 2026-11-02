@@ -19,13 +19,19 @@ import {
 } from "../onboarding/onboarding-service";
 import {
   approveTimesheetInDb,
+  getTimesheetForWeekFromDb,
   listAccessibleTeamMembersFromDb,
+  listApprovalsFromDb,
   listProjectsFromDb,
   listTenantAuditLogsFromDb,
   listUserTenantsFromDb,
   registerCompanyInDb,
+  rejectTimesheetInDb,
+  submitTimesheetInDb,
   updateProjectBudgetInDb,
+  upsertTimesheetInDb,
   verifyCompanyAdminEmailInDb,
+  type TimesheetEntryInput,
 } from "../repositories/postgres-tenant-store";
 import { MultiTenantDataStore } from "../repositories/tenant-scoped-store";
 import {
@@ -220,12 +226,41 @@ export const API_ROUTE_CONTRACTS: ApiRouteContract[] = [
     description: "Lists tenant members scoped to caller's HR reporting hierarchy or admin scope.",
   },
   {
+    method: "GET",
+    path: "/api/v1/tenants/:tenantId/timesheets/week/:weekKey",
+    scope: "tenant_scoped",
+    requiredPermission: "timesheet:submit:own",
+    description:
+      "Retrieves timesheet and entries for the specified week and target membership (defaults to caller).",
+  },
+  {
+    method: "PUT",
+    path: "/api/v1/tenants/:tenantId/timesheets/week/:weekKey",
+    scope: "tenant_scoped",
+    requiredPermission: "timesheet:submit:own",
+    description: "Creates or updates draft timesheet entries for a specified week and member.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/tenants/:tenantId/timesheets/:timesheetId/submit",
+    scope: "tenant_scoped",
+    requiredPermission: "timesheet:submit:own",
+    description: "Submits a draft or rejected timesheet for manager review.",
+  },
+  {
     method: "POST",
     path: "/api/v1/tenants/:tenantId/timesheets/:timesheetId/approve",
     scope: "tenant_scoped",
     requiredPermission: "timesheet:approve:team",
     description:
       "Approves a submitted timesheet; validates HR reporting line or project-level approver permission.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/tenants/:tenantId/timesheets/:timesheetId/reject",
+    scope: "tenant_scoped",
+    requiredPermission: "timesheet:approve:team",
+    description: "Rejects a submitted timesheet with mandatory review comment.",
   },
   {
     method: "GET",
@@ -773,26 +808,40 @@ export async function handleApiRequest(
       const userAgent = request.headers.get("user-agent") ?? undefined;
       const isSecureRequest = url.protocol === "https:";
 
-      const loginResult = await defaultAuthService.login(
-        {
-          email,
-          password,
-          ipAddress,
-          userAgent,
-        },
-        { db: targetDb, store, isSecureRequest, env },
-      );
+      try {
+        const loginResult = await defaultAuthService.login(
+          {
+            email,
+            password,
+            ipAddress,
+            userAgent,
+          },
+          { db: targetDb, store, isSecureRequest, env },
+        );
 
-      return jsonResponse(
-        {
-          user: loginResult.user,
-          session: loginResult.session,
-          sessionToken: loginResult.sessionToken,
-          tenants: loginResult.tenants,
-        },
-        200,
-        { "set-cookie": loginResult.setCookieHeader },
-      );
+        return jsonResponse(
+          {
+            authenticated: true,
+            user: loginResult.user,
+            session: loginResult.session,
+            sessionToken: loginResult.sessionToken,
+            tenants: loginResult.tenants,
+          },
+          200,
+          { "set-cookie": loginResult.setCookieHeader },
+        );
+      } catch (err) {
+        if (err instanceof AuthorizationError) {
+          return jsonResponse(
+            {
+              error: "UNAUTHENTICATED",
+              message: err.message,
+            },
+            401,
+          );
+        }
+        throw err;
+      }
     }
 
     if (contract.path === "/api/v1/auth/logout") {
@@ -1006,7 +1055,30 @@ export async function handleApiRequest(
     const userId = identity.userId;
 
     if (contract.path === "/api/v1/auth/session") {
-      return jsonResponse({ authenticated: true, session: identity.session });
+      const serverUser = await resolveVerifiedServerUser(userId, {
+        db: targetDb,
+        store,
+        env,
+      });
+      const tenants =
+        useDatabase && targetDb
+          ? await listUserTenantsFromDb(targetDb, userId)
+          : store.listUserTenants(userId);
+
+      return jsonResponse({
+        authenticated: true,
+        session: identity.session,
+        user: serverUser
+          ? {
+              id: serverUser.id,
+              email: serverUser.email,
+              fullName: serverUser.fullName,
+              status: serverUser.status,
+              isPlatformAdmin: serverUser.isPlatformAdmin,
+            }
+          : null,
+        tenants,
+      });
     }
 
     if (contract.path === "/api/v1/auth/session/rotate") {
@@ -1258,6 +1330,62 @@ export async function handleApiRequest(
         return jsonResponse({ members: store.listAccessibleTeamMembers(ctx) });
       }
 
+      if (
+        contract.method === "GET" &&
+        contract.path === "/api/v1/tenants/:tenantId/timesheets/week/:weekKey"
+      ) {
+        const weekKeyParam = String(params["weekKey"] ?? "");
+        const targetMembershipId = url.searchParams.get("membershipId") || ctx.membership.id;
+        if (useDatabase) {
+          const timesheet = await getTimesheetForWeekFromDb(ctx, targetMembershipId, weekKeyParam, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ timesheet });
+        }
+        const timesheet = store.getTimesheetForWeek(ctx, targetMembershipId, weekKeyParam);
+        return jsonResponse({ timesheet });
+      }
+
+      if (
+        contract.method === "PUT" &&
+        contract.path === "/api/v1/tenants/:tenantId/timesheets/week/:weekKey"
+      ) {
+        const weekKeyParam = String(params["weekKey"] ?? "");
+        const targetMembershipId =
+          (body["membershipId"] ? String(body["membershipId"]) : null) || ctx.membership.id;
+        const entries = (
+          Array.isArray(body["entries"]) ? body["entries"] : []
+        ) as TimesheetEntryInput[];
+        if (useDatabase) {
+          const timesheet = await upsertTimesheetInDb(
+            ctx,
+            targetMembershipId,
+            { weekStart: weekKeyParam, entries },
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ timesheet });
+        }
+        const timesheet = store.upsertTimesheet(ctx, targetMembershipId, {
+          weekStart: weekKeyParam,
+          entries,
+        });
+        return jsonResponse({ timesheet });
+      }
+
+      if (contract.path === "/api/v1/tenants/:tenantId/timesheets/:timesheetId/submit") {
+        const timesheetId = String(params["timesheetId"] ?? "");
+        if (useDatabase) {
+          const submitted = await submitTimesheetInDb(ctx, timesheetId, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ timesheet: submitted });
+        }
+        const submitted = store.submitTimesheet(ctx, timesheetId);
+        return jsonResponse({ timesheet: submitted });
+      }
+
       if (contract.path === "/api/v1/tenants/:tenantId/timesheets/:timesheetId/approve") {
         if (useDatabase) {
           const comment = body["comment"] ? String(body["comment"]) : undefined;
@@ -1271,6 +1399,30 @@ export async function handleApiRequest(
         }
         const approved = store.approveTimesheet(ctx, String(params["timesheetId"] ?? ""));
         return jsonResponse({ timesheet: approved });
+      }
+
+      if (contract.path === "/api/v1/tenants/:tenantId/timesheets/:timesheetId/reject") {
+        const comment = String(body["comment"] ?? body["rejectionComment"] ?? "").trim();
+        if (!comment || comment.length < 3) {
+          return jsonResponse(
+            {
+              error: "VALIDATION_ERROR",
+              message: "A rejection comment of at least 3 characters is required.",
+            },
+            400,
+          );
+        }
+        if (useDatabase) {
+          const rejected = await rejectTimesheetInDb(
+            ctx,
+            String(params["timesheetId"] ?? ""),
+            comment,
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse({ timesheet: rejected });
+        }
+        const rejected = store.rejectTimesheet(ctx, String(params["timesheetId"] ?? ""), comment);
+        return jsonResponse({ timesheet: rejected });
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/audit-logs") {
@@ -1297,7 +1449,22 @@ export async function handleApiRequest(
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/approvals") {
-        return jsonResponse({ tenantId: ctx.tenant.id, approvals: [] });
+        if (useDatabase) {
+          const result = await listApprovalsFromDb(ctx, { pool: targetPool, env: options?.env });
+          return jsonResponse({
+            tenantId: ctx.tenant.id,
+            approvals: result.pending,
+            pending: result.pending,
+            history: result.history,
+          });
+        }
+        const result = store.listApprovals(ctx);
+        return jsonResponse({
+          tenantId: ctx.tenant.id,
+          approvals: result.pending,
+          pending: result.pending,
+          history: result.history,
+        });
       }
     }
 

@@ -975,6 +975,517 @@ export async function rejectTimesheetInDb(
   );
 }
 
+export interface TimesheetEntryInput {
+  id?: string;
+  projectId: string;
+  taskName: string;
+  hoursByDay: number[];
+  billable?: boolean;
+  notes?: string;
+}
+
+export interface DetailedTimesheetEntry {
+  id: string;
+  timesheetId: string;
+  projectId: string;
+  projectName: string;
+  taskName: string;
+  hoursByDay: number[];
+  billable: boolean;
+  notes: string;
+}
+
+export interface DetailedTimesheet {
+  id: string;
+  tenantId: string;
+  membershipId: string;
+  weekStart: string;
+  status: "draft" | "submitted" | "approved" | "rejected";
+  submittedAt: string | null;
+  reviewedAt: string | null;
+  reviewedByMembershipId: string | null;
+  reviewComment: string | null;
+  totalHours: number;
+  entries: DetailedTimesheetEntry[];
+}
+
+export interface ApprovalItem {
+  id: string;
+  timesheetId: string;
+  membershipId: string;
+  memberName: string;
+  memberEmail: string;
+  jobTitle: string;
+  weekStart: string;
+  totalHours: number;
+  submittedAt: string | null;
+  entries: Array<{
+    id: string;
+    projectId: string;
+    projectName: string;
+    taskName: string;
+    hoursByDay: number[];
+    billable: boolean;
+    notes: string;
+  }>;
+}
+
+export interface ApprovalHistoryItem {
+  id: string;
+  targetType: "timesheet" | "leave_request";
+  targetId: string;
+  requesterMembershipId: string;
+  requesterName: string;
+  approverMembershipId: string | null;
+  approverName: string | null;
+  status: "approved" | "rejected";
+  comment: string | null;
+  decidedAt: string | null;
+}
+
+/**
+ * Retrieves a detailed timesheet with its line entries for a given week.
+ */
+export async function getTimesheetForWeekFromDb(
+  ctx: ResolvedTenantContext,
+  targetMembershipId: string,
+  weekStart: string,
+  scopeOptions?: ScopeOptions,
+): Promise<DetailedTimesheet | null> {
+  const isSelf = ctx.membership.id === targetMembershipId;
+  const isManagerOrAdmin =
+    ctx.roleKeys.has("business_admin") ||
+    ctx.permissions.has("tenant:settings:manage") ||
+    (ctx.permissions.has("timesheet:read:team") &&
+      ctx.directReportMembershipIds.has(targetMembershipId));
+
+  if (!isSelf && !isManagerOrAdmin) {
+    throw new AuthorizationError("You do not have permission to view this timesheet.");
+  }
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const tsRows = await db
+        .select()
+        .from(schema.timesheets)
+        .where(
+          and(
+            eq(schema.timesheets.tenantId, verifiedTenantId),
+            eq(schema.timesheets.membershipId, targetMembershipId),
+            eq(schema.timesheets.weekStart, weekStart),
+          ),
+        )
+        .limit(1);
+
+      const ts = tsRows[0];
+      if (!ts) return null;
+
+      const entryRows = await db
+        .select({
+          entry: schema.timesheetEntries,
+          projectName: schema.projects.name,
+        })
+        .from(schema.timesheetEntries)
+        .leftJoin(
+          schema.projects,
+          and(
+            eq(schema.projects.tenantId, verifiedTenantId),
+            eq(schema.projects.id, schema.timesheetEntries.projectId),
+          ),
+        )
+        .where(
+          and(
+            eq(schema.timesheetEntries.tenantId, verifiedTenantId),
+            eq(schema.timesheetEntries.timesheetId, ts.id),
+          ),
+        );
+
+      let totalHours = 0;
+      const entries: DetailedTimesheetEntry[] = entryRows.map(({ entry, projectName }) => {
+        const hours = Array.isArray(entry.hoursByDayJson)
+          ? entry.hoursByDayJson
+          : [0, 0, 0, 0, 0, 0, 0];
+        const entrySum = hours.reduce((acc, h) => acc + (typeof h === "number" ? h : 0), 0);
+        totalHours += entrySum;
+        return {
+          id: entry.id,
+          timesheetId: entry.timesheetId,
+          projectId: entry.projectId,
+          projectName: projectName ?? "General",
+          taskName: entry.taskName,
+          hoursByDay: hours,
+          billable: entry.billable,
+          notes: entry.notes,
+        };
+      });
+
+      return {
+        id: ts.id,
+        tenantId: ts.tenantId,
+        membershipId: ts.membershipId,
+        weekStart: String(ts.weekStart),
+        status: ts.status,
+        submittedAt: ts.submittedAt ? ts.submittedAt.toISOString() : null,
+        reviewedAt: ts.reviewedAt ? ts.reviewedAt.toISOString() : null,
+        reviewedByMembershipId: ts.reviewedByMembershipId,
+        reviewComment: ts.reviewComment,
+        totalHours: Math.round(totalHours * 100) / 100,
+        entries,
+      };
+    },
+    scopeOptions,
+  );
+}
+
+/**
+ * Creates or updates draft timesheet entries for a specified week.
+ */
+export async function upsertTimesheetInDb(
+  ctx: ResolvedTenantContext,
+  targetMembershipId: string,
+  input: {
+    weekStart: string;
+    entries: TimesheetEntryInput[];
+  },
+  scopeOptions?: ScopeOptions,
+): Promise<DetailedTimesheet> {
+  const isSelf = ctx.membership.id === targetMembershipId;
+  const isAdmin =
+    ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:settings:manage");
+
+  if (!isSelf && !isAdmin) {
+    throw new AuthorizationError("You can only edit your own timesheets.");
+  }
+
+  for (const entry of input.entries) {
+    if (!entry.projectId) {
+      throw new Error("Project is required for all timesheet entries.");
+    }
+    if (!entry.taskName?.trim()) {
+      throw new Error("Task name is required for all timesheet entries.");
+    }
+    if (!Array.isArray(entry.hoursByDay) || entry.hoursByDay.length !== 7) {
+      throw new Error("Each timesheet entry must contain 7 daily hour values.");
+    }
+    for (const h of entry.hoursByDay) {
+      if (typeof h !== "number" || isNaN(h) || h < 0 || h > 24) {
+        throw new Error("Daily hours must be between 0 and 24.");
+      }
+    }
+  }
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const existingRows = await db
+        .select()
+        .from(schema.timesheets)
+        .where(
+          and(
+            eq(schema.timesheets.tenantId, verifiedTenantId),
+            eq(schema.timesheets.membershipId, targetMembershipId),
+            eq(schema.timesheets.weekStart, input.weekStart),
+          ),
+        )
+        .limit(1);
+
+      const existing = existingRows[0];
+      if (existing && existing.status === "approved") {
+        throw new AuthorizationError("Cannot modify an approved timesheet.");
+      }
+
+      const now = new Date();
+      let timesheetId = existing?.id;
+
+      if (existing) {
+        const newStatus = existing.status === "rejected" ? "draft" : existing.status;
+        await db
+          .update(schema.timesheets)
+          .set({
+            status: newStatus,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(schema.timesheets.tenantId, verifiedTenantId),
+              eq(schema.timesheets.id, existing.id),
+            ),
+          );
+
+        await db
+          .delete(schema.timesheetEntries)
+          .where(
+            and(
+              eq(schema.timesheetEntries.tenantId, verifiedTenantId),
+              eq(schema.timesheetEntries.timesheetId, existing.id),
+            ),
+          );
+      } else {
+        const [inserted] = await db
+          .insert(schema.timesheets)
+          .values({
+            tenantId: verifiedTenantId,
+            membershipId: targetMembershipId,
+            weekStart: input.weekStart,
+            status: "draft",
+            createdAt: now,
+            updatedAt: now,
+          })
+          .returning();
+        if (!inserted) {
+          throw new Error("Failed to insert draft timesheet.");
+        }
+        timesheetId = inserted.id;
+      }
+
+      if (input.entries.length > 0 && timesheetId) {
+        await db.insert(schema.timesheetEntries).values(
+          input.entries.map((e) => ({
+            tenantId: verifiedTenantId,
+            timesheetId,
+            projectId: e.projectId,
+            taskName: e.taskName.trim(),
+            hoursByDayJson: e.hoursByDay,
+            billable: e.billable ?? true,
+            notes: e.notes?.trim() ?? "",
+          })),
+        );
+      }
+
+      const updated = await getTimesheetForWeekFromDb(
+        ctx,
+        targetMembershipId,
+        input.weekStart,
+        scopeOptions,
+      );
+      if (!updated) {
+        throw new Error("Failed to retrieve updated timesheet.");
+      }
+      return updated;
+    },
+    scopeOptions,
+  );
+}
+
+/**
+ * Submits a draft or rejected timesheet for manager review.
+ */
+export async function submitTimesheetInDb(
+  ctx: ResolvedTenantContext,
+  timesheetId: string,
+  scopeOptions?: ScopeOptions,
+): Promise<DetailedTimesheet> {
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const tsRows = await db
+        .select()
+        .from(schema.timesheets)
+        .where(
+          and(
+            eq(schema.timesheets.tenantId, verifiedTenantId),
+            eq(schema.timesheets.id, timesheetId),
+          ),
+        )
+        .limit(1);
+
+      const ts = tsRows[0];
+      if (!ts) {
+        throw new Error(`Timesheet ${timesheetId} not found.`);
+      }
+
+      const isSelf = ctx.membership.id === ts.membershipId;
+      const isAdmin =
+        ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:settings:manage");
+      if (!isSelf && !isAdmin) {
+        throw new AuthorizationError("You can only submit your own timesheet.");
+      }
+
+      if (ts.status === "approved") {
+        throw new Error("Timesheet is already approved.");
+      }
+      if (ts.status === "submitted") {
+        throw new Error("Timesheet is already submitted.");
+      }
+
+      const now = new Date();
+      await db
+        .update(schema.timesheets)
+        .set({
+          status: "submitted",
+          submittedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(schema.timesheets.tenantId, verifiedTenantId),
+            eq(schema.timesheets.id, timesheetId),
+          ),
+        );
+
+      await recordAuditLogToDb(db, {
+        tenantId: verifiedTenantId,
+        actorUserId: ctx.user.id,
+        actorMembershipId: ctx.membership.id,
+        impersonatedByPlatformUserId: ctx.impersonatedByPlatformUserId,
+        category: "timesheet",
+        action: "timesheet.submitted",
+        targetType: "timesheet",
+        targetId: timesheetId,
+        metadata: { weekStart: String(ts.weekStart) },
+      });
+
+      const updated = await getTimesheetForWeekFromDb(
+        ctx,
+        ts.membershipId,
+        String(ts.weekStart),
+        scopeOptions,
+      );
+      if (!updated) {
+        throw new Error("Failed to retrieve submitted timesheet.");
+      }
+      return updated;
+    },
+    scopeOptions,
+  );
+}
+
+/**
+ * Lists pending timesheet approvals and recent approval history.
+ */
+export async function listApprovalsFromDb(
+  ctx: ResolvedTenantContext,
+  scopeOptions?: ScopeOptions,
+): Promise<{
+  pending: ApprovalItem[];
+  history: ApprovalHistoryItem[];
+}> {
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const isBusinessAdmin =
+        ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:settings:manage");
+
+      const submittedSheets = await db
+        .select({
+          timesheet: schema.timesheets,
+          membership: schema.memberships,
+          user: schema.users,
+        })
+        .from(schema.timesheets)
+        .innerJoin(
+          schema.memberships,
+          and(
+            eq(schema.memberships.tenantId, verifiedTenantId),
+            eq(schema.memberships.id, schema.timesheets.membershipId),
+          ),
+        )
+        .innerJoin(schema.users, eq(schema.users.id, schema.memberships.userId))
+        .where(
+          and(
+            eq(schema.timesheets.tenantId, verifiedTenantId),
+            eq(schema.timesheets.status, "submitted"),
+          ),
+        )
+        .orderBy(desc(schema.timesheets.submittedAt));
+
+      const authorizedSheets = submittedSheets.filter((row) => {
+        if (isBusinessAdmin) return true;
+        return ctx.directReportMembershipIds.has(row.timesheet.membershipId);
+      });
+
+      const pending: ApprovalItem[] = [];
+      for (const row of authorizedSheets) {
+        const entries = await db
+          .select({
+            entry: schema.timesheetEntries,
+            projectName: schema.projects.name,
+          })
+          .from(schema.timesheetEntries)
+          .leftJoin(
+            schema.projects,
+            and(
+              eq(schema.projects.tenantId, verifiedTenantId),
+              eq(schema.projects.id, schema.timesheetEntries.projectId),
+            ),
+          )
+          .where(
+            and(
+              eq(schema.timesheetEntries.tenantId, verifiedTenantId),
+              eq(schema.timesheetEntries.timesheetId, row.timesheet.id),
+            ),
+          );
+
+        let totalHours = 0;
+        const mappedEntries = entries.map(({ entry, projectName }) => {
+          const hours = Array.isArray(entry.hoursByDayJson)
+            ? entry.hoursByDayJson
+            : [0, 0, 0, 0, 0, 0, 0];
+          const entrySum = hours.reduce((acc, h) => acc + (typeof h === "number" ? h : 0), 0);
+          totalHours += entrySum;
+          return {
+            id: entry.id,
+            projectId: entry.projectId,
+            projectName: projectName ?? "General",
+            taskName: entry.taskName,
+            hoursByDay: hours,
+            billable: entry.billable,
+            notes: entry.notes,
+          };
+        });
+
+        pending.push({
+          id: row.timesheet.id,
+          timesheetId: row.timesheet.id,
+          membershipId: row.membership.id,
+          memberName: row.user.fullName,
+          memberEmail: row.user.email,
+          jobTitle: row.membership.jobTitle,
+          weekStart: String(row.timesheet.weekStart),
+          totalHours: Math.round(totalHours * 100) / 100,
+          submittedAt: row.timesheet.submittedAt ? row.timesheet.submittedAt.toISOString() : null,
+          entries: mappedEntries,
+        });
+      }
+
+      const approvalRows = await db
+        .select({
+          approval: schema.approvals,
+          requesterUser: schema.users,
+        })
+        .from(schema.approvals)
+        .innerJoin(
+          schema.memberships,
+          and(
+            eq(schema.memberships.tenantId, verifiedTenantId),
+            eq(schema.memberships.id, schema.approvals.requesterMembershipId),
+          ),
+        )
+        .innerJoin(schema.users, eq(schema.users.id, schema.memberships.userId))
+        .where(eq(schema.approvals.tenantId, verifiedTenantId))
+        .orderBy(desc(schema.approvals.createdAt))
+        .limit(50);
+
+      const history: ApprovalHistoryItem[] = approvalRows.map(({ approval, requesterUser }) => ({
+        id: approval.id,
+        targetType: approval.targetType,
+        targetId: approval.targetId,
+        requesterMembershipId: approval.requesterMembershipId,
+        requesterName: requesterUser.fullName,
+        approverMembershipId: approval.approverMembershipId,
+        approverName: null,
+        status: approval.status as "approved" | "rejected",
+        comment: approval.comment,
+        decidedAt: approval.decidedAt ? approval.decidedAt.toISOString() : null,
+      }));
+
+      return { pending, history };
+    },
+    scopeOptions,
+  );
+}
+
 /**
  * Lists tenant audit logs with pagination, category filter, and search.
  * Strictly checks `audit:read:tenant` permission.

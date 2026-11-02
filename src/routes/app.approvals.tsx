@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useState, useMemo } from "react";
+import { useState, useMemo, useEffect } from "react";
 import { format, parseISO } from "date-fns";
 import {
   Check,
@@ -42,11 +42,13 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyState, Initials, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
+import { apiFetchApprovals, apiApproveTimesheet, apiRejectTimesheet } from "@/lib/timesheet-api";
 import {
   entryTotal,
   reviewTimesheet,
   bulkReviewTimesheets,
   sheetTotal,
+  upsertTimesheet,
   useDemo,
   useMe,
   setLeave,
@@ -111,6 +113,37 @@ export function Approvals() {
   const fmt = s.settings.timeFormat;
   const member = (id: string) => s.members.find((m) => m.id === id);
   const project = (id: string) => s.projects.find((p) => p.id === id);
+
+  useEffect(() => {
+    let mounted = true;
+    apiFetchApprovals()
+      .then((res) => {
+        if (!mounted || !res.pending) return;
+        res.pending.forEach((item) => {
+          upsertTimesheet({
+            id: item.timesheetId,
+            memberId: item.membershipId,
+            weekStart: item.weekStart,
+            status: "submitted",
+            submittedAt: item.submittedAt ?? undefined,
+            entries: item.entries.map((e) => ({
+              id: e.id,
+              projectId: e.projectId,
+              task: e.taskName,
+              hours: e.hoursByDay,
+              billable: e.billable,
+              notes: e.notes,
+            })),
+          });
+        });
+      })
+      .catch((err) => {
+        console.warn("Backend approvals fetch note:", err);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // ----------------- Scoped Timesheets -----------------
   const approvableTs = useMemo(() => approvableTimesheets(s, me), [s, me]);
@@ -211,7 +244,24 @@ export function Approvals() {
       return;
     }
 
-    reviewTimesheet(openTs.id, decision, tsComment.trim(), me.id, me.name);
+    const targetTsId = openTs.id;
+    const comment = tsComment.trim();
+
+    reviewTimesheet(targetTsId, decision, comment, me.id, me.name);
+
+    // Call backend API in background
+    void (async () => {
+      try {
+        if (decision === "approved") {
+          await apiApproveTimesheet(targetTsId, comment);
+        } else {
+          await apiRejectTimesheet(targetTsId, comment);
+        }
+      } catch (err) {
+        console.warn("Backend timesheet decision API notice:", err);
+      }
+    })();
+
     toast.success(`${member(openTs.memberId)?.name}'s timesheet ${decision}`);
     setOpenTsId(null);
     setTsComment("");
@@ -231,6 +281,13 @@ export function Approvals() {
     }
 
     bulkReviewTimesheets(validIds, "approved", me.id, me.name, "Bulk approved by manager");
+
+    validIds.forEach((id) => {
+      apiApproveTimesheet(id, "Bulk approved by manager").catch((err) => {
+        console.warn("Bulk approval sync note:", err);
+      });
+    });
+
     toast.success(`Approved ${validIds.length} timesheets successfully`);
     setSelectedTsIds([]);
   };

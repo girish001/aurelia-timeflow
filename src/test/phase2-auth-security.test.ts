@@ -38,6 +38,7 @@ import {
   verifyCompanyAdminEmailInDb,
 } from "../server/repositories/postgres-tenant-store";
 import { MultiTenantDataStore } from "../server/repositories/tenant-scoped-store";
+import type { UserRecord } from "../server/tenancy/tenant-context";
 
 describe("Phase 2: Production Authentication & Security Remediation", { timeout: 30000 }, () => {
   let store: MultiTenantDataStore;
@@ -2028,7 +2029,7 @@ describe("Phase 2: Production Authentication & Security Remediation", { timeout:
         fullName: "CSRF Target",
         status: "active",
         isPlatformAdmin: false,
-        createdAt: "2026-03-01T00:00:00.000Z",
+        emailVerifiedAt: "2026-03-01T00:00:00.000Z",
       };
       store.registerUser(adminUser, "dummy_hash");
       const { rawToken } = defaultSessionManager.createSession(adminUser.id, adminUser.email);

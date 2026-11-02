@@ -1,18 +1,22 @@
 import { createFileRoute, Link, Navigate, Outlet, useRouterState } from "@tanstack/react-router";
-import { useEffect } from "react";
-import { ShieldOff } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Loader2, ShieldOff } from "lucide-react";
 import { AppShell } from "@/components/app/AppShell";
 import { Button } from "@/components/ui/button";
+import {
+  checkServerSession,
+  isProductionEnvironment,
+  type AuthSessionResponse,
+} from "@/lib/auth-client";
 import { useMe, useSessionId, useDemo, getState, type State, type Member } from "@/lib/demo-store";
 import { canAccess, pageFromPath, ROLE_LABEL } from "@/lib/rules";
 import { weekKey } from "@/lib/time";
 
-// Client-only: demo data and the demo persona live in this browser's localStorage.
 export const Route = createFileRoute("/app")({
   ssr: false,
   pendingComponent: () => (
     <div className="grid min-h-screen place-items-center text-sm text-muted-foreground">
-      Loading demo workspace…
+      Loading workspace…
     </div>
   ),
   component: AppLayout,
@@ -25,6 +29,7 @@ function logAppDiagnostics(params: {
   page: string | null;
   allowed: boolean;
   state: State;
+  isRealSession: boolean;
 }) {
   const currentWeek = weekKey(new Date());
   const activeSheet = params.state.timesheets.find(
@@ -33,7 +38,7 @@ function logAppDiagnostics(params: {
 
   if (console.groupCollapsed) {
     console.groupCollapsed(
-      `%c[TimeFlow Diagnostics] Session & State Loaded%c (${params.me.name || "Unknown"} · ${params.me.role || "No Role"})`,
+      `%c[TimeFlow Diagnostics] Session & State Loaded%c (${params.me.name || "Unknown"} · ${params.me.role || "No Role"})${params.isRealSession ? " [SERVER AUTH]" : " [DEMO]"}`,
       "color: #0d9488; font-weight: bold;",
       "color: gray; font-weight: normal;",
     );
@@ -43,10 +48,10 @@ function logAppDiagnostics(params: {
 
   console.log("Timestamp:", new Date().toISOString());
   console.log("Route Path:", params.path, "| Page:", params.page, "| Allowed:", params.allowed);
-  console.log("Session State:", {
-    sessionId: params.sessionId,
-    hasValidSession: Boolean(params.sessionId && params.me.id),
-  });
+  console.log(
+    "Auth Mode:",
+    params.isRealSession ? "Real Server Session" : "Local Development Sandbox",
+  );
   console.log("Active User Persona:", {
     id: params.me.id,
     name: params.me.name,
@@ -54,23 +59,6 @@ function logAppDiagnostics(params: {
     role: params.me.role,
     title: params.me.title,
     department: params.me.department,
-    reportingManagerId: params.me.reportingManagerId,
-  });
-  console.log("Store Snapshot:", {
-    clientsCount: params.state.clients.length,
-    projectsCount: params.state.projects.length,
-    membersCount: params.state.members.length,
-    timesheetsCount: params.state.timesheets.length,
-    leavesCount: params.state.leaves.length,
-    allocationsCount: params.state.allocations.length,
-    auditLogsCount: params.state.auditLogs.length,
-    notificationsCount: params.state.notifications.length,
-  });
-  console.log("Active Week Coverage:", {
-    currentWeek,
-    hasActiveWeekTimesheet: Boolean(activeSheet),
-    activeWeekStatus: activeSheet?.status ?? "none",
-    activeWeekEntriesCount: activeSheet?.entries.length ?? 0,
   });
 
   if (console.groupEnd) {
@@ -79,6 +67,10 @@ function logAppDiagnostics(params: {
 }
 
 function AppLayout() {
+  const isProd = isProductionEnvironment();
+  const [sessionChecking, setSessionChecking] = useState(true);
+  const [serverSession, setServerSession] = useState<AuthSessionResponse | null>(null);
+
   const sessionId = useSessionId();
   const me = useMe();
   const state = useDemo((s) => s);
@@ -87,24 +79,73 @@ function AppLayout() {
   const allowed = !page || canAccess(me.role, page);
 
   useEffect(() => {
-    if (sessionId && me.id) {
-      logAppDiagnostics({ sessionId, me, path, page, allowed, state });
-      if (typeof window !== "undefined") {
-        (window as unknown as { __TIMEFLOW_DIAGNOSTICS__?: () => void }).__TIMEFLOW_DIAGNOSTICS__ =
-          () => {
-            logAppDiagnostics({ sessionId, me, path, page, allowed, state: getState() });
-          };
-      }
-    } else {
-      console.warn("[TimeFlow Diagnostics] Unauthenticated /app access attempt:", {
-        sessionId,
-        hasMemberId: Boolean(me.id),
-        redirectingTo: "/login",
+    let mounted = true;
+    checkServerSession()
+      .then((session) => {
+        if (!mounted) return;
+        setServerSession(session);
+        setSessionChecking(false);
+      })
+      .catch(() => {
+        if (!mounted) return;
+        setServerSession(null);
+        setSessionChecking(false);
+      });
+
+    return () => {
+      mounted = false;
+    };
+  }, []);
+
+  const hasValidServerSession = Boolean(serverSession?.authenticated);
+  const hasValidDemoSession = Boolean(!isProd && sessionId && me.id);
+  const isAuthenticated = hasValidServerSession || hasValidDemoSession;
+
+  useEffect(() => {
+    if (!sessionChecking && isAuthenticated) {
+      logAppDiagnostics({
+        sessionId: hasValidServerSession ? (serverSession?.session?.id ?? sessionId) : sessionId,
+        me,
+        path,
+        page,
+        allowed,
+        state,
+        isRealSession: hasValidServerSession,
       });
     }
-  }, [sessionId, me, path, page, allowed, state]);
+  }, [
+    sessionChecking,
+    isAuthenticated,
+    hasValidServerSession,
+    serverSession,
+    sessionId,
+    me,
+    path,
+    page,
+    allowed,
+    state,
+  ]);
 
-  if (!sessionId || !me.id) return <Navigate to="/login" />;
+  if (sessionChecking) {
+    return (
+      <div className="grid min-h-screen place-items-center bg-background text-sm text-muted-foreground">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="size-8 animate-spin text-primary" />
+          <p className="font-medium">Validating workspace session…</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Production strictly prohibits demo sessions — must have real server authentication
+  if (isProd && !hasValidServerSession) {
+    return <Navigate to="/login" />;
+  }
+
+  // Development requires either server session or dev demo session
+  if (!isAuthenticated) {
+    return <Navigate to="/login" />;
+  }
 
   return (
     <AppShell>
@@ -120,8 +161,8 @@ function AppLayout() {
           </span>
           <h1 className="mt-3 text-lg font-semibold">Not available for {ROLE_LABEL[me.role]}</h1>
           <p className="mt-1 text-sm text-muted-foreground">
-            This page is hidden for your demo role. (Demo guard only — real access control must be
-            enforced on the server.)
+            This page is restricted for your role. Contact your organization administrator for
+            access.
           </p>
           <Button asChild className="mt-5">
             <Link to="/app">Go to my dashboard</Link>

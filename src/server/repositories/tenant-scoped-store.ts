@@ -8,6 +8,13 @@ import {
   canViewProject,
   SYSTEM_ROLE_PERMISSIONS,
 } from "../authz/rbac";
+import type {
+  ApprovalHistoryItem,
+  ApprovalItem,
+  DetailedTimesheet,
+  DetailedTimesheetEntry,
+  TimesheetEntryInput,
+} from "./postgres-tenant-store";
 import {
   AuthorizationError,
   TenantIsolationError,
@@ -46,6 +53,8 @@ export class MultiTenantDataStore {
   private projects = new Map<string, ProjectRecord>();
   private projectMemberships: ProjectMembershipRecord[] = [];
   private timesheets = new Map<string, TimesheetRecord>();
+  private detailedSheets = new Map<string, DetailedTimesheet>();
+  private approvalHistory: ApprovalHistoryItem[] = [];
   private auditLogs: AuditLogRecord[] = [];
 
   // --------------------------------------------------------------------------
@@ -393,8 +402,293 @@ export class MultiTenantDataStore {
 
     const updated: TimesheetRecord = { ...ts, status: "approved" };
     this.timesheets.set(timesheetId, updated);
+
+    const detailed = this.detailedSheets.get(timesheetId);
+    if (detailed) {
+      detailed.status = "approved";
+      detailed.reviewedAt = new Date().toISOString();
+      detailed.reviewedByMembershipId = ctx.membership.id;
+    }
+
+    const requesterUser = this.users.get(this.memberships.get(ts.membershipId)?.userId ?? "");
+    this.approvalHistory.unshift({
+      id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      targetType: "timesheet",
+      targetId: timesheetId,
+      requesterMembershipId: ts.membershipId,
+      requesterName: requesterUser?.fullName ?? "Team Member",
+      approverMembershipId: ctx.membership.id,
+      approverName: ctx.user.fullName,
+      status: "approved",
+      comment: null,
+      decidedAt: new Date().toISOString(),
+    });
+
     this.recordAudit(ctx, "approval", "timesheet.approved", "timesheet", timesheetId);
     return updated;
+  }
+
+  public getTimesheetForWeek(
+    ctx: ResolvedTenantContext,
+    targetMembershipId: string,
+    weekStart: string,
+  ): DetailedTimesheet | null {
+    const isSelf = ctx.membership.id === targetMembershipId;
+    const isManagerOrAdmin =
+      ctx.roleKeys.has("business_admin") ||
+      ctx.permissions.has("tenant:settings:manage") ||
+      (ctx.permissions.has("timesheet:read:team") &&
+        ctx.directReportMembershipIds.has(targetMembershipId));
+
+    if (!isSelf && !isManagerOrAdmin) {
+      throw new AuthorizationError("You do not have permission to view this timesheet.");
+    }
+
+    for (const sheet of this.detailedSheets.values()) {
+      if (
+        sheet.tenantId === ctx.tenant.id &&
+        sheet.membershipId === targetMembershipId &&
+        sheet.weekStart === weekStart
+      ) {
+        return sheet;
+      }
+    }
+    return null;
+  }
+
+  public upsertTimesheet(
+    ctx: ResolvedTenantContext,
+    targetMembershipId: string,
+    input: {
+      weekStart: string;
+      entries: TimesheetEntryInput[];
+    },
+  ): DetailedTimesheet {
+    const isSelf = ctx.membership.id === targetMembershipId;
+    const isAdmin =
+      ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:settings:manage");
+
+    if (!isSelf && !isAdmin) {
+      throw new AuthorizationError("You can only edit your own timesheet.");
+    }
+
+    for (let day = 0; day < 7; day++) {
+      let daySum = 0;
+      for (const entry of input.entries) {
+        const val = entry.hoursByDay[day] ?? 0;
+        if (typeof val === "number") {
+          daySum += val;
+        }
+      }
+      if (daySum > 24) {
+        throw new Error(`Total daily hours cannot exceed 24 hours for day ${day + 1}.`);
+      }
+    }
+
+    let existing: DetailedTimesheet | undefined;
+    for (const sheet of this.detailedSheets.values()) {
+      if (
+        sheet.tenantId === ctx.tenant.id &&
+        sheet.membershipId === targetMembershipId &&
+        sheet.weekStart === input.weekStart
+      ) {
+        existing = sheet;
+        break;
+      }
+    }
+
+    if (existing && (existing.status === "approved" || existing.status === "submitted")) {
+      throw new Error(`Cannot modify timesheet in '${existing.status}' status.`);
+    }
+
+    const id = existing?.id ?? `ts_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    let totalHours = 0;
+    const mappedEntries: DetailedTimesheetEntry[] = input.entries.map((e, idx) => {
+      const sum = e.hoursByDay.reduce((acc, h) => acc + (typeof h === "number" ? h : 0), 0);
+      totalHours += sum;
+      const proj = this.projects.get(e.projectId);
+      return {
+        id: `entry_${id}_${idx + 1}`,
+        timesheetId: id,
+        projectId: e.projectId,
+        projectName: proj?.name ?? "General",
+        taskName: e.taskName.trim(),
+        hoursByDay: e.hoursByDay,
+        billable: e.billable ?? true,
+        notes: e.notes?.trim() ?? "",
+      };
+    });
+
+    const detailed: DetailedTimesheet = {
+      id,
+      tenantId: ctx.tenant.id,
+      membershipId: targetMembershipId,
+      weekStart: input.weekStart,
+      status: "draft",
+      submittedAt: existing?.submittedAt ?? null,
+      reviewedAt: null,
+      reviewedByMembershipId: null,
+      reviewComment: null,
+      totalHours: Math.round(totalHours * 100) / 100,
+      entries: mappedEntries,
+    };
+
+    this.detailedSheets.set(id, detailed);
+
+    // Keep timesheets map in sync
+    const firstProjId = input.entries[0]?.projectId ?? "proj_default";
+    this.timesheets.set(id, {
+      id,
+      tenantId: ctx.tenant.id,
+      membershipId: targetMembershipId,
+      projectId: firstProjId,
+      weekStartDate: input.weekStart,
+      totalHours: detailed.totalHours,
+      status: "draft",
+    });
+
+    return detailed;
+  }
+
+  public submitTimesheet(ctx: ResolvedTenantContext, timesheetId: string): DetailedTimesheet {
+    const sheet = this.detailedSheets.get(timesheetId);
+    if (!sheet) {
+      throw new Error(`Timesheet ${timesheetId} not found.`);
+    }
+    assertSameTenant(ctx, sheet.tenantId);
+
+    const isSelf = ctx.membership.id === sheet.membershipId;
+    const isAdmin =
+      ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:settings:manage");
+    if (!isSelf && !isAdmin) {
+      throw new AuthorizationError("You can only submit your own timesheet.");
+    }
+
+    if (sheet.status === "approved") {
+      throw new Error("Timesheet is already approved.");
+    }
+    if (sheet.status === "submitted") {
+      throw new Error("Timesheet is already submitted.");
+    }
+
+    sheet.status = "submitted";
+    sheet.submittedAt = new Date().toISOString();
+    const legacy = this.timesheets.get(timesheetId);
+    if (legacy) {
+      legacy.status = "submitted";
+    }
+
+    this.recordAudit(ctx, "timesheet", "timesheet.submitted", "timesheet", timesheetId);
+    return sheet;
+  }
+
+  public rejectTimesheet(
+    ctx: ResolvedTenantContext,
+    timesheetId: string,
+    rejectionComment: string,
+  ): TimesheetRecord {
+    if (!rejectionComment || rejectionComment.trim().length < 3) {
+      throw new Error("A rejection comment of at least 3 characters is required.");
+    }
+
+    const ts = this.timesheets.get(timesheetId);
+    const detailed = this.detailedSheets.get(timesheetId);
+    if (!ts && !detailed) {
+      throw new Error(`Timesheet ${timesheetId} not found.`);
+    }
+    const tenantId = ts?.tenantId ?? detailed?.tenantId ?? "";
+    assertSameTenant(ctx, tenantId);
+
+    const membershipId = ts?.membershipId ?? detailed?.membershipId ?? "";
+    if (membershipId === ctx.membership.id) {
+      throw new AuthorizationError("Self-rejection is not permitted.");
+    }
+
+    const isBusinessAdmin = ctx.roleKeys.has("business_admin");
+    const isDirectReport = ctx.directReportMembershipIds.has(membershipId);
+    if (!isBusinessAdmin && !isDirectReport) {
+      throw new AuthorizationError(
+        `Membership ${ctx.membership.id} is not authorized to reject timesheet ${timesheetId}.`,
+      );
+    }
+
+    const updated: TimesheetRecord = {
+      id: timesheetId,
+      tenantId: ctx.tenant.id,
+      membershipId,
+      projectId: ts?.projectId ?? detailed?.entries[0]?.projectId ?? "",
+      weekStartDate: ts?.weekStartDate ?? detailed?.weekStart ?? "",
+      totalHours: ts?.totalHours ?? detailed?.totalHours ?? 0,
+      status: "rejected",
+    };
+    this.timesheets.set(timesheetId, updated);
+
+    if (detailed) {
+      detailed.status = "rejected";
+      detailed.reviewComment = rejectionComment.trim();
+      detailed.reviewedAt = new Date().toISOString();
+      detailed.reviewedByMembershipId = ctx.membership.id;
+    }
+
+    const requesterUser = this.users.get(this.memberships.get(membershipId)?.userId ?? "");
+    this.approvalHistory.unshift({
+      id: `appr_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      targetType: "timesheet",
+      targetId: timesheetId,
+      requesterMembershipId: membershipId,
+      requesterName: requesterUser?.fullName ?? "Team Member",
+      approverMembershipId: ctx.membership.id,
+      approverName: ctx.user.fullName,
+      status: "rejected",
+      comment: rejectionComment.trim(),
+      decidedAt: new Date().toISOString(),
+    });
+
+    this.recordAudit(ctx, "approval", "timesheet.rejected", "timesheet", timesheetId);
+    return updated;
+  }
+
+  public listApprovals(ctx: ResolvedTenantContext): {
+    pending: ApprovalItem[];
+    history: ApprovalHistoryItem[];
+  } {
+    const isBusinessAdmin =
+      ctx.roleKeys.has("business_admin") || ctx.permissions.has("tenant:settings:manage");
+
+    const pending: ApprovalItem[] = [];
+    for (const sheet of this.detailedSheets.values()) {
+      if (sheet.tenantId !== ctx.tenant.id || sheet.status !== "submitted") continue;
+      if (!isBusinessAdmin && !ctx.directReportMembershipIds.has(sheet.membershipId)) continue;
+
+      const member = this.memberships.get(sheet.membershipId);
+      const user = member ? this.users.get(member.userId) : undefined;
+
+      pending.push({
+        id: sheet.id,
+        timesheetId: sheet.id,
+        membershipId: sheet.membershipId,
+        memberName: user?.fullName ?? "Team Member",
+        memberEmail: user?.email ?? "",
+        jobTitle: member?.jobTitle ?? "Member",
+        weekStart: sheet.weekStart,
+        totalHours: sheet.totalHours,
+        submittedAt: sheet.submittedAt,
+        entries: sheet.entries.map((e) => ({
+          id: e.id,
+          projectId: e.projectId,
+          projectName: e.projectName,
+          taskName: e.taskName,
+          hoursByDay: e.hoursByDay,
+          billable: e.billable,
+          notes: e.notes,
+        })),
+      });
+    }
+
+    return {
+      pending,
+      history: this.approvalHistory.slice(0, 50),
+    };
   }
 
   public listTenantAuditLogs(ctx: ResolvedTenantContext): AuditLogRecord[] {

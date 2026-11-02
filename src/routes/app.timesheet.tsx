@@ -39,6 +39,11 @@ import {
 } from "@/components/ui/alert-dialog";
 import { EmptyState, PageHeader, StatusBadge } from "@/components/app/common";
 import {
+  apiFetchTimesheetForWeek,
+  apiSaveDraftTimesheet,
+  apiSubmitTimesheet,
+} from "@/lib/timesheet-api";
+import {
   useMe,
   uid,
   upsertTimesheet,
@@ -76,6 +81,37 @@ export function TimesheetPage() {
   );
   const state = useDemo((s) => s);
   const thisWeek = weekKey(new Date());
+
+  useEffect(() => {
+    let mounted = true;
+    apiFetchTimesheetForWeek(week)
+      .then((remoteSheet) => {
+        if (!mounted || !remoteSheet) return;
+        upsertTimesheet({
+          id: remoteSheet.id,
+          memberId: CURRENT_USER_ID,
+          weekStart: remoteSheet.weekStart,
+          status: remoteSheet.status,
+          submittedAt: remoteSheet.submittedAt ?? undefined,
+          reviewedAt: remoteSheet.reviewedAt ?? undefined,
+          reviewComment: remoteSheet.reviewComment ?? undefined,
+          entries: remoteSheet.entries.map((e) => ({
+            id: e.id,
+            projectId: e.projectId,
+            task: e.taskName,
+            hours: e.hoursByDay,
+            billable: e.billable,
+            notes: e.notes,
+          })),
+        });
+      })
+      .catch((err) => {
+        console.warn("Backend timesheet fetch fallback:", err);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [week, CURRENT_USER_ID]);
 
   return (
     <div className="space-y-6">
@@ -327,6 +363,14 @@ function Editor({
       return fail("Add at least some logged hours before submitting");
 
     const nowTime = format(new Date(), "HH:mm");
+    const entriesPayload = rows.map((r, i) => ({
+      projectId: r.projectId || "p_general",
+      taskName: r.task || "General Work",
+      hoursByDay: (parsed[i] ?? []).map((c) => (c.ok ? c.value : 0)),
+      billable: r.billable,
+      notes: r.notes.trim(),
+    }));
+
     upsertTimesheet({
       id: sheet?.id ?? `t_${CURRENT_USER_ID}_${week}`,
       memberId: CURRENT_USER_ID,
@@ -347,6 +391,19 @@ function Editor({
     setDirty(false);
     setLastSaved(nowTime);
     setShowConfirmSubmit(false);
+
+    // Asynchronously synchronize with PostgreSQL backend
+    void (async () => {
+      try {
+        const saved = await apiSaveDraftTimesheet(week, entriesPayload);
+        if (status === "submitted" && saved?.id) {
+          await apiSubmitTimesheet(saved.id);
+        }
+      } catch (err) {
+        console.warn("Backend timesheet API sync note:", err);
+      }
+    })();
+
     if (status === "submitted") {
       const actor = state.members.find((m) => m.id === CURRENT_USER_ID);
       addAuditLog({

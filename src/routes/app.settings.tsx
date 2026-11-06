@@ -25,6 +25,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { PageHeader, Panel } from "@/components/app/common";
+import { apiFetchSettings, apiUpdateSettings } from "@/lib/timesheet-api";
 import { getState, updateSettings, useDemo, useMe, addAuditLog } from "@/lib/demo-store";
 import { pageHead } from "@/lib/seo";
 
@@ -49,6 +50,27 @@ export function SettingsPage() {
   }));
   const [errors, setErrors] = useState<Record<string, string>>({});
 
+  useState(() => {
+    apiFetchSettings()
+      .then((s) => {
+        if (!s) return;
+        setF((prev) => ({
+          ...prev,
+          companyName: s.name || prev.companyName,
+          country: s.country || prev.country,
+          timezone: s.timezone || prev.timezone,
+          dailyTarget: s.dailyTargetHours || prev.dailyTarget,
+          lockApproved:
+            s.lockApprovedSheets !== undefined ? s.lockApprovedSheets : prev.lockApproved,
+          requireRejectReason:
+            s.requireRejectReason !== undefined ? s.requireRejectReason : prev.requireRejectReason,
+        }));
+      })
+      .catch((err) => {
+        console.warn("Backend settings fetch notice:", err);
+      });
+  });
+
   const save = (e: React.FormEvent) => {
     e.preventDefault();
     const r = schema.safeParse(f);
@@ -56,6 +78,18 @@ export function SettingsPage() {
       return setErrors(Object.fromEntries(r.error.issues.map((i) => [i.path[0], i.message])));
     }
     setErrors({});
+
+    void apiUpdateSettings({
+      name: r.data.companyName,
+      country: r.data.country,
+      timezone: f.timezone,
+      dailyTargetHours: String(r.data.dailyTarget),
+      lockApprovedSheets: f.lockApproved,
+      requireRejectReason: f.requireRejectReason,
+    }).catch((err) => {
+      console.warn("Backend settings update notice:", err);
+    });
+
     updateSettings({
       companyName: r.data.companyName,
       companyEmail: r.data.companyEmail,

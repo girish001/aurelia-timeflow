@@ -176,3 +176,222 @@ export async function apiRejectTimesheet(
 
   return { success: true, timesheet: data.timesheet };
 }
+
+/**
+ * Retrieves database-backed reports & analytics.
+ */
+export async function apiFetchReports(
+  options?: { from?: string; to?: string; includeDrafts?: boolean },
+  tenantId?: string,
+): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const query = new URLSearchParams();
+  if (options?.from) query.set("from", options.from);
+  if (options?.to) query.set("to", options.to);
+  if (options?.includeDrafts) query.set("includeDrafts", "true");
+
+  const qs = query.toString() ? `?${query.toString()}` : "";
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/reports${qs}`, {
+    method: "GET",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to fetch reports.");
+  }
+  return data;
+}
+
+/**
+ * Fetches tenant clients.
+ */
+export async function apiFetchClients(
+  options?: {
+    search?: string;
+    status?: string;
+    page?: number;
+    limit?: number;
+  },
+  tenantId?: string,
+): Promise<{ clients: Record<string, unknown>[]; total: number }> {
+  const tid = tenantId || getActiveTenantId();
+  const query = new URLSearchParams();
+  if (options?.search) query.set("search", options.search);
+  if (options?.status) query.set("status", options.status);
+  if (options?.page) query.set("page", String(options.page));
+  if (options?.limit) query.set("limit", String(options.limit));
+
+  const qs = query.toString() ? `?${query.toString()}` : "";
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/clients${qs}`, {
+    method: "GET",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to fetch clients.");
+  }
+  return { clients: data.clients || [], total: data.total || 0 };
+}
+
+/**
+ * Creates a new client profile.
+ */
+export async function apiCreateClient(
+  input: {
+    name: string;
+    contactName: string;
+    contactEmail: string;
+    country: string;
+    billingTerms?: string;
+    status?: string;
+  },
+  tenantId?: string,
+): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/clients`, {
+    method: "POST",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+    body: JSON.stringify(input),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to create client.");
+  }
+  return data.client;
+}
+
+/**
+ * Updates an existing client profile.
+ */
+export async function apiUpdateClient(
+  clientId: string,
+  input: Partial<{
+    name: string;
+    contactName: string;
+    contactEmail: string;
+    country: string;
+    billingTerms?: string;
+    status?: string;
+  }>,
+  tenantId?: string,
+): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const res = await fetch(
+    `/api/v1/tenants/${encodeURIComponent(tid)}/clients/${encodeURIComponent(clientId)}`,
+    {
+      method: "PATCH",
+      headers: API_HEADERS,
+      credentials: "same-origin",
+      body: JSON.stringify(input),
+    },
+  );
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to update client.");
+  }
+  return data.client;
+}
+
+/**
+ * Creates a new project in the tenant.
+ */
+export async function apiCreateProject(
+  input: {
+    clientId: string;
+    name: string;
+    projectManagerMembershipId?: string;
+    budgetHours: number;
+    billableRate: number;
+    tasks?: string[];
+    status?: "active" | "on-hold" | "completed";
+  },
+  tenantId?: string,
+): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/projects`, {
+    method: "POST",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+    body: JSON.stringify(input),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to create project.");
+  }
+  return data.project;
+}
+
+/**
+ * Fetches tenant company settings.
+ */
+export async function apiFetchSettings(tenantId?: string): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/settings`, {
+    method: "GET",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to fetch settings.");
+  }
+  return data.settings;
+}
+
+/**
+ * Updates tenant company settings.
+ */
+export async function apiUpdateSettings(
+  input: Record<string, unknown>,
+  tenantId?: string,
+): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/settings`, {
+    method: "PATCH",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+    body: JSON.stringify(input),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to update settings.");
+  }
+  return data.settings;
+}
+
+/**
+ * Sends a single employee invitation.
+ */
+export async function apiInviteMember(
+  input: {
+    email: string;
+    roleKeys: string[];
+    departmentId?: string;
+    reportingManagerMembershipId?: string;
+  },
+  tenantId?: string,
+): Promise<Record<string, unknown>> {
+  const tid = tenantId || getActiveTenantId();
+  const res = await fetch(`/api/v1/tenants/${encodeURIComponent(tid)}/invitations`, {
+    method: "POST",
+    headers: API_HEADERS,
+    credentials: "same-origin",
+    body: JSON.stringify(input),
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    throw new Error(data.message || data.error || "Failed to invite member.");
+  }
+  return data.invitation;
+}

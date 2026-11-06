@@ -19,16 +19,24 @@ import {
 } from "../onboarding/onboarding-service";
 import {
   approveTimesheetInDb,
+  createClientInDb,
+  createMemberInvitationInDb,
+  createProjectInDb,
+  getTenantReportsFromDb,
+  getTenantSettingsFromDb,
   getTimesheetForWeekFromDb,
   listAccessibleTeamMembersFromDb,
   listApprovalsFromDb,
+  listClientsFromDb,
   listProjectsFromDb,
   listTenantAuditLogsFromDb,
   listUserTenantsFromDb,
   registerCompanyInDb,
   rejectTimesheetInDb,
   submitTimesheetInDb,
+  updateClientInDb,
   updateProjectBudgetInDb,
+  updateTenantSettingsInDb,
   upsertTimesheetInDb,
   verifyCompanyAdminEmailInDb,
   type TimesheetEntryInput,
@@ -206,10 +214,38 @@ export const API_ROUTE_CONTRACTS: ApiRouteContract[] = [
   // 4. Tenant-Scoped Operational Endpoints
   {
     method: "GET",
+    path: "/api/v1/tenants/:tenantId/clients",
+    scope: "tenant_scoped",
+    requiredPermission: "client:read:all",
+    description: "Lists client corporate profiles for the tenant workspace.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/tenants/:tenantId/clients",
+    scope: "tenant_scoped",
+    requiredPermission: "client:write:all",
+    description: "Creates a new client corporate profile for the tenant.",
+  },
+  {
+    method: "PATCH",
+    path: "/api/v1/tenants/:tenantId/clients/:clientId",
+    scope: "tenant_scoped",
+    requiredPermission: "client:write:all",
+    description: "Updates an existing client profile and billing terms.",
+  },
+  {
+    method: "GET",
     path: "/api/v1/tenants/:tenantId/projects",
     scope: "tenant_scoped",
     requiredPermission: "project:read:assigned",
     description: "Lists tenant projects filtered by caller's role and project memberships.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/tenants/:tenantId/projects",
+    scope: "tenant_scoped",
+    requiredPermission: "project:write:all",
+    description: "Creates a new project with client, billable rate, budget, and project manager.",
   },
   {
     method: "PATCH",
@@ -218,6 +254,34 @@ export const API_ROUTE_CONTRACTS: ApiRouteContract[] = [
     requiredPermission: "project:write:assigned",
     description:
       "Updates project settings/budget; enforces project manager or business admin ownership.",
+  },
+  {
+    method: "GET",
+    path: "/api/v1/tenants/:tenantId/settings",
+    scope: "tenant_scoped",
+    requiredPermission: "tenant:settings:manage",
+    description: "Returns tenant workspace settings and localization preferences.",
+  },
+  {
+    method: "PATCH",
+    path: "/api/v1/tenants/:tenantId/settings",
+    scope: "tenant_scoped",
+    requiredPermission: "tenant:settings:manage",
+    description: "Updates tenant company configuration, timezone, currency, and rules.",
+  },
+  {
+    method: "GET",
+    path: "/api/v1/tenants/:tenantId/reports",
+    scope: "tenant_scoped",
+    requiredPermission: "report:read:tenant",
+    description: "Returns aggregated utilization, project, client, employee and monthly reports.",
+  },
+  {
+    method: "POST",
+    path: "/api/v1/tenants/:tenantId/invitations",
+    scope: "tenant_scoped",
+    requiredPermission: "tenant:members:manage",
+    description: "Dispatches a single employee invitation with assigned roles.",
   },
   {
     method: "GET",
@@ -1240,6 +1304,182 @@ export async function handleApiRequest(
           env,
         });
         return jsonResponse({ success: true, targetUserId, status: newStatus });
+      }
+
+      if (contract.method === "GET" && contract.path === "/api/v1/tenants/:tenantId/clients") {
+        const search = url.searchParams.get("search") ?? undefined;
+        const status = url.searchParams.get("status") ?? undefined;
+        const page = url.searchParams.get("page")
+          ? Number(url.searchParams.get("page"))
+          : undefined;
+        const limit = url.searchParams.get("limit")
+          ? Number(url.searchParams.get("limit"))
+          : undefined;
+
+        if (useDatabase) {
+          const result = await listClientsFromDb(
+            ctx,
+            { search, status, page, limit },
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse(result);
+        }
+        return jsonResponse(store.listClients(ctx, { search, status, page, limit }));
+      }
+
+      if (contract.method === "POST" && contract.path === "/api/v1/tenants/:tenantId/clients") {
+        const input = {
+          name: String(body["name"] ?? ""),
+          contactName: String(body["contactName"] ?? body["contact"] ?? ""),
+          contactEmail: String(body["contactEmail"] ?? body["email"] ?? ""),
+          country: String(body["country"] ?? "India"),
+          billingTerms: body["billingTerms"] ? String(body["billingTerms"]) : undefined,
+          status: body["status"] ? String(body["status"]) : "active",
+        };
+        if (useDatabase) {
+          const client = await createClientInDb(ctx, input, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ client }, 201);
+        }
+        const client = store.createClient(ctx, input);
+        return jsonResponse({ client }, 201);
+      }
+
+      if (
+        contract.method === "PATCH" &&
+        contract.path === "/api/v1/tenants/:tenantId/clients/:clientId"
+      ) {
+        const clientId = String(params["clientId"] ?? "");
+        const input = {
+          name: body["name"] !== undefined ? String(body["name"]) : undefined,
+          contactName: body["contactName"] !== undefined ? String(body["contactName"]) : undefined,
+          contactEmail:
+            body["contactEmail"] !== undefined ? String(body["contactEmail"]) : undefined,
+          country: body["country"] !== undefined ? String(body["country"]) : undefined,
+          billingTerms:
+            body["billingTerms"] !== undefined ? String(body["billingTerms"]) : undefined,
+          status: body["status"] !== undefined ? String(body["status"]) : undefined,
+        };
+        if (useDatabase) {
+          const client = await updateClientInDb(ctx, clientId, input, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ client });
+        }
+        const client = store.updateClient(ctx, clientId, input);
+        return jsonResponse({ client });
+      }
+
+      if (contract.method === "POST" && contract.path === "/api/v1/tenants/:tenantId/projects") {
+        const input = {
+          clientId: String(body["clientId"] ?? ""),
+          name: String(body["name"] ?? ""),
+          projectManagerMembershipId: String(
+            body["projectManagerMembershipId"] ?? ctx.membership.id,
+          ),
+          budgetHours: Number(body["budgetHours"] ?? 100),
+          billableRate: Number(body["billableRate"] ?? 75),
+          tasks: Array.isArray(body["tasks"]) ? (body["tasks"] as string[]) : undefined,
+          status: (body["status"] as "active" | "on-hold" | "completed") ?? "active",
+        };
+        if (useDatabase) {
+          const project = await createProjectInDb(ctx, input, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ project }, 201);
+        }
+        const project = store.createProjectScoped(ctx, input);
+        return jsonResponse({ project }, 201);
+      }
+
+      if (contract.method === "GET" && contract.path === "/api/v1/tenants/:tenantId/settings") {
+        if (useDatabase) {
+          const settings = await getTenantSettingsFromDb(ctx, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ settings });
+        }
+        const settings = store.getTenantSettings(ctx);
+        return jsonResponse({ settings });
+      }
+
+      if (contract.method === "PATCH" && contract.path === "/api/v1/tenants/:tenantId/settings") {
+        const input = {
+          name: body["name"] !== undefined ? String(body["name"]) : undefined,
+          country: body["country"] !== undefined ? String(body["country"]) : undefined,
+          timezone: body["timezone"] !== undefined ? String(body["timezone"]) : undefined,
+          currency: body["currency"] !== undefined ? String(body["currency"]) : undefined,
+          timeFormat: body["timeFormat"] !== undefined ? String(body["timeFormat"]) : undefined,
+          weekStart: body["weekStart"] !== undefined ? String(body["weekStart"]) : undefined,
+          dailyTargetHours:
+            body["dailyTargetHours"] !== undefined ? String(body["dailyTargetHours"]) : undefined,
+          lockApprovedSheets:
+            body["lockApprovedSheets"] !== undefined
+              ? Boolean(body["lockApprovedSheets"])
+              : undefined,
+          requireRejectReason:
+            body["requireRejectReason"] !== undefined
+              ? Boolean(body["requireRejectReason"])
+              : undefined,
+        };
+        if (useDatabase) {
+          const settings = await updateTenantSettingsInDb(ctx, input, {
+            pool: targetPool,
+            env: options?.env,
+          });
+          return jsonResponse({ settings });
+        }
+        const settings = store.updateTenantSettings(ctx, input);
+        return jsonResponse({ settings });
+      }
+
+      if (contract.method === "GET" && contract.path === "/api/v1/tenants/:tenantId/reports") {
+        const from = url.searchParams.get("from") ?? undefined;
+        const to = url.searchParams.get("to") ?? undefined;
+        const includeDrafts = url.searchParams.get("includeDrafts") === "true";
+
+        if (useDatabase) {
+          const report = await getTenantReportsFromDb(
+            ctx,
+            { from, to, includeDrafts },
+            { pool: targetPool, env: options?.env },
+          );
+          return jsonResponse(report);
+        }
+        const report = store.getReports(ctx, { from, to, includeDrafts });
+        return jsonResponse(report);
+      }
+
+      if (contract.method === "POST" && contract.path === "/api/v1/tenants/:tenantId/invitations") {
+        const email = String(body["email"] ?? "");
+        const roleKeys = Array.isArray(body["roleKeys"])
+          ? (body["roleKeys"] as string[])
+          : ["employee"];
+        const departmentId = body["departmentId"] ? String(body["departmentId"]) : undefined;
+        const reportingManagerMembershipId = body["reportingManagerMembershipId"]
+          ? String(body["reportingManagerMembershipId"])
+          : undefined;
+
+        if (useDatabase) {
+          const invitation = await createMemberInvitationInDb(
+            ctx,
+            { email, roleKeys, departmentId, reportingManagerMembershipId },
+            { pool: targetPool, env: options?.env, emailProvider: options?.emailProvider },
+          );
+          return jsonResponse({ invitation }, 201);
+        }
+        const invitation = store.createInvitation(ctx, {
+          email,
+          roleKeys,
+          departmentId,
+          reportingManagerMembershipId,
+        });
+        return jsonResponse({ invitation }, 201);
       }
 
       if (contract.path === "/api/v1/tenants/:tenantId/invitations/bulk-csv") {

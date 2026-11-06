@@ -99,6 +99,7 @@ export async function checkServerSession(): Promise<AuthSessionResponse | null> 
       return null;
     }
 
+    const data = (await res.json()) as AuthSessionResponse;
     const firstTenant = data.tenants?.[0];
     if (data.authenticated && firstTenant) {
       const storedTenantId = localStorage.getItem("aurelia_active_tenant_id");

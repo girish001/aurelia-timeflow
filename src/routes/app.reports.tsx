@@ -1,5 +1,5 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   parseISO,
   subDays,
@@ -31,6 +31,7 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { EmptyState, PageHeader, Panel, StatCard } from "@/components/app/common";
+import { apiFetchReports } from "@/lib/timesheet-api";
 import { flatten, useDemo, loggedHours } from "@/lib/demo-store";
 import { formatHours, formatMoney, isoDay } from "@/lib/time";
 import { toCsv, downloadBlob } from "@/lib/csv";
@@ -52,6 +53,22 @@ export function Reports() {
   const [to, setTo] = useState(isoDay(today));
   const [group, setGroup] = useState<Group>("project");
   const [drafts, setDrafts] = useState(false);
+  const [serverReport, setServerReport] = useState<Record<string, unknown> | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    apiFetchReports({ from, to, includeDrafts: drafts })
+      .then((data) => {
+        if (!mounted || !data) return;
+        setServerReport(data);
+      })
+      .catch((err) => {
+        console.warn("Backend reports API notice:", err);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, [from, to, drafts]);
 
   const cur = s.settings.currency;
   const fmt = s.settings.timeFormat;

@@ -350,7 +350,9 @@ function Editor({
     return () => clearTimeout(timer);
   }, [dirty, locked, cellErrors, dayOver, rows, parsed, sheet, CURRENT_USER_ID, week]);
 
-  const persist = (status: "draft" | "submitted"): void => {
+  const [isSaving, setIsSaving] = useState(false);
+
+  const persist = async (status: "draft" | "submitted"): Promise<void> => {
     setShowErrors(true);
     const fail = (m: string) => {
       toast.error(m);
@@ -362,6 +364,7 @@ function Editor({
     if (status === "submitted" && total <= 0)
       return fail("Add at least some logged hours before submitting");
 
+    setIsSaving(true);
     const nowTime = format(new Date(), "HH:mm");
     const entriesPayload = rows.map((r, i) => ({
       projectId: r.projectId || "p_general",
@@ -371,52 +374,63 @@ function Editor({
       notes: r.notes.trim(),
     }));
 
-    upsertTimesheet({
-      id: sheet?.id ?? `t_${CURRENT_USER_ID}_${week}`,
-      memberId: CURRENT_USER_ID,
-      weekStart: week,
-      status,
-      submittedAt: status === "submitted" ? isoDay(new Date()) : sheet?.submittedAt,
-      reviewComment: status === "submitted" ? undefined : sheet?.reviewComment,
-      lastAutoSavedAt: nowTime,
-      entries: rows.map((r, i) => ({
-        id: r.id,
-        projectId: r.projectId,
-        task: r.task,
-        billable: r.billable,
-        notes: r.notes.trim(),
-        hours: (parsed[i] ?? []).map((c) => (c.ok ? c.value : 0)),
-      })),
-    });
-    setDirty(false);
-    setLastSaved(nowTime);
-    setShowConfirmSubmit(false);
+    try {
+      let savedId = sheet?.id ?? `t_${CURRENT_USER_ID}_${week}`;
+      let finalStatus: "draft" | "submitted" = status;
 
-    // Asynchronously synchronize with PostgreSQL backend
-    void (async () => {
       try {
         const saved = await apiSaveDraftTimesheet(week, entriesPayload);
-        if (status === "submitted" && saved?.id) {
-          await apiSubmitTimesheet(saved.id);
+        if (saved?.id) {
+          savedId = saved.id;
+          if (status === "submitted") {
+            const submitted = await apiSubmitTimesheet(saved.id);
+            finalStatus = (submitted.status as "draft" | "submitted") || "submitted";
+          }
         }
-      } catch (err) {
-        console.warn("Backend timesheet API sync note:", err);
+      } catch (backendErr) {
+        console.warn("Backend timesheet API response note:", backendErr);
       }
-    })();
 
-    if (status === "submitted") {
-      const actor = state.members.find((m) => m.id === CURRENT_USER_ID);
-      addAuditLog({
-        actorId: CURRENT_USER_ID,
-        actorName: actor?.name ?? "Employee",
-        action: "Timesheet Submitted",
-        category: "timesheet",
-        details: `Submitted ${total.toFixed(1)}h timesheet for week ${week}`,
+      // Confirm UI update upon successful completion
+      upsertTimesheet({
+        id: savedId,
+        memberId: CURRENT_USER_ID,
+        weekStart: week,
+        status: finalStatus,
+        submittedAt: finalStatus === "submitted" ? isoDay(new Date()) : sheet?.submittedAt,
+        reviewComment: finalStatus === "submitted" ? undefined : sheet?.reviewComment,
+        lastAutoSavedAt: nowTime,
+        entries: rows.map((r, i) => ({
+          id: r.id,
+          projectId: r.projectId,
+          task: r.task,
+          billable: r.billable,
+          notes: r.notes.trim(),
+          hours: (parsed[i] ?? []).map((c) => (c.ok ? c.value : 0)),
+        })),
       });
+      setDirty(false);
+      setLastSaved(nowTime);
+      setShowConfirmSubmit(false);
+
+      if (finalStatus === "submitted") {
+        const actor = state.members.find((m) => m.id === CURRENT_USER_ID);
+        addAuditLog({
+          actorId: CURRENT_USER_ID,
+          actorName: actor?.name ?? "Employee",
+          action: "Timesheet Submitted",
+          category: "timesheet",
+          details: `Submitted ${total.toFixed(1)}h timesheet for week ${week}`,
+        });
+      }
+      toast.success(
+        finalStatus === "submitted" ? "Timesheet submitted for manager approval" : "Draft saved",
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to save timesheet.");
+    } finally {
+      setIsSaving(false);
     }
-    toast.success(
-      status === "submitted" ? "Timesheet submitted for manager approval" : "Draft saved",
-    );
   };
 
   return (

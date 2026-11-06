@@ -33,6 +33,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Initials, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
+import { apiInviteMember } from "@/lib/timesheet-api";
 import {
   addMember,
   addAuditLog,
@@ -101,6 +102,21 @@ export function Team() {
     if (s.members.some((m) => m.email.toLowerCase() === r.data.email.toLowerCase())) {
       return setErrors({ email: "This email is already associated with an account" });
     }
+
+    const roleKey =
+      r.data.role === "Admin"
+        ? "business_admin"
+        : r.data.role === "Manager"
+          ? "manager"
+          : "employee";
+
+    void apiInviteMember({
+      email: r.data.email,
+      roleKeys: [roleKey],
+      reportingManagerMembershipId: r.data.reportingManagerId || undefined,
+    }).catch((err) => {
+      console.warn("Backend invitation dispatch notice:", err);
+    });
 
     addMember({
       id: uid("m"),

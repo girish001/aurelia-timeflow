@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { addDays, format, parseISO } from "date-fns";
 import { and, asc, count, desc, eq, ilike, inArray, sql } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
@@ -2057,4 +2058,876 @@ export async function verifyCompanyAdminEmailInDb(
   } finally {
     client.release();
   }
+}
+
+// ============================================================================
+// 10. Client Management Repository Functions
+// ============================================================================
+
+export interface ClientRecord {
+  id: string;
+  tenantId: string;
+  name: string;
+  contactName: string;
+  contactEmail: string;
+  country: string;
+  billingTerms: string;
+  status: string;
+  createdAt: string;
+}
+
+export interface CreateClientInput {
+  name: string;
+  contactName: string;
+  contactEmail: string;
+  country: string;
+  billingTerms?: string | undefined;
+  status?: string | undefined;
+}
+
+export async function listClientsFromDb(
+  ctx: ResolvedTenantContext,
+  options?: (PaginationOptions & { search?: string; status?: string }) | undefined,
+  scopeOptions?: ScopeOptions,
+): Promise<{ clients: ClientRecord[]; total: number }> {
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      let conditions = eq(schema.clients.tenantId, verifiedTenantId);
+
+      if (options?.status && options.status !== "all") {
+        conditions = and(conditions, eq(schema.clients.status, options.status))!;
+      }
+
+      if (options?.search?.trim()) {
+        const q = `%${options.search.trim()}%`;
+        conditions = and(
+          conditions,
+          sql`(${schema.clients.name} ILIKE ${q} OR ${schema.clients.contactName} ILIKE ${q} OR ${schema.clients.contactEmail} ILIKE ${q})`,
+        )!;
+      }
+
+      const totalResult = await db
+        .select({ count: count() })
+        .from(schema.clients)
+        .where(conditions);
+      const total = totalResult[0]?.count ?? 0;
+
+      const page = Math.max(1, options?.page ?? 1);
+      const limit = Math.max(1, Math.min(100, options?.limit ?? 50));
+      const offset = (page - 1) * limit;
+
+      const rows = await db
+        .select()
+        .from(schema.clients)
+        .where(conditions)
+        .orderBy(asc(schema.clients.name))
+        .limit(limit)
+        .offset(offset);
+
+      return {
+        clients: rows.map((r) => ({
+          id: r.id,
+          tenantId: r.tenantId,
+          name: r.name,
+          contactName: r.contactName,
+          contactEmail: r.contactEmail,
+          country: r.country,
+          billingTerms: r.billingTerms,
+          status: r.status,
+          createdAt: r.createdAt.toISOString(),
+        })),
+        total,
+      };
+    },
+    scopeOptions,
+  );
+}
+
+export async function createClientInDb(
+  ctx: ResolvedTenantContext,
+  input: CreateClientInput,
+  scopeOptions?: ScopeOptions,
+): Promise<ClientRecord> {
+  if (!ctx.permissions.has("client:write:all")) {
+    throw new AuthorizationError("Only administrators can create client accounts.");
+  }
+  if (!input.name?.trim()) {
+    throw new Error("Client name is required.");
+  }
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const rows = await db
+        .insert(schema.clients)
+        .values({
+          tenantId: verifiedTenantId,
+          name: input.name.trim(),
+          contactName: input.contactName?.trim() || "Contact Representative",
+          contactEmail: input.contactEmail?.trim().toLowerCase() || "",
+          country: input.country?.trim() || "India",
+          billingTerms: input.billingTerms?.trim() || "Net 30",
+          status: input.status === "inactive" ? "inactive" : "active",
+        })
+        .returning();
+
+      const created = rows[0]!;
+      await recordAuditLogToDb(
+        ctx,
+        "client",
+        "client.created",
+        "client",
+        created.id,
+        { name: created.name, contactName: created.contactName },
+        scopeOptions,
+      );
+
+      return {
+        id: created.id,
+        tenantId: created.tenantId,
+        name: created.name,
+        contactName: created.contactName,
+        contactEmail: created.contactEmail,
+        country: created.country,
+        billingTerms: created.billingTerms,
+        status: created.status,
+        createdAt: created.createdAt.toISOString(),
+      };
+    },
+    scopeOptions,
+  );
+}
+
+export async function updateClientInDb(
+  ctx: ResolvedTenantContext,
+  clientId: string,
+  input: Partial<CreateClientInput>,
+  scopeOptions?: ScopeOptions,
+): Promise<ClientRecord> {
+  if (!ctx.permissions.has("client:write:all")) {
+    throw new AuthorizationError("Only administrators can update client accounts.");
+  }
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const patch: Record<string, unknown> = {};
+      if (input.name !== undefined) patch["name"] = input.name.trim();
+      if (input.contactName !== undefined) patch["contactName"] = input.contactName.trim();
+      if (input.contactEmail !== undefined)
+        patch["contactEmail"] = input.contactEmail.trim().toLowerCase();
+      if (input.country !== undefined) patch["country"] = input.country.trim();
+      if (input.billingTerms !== undefined) patch["billingTerms"] = input.billingTerms.trim();
+      if (input.status !== undefined)
+        patch["status"] = input.status === "inactive" ? "inactive" : "active";
+
+      const rows = await db
+        .update(schema.clients)
+        .set(patch)
+        .where(and(eq(schema.clients.tenantId, verifiedTenantId), eq(schema.clients.id, clientId)))
+        .returning();
+
+      const updated = rows[0];
+      if (!updated) {
+        throw new Error(`Client ${clientId} not found.`);
+      }
+
+      await recordAuditLogToDb(
+        ctx,
+        "client",
+        "client.updated",
+        "client",
+        clientId,
+        patch,
+        scopeOptions,
+      );
+
+      return {
+        id: updated.id,
+        tenantId: updated.tenantId,
+        name: updated.name,
+        contactName: updated.contactName,
+        contactEmail: updated.contactEmail,
+        country: updated.country,
+        billingTerms: updated.billingTerms,
+        status: updated.status,
+        createdAt: updated.createdAt.toISOString(),
+      };
+    },
+    scopeOptions,
+  );
+}
+
+// ============================================================================
+// 11. Project Creation Repository Function
+// ============================================================================
+
+export interface CreateProjectInput {
+  clientId: string;
+  name: string;
+  projectManagerMembershipId: string;
+  budgetHours: number;
+  billableRate: number;
+  tasks?: string[] | undefined;
+  status?: "active" | "on-hold" | "completed" | undefined;
+}
+
+export async function createProjectInDb(
+  ctx: ResolvedTenantContext,
+  input: CreateProjectInput,
+  scopeOptions?: ScopeOptions,
+): Promise<ProjectRecord> {
+  if (!ctx.permissions.has("project:write:all")) {
+    throw new AuthorizationError("Only administrators can create new projects.");
+  }
+  if (!input.name?.trim()) {
+    throw new Error("Project name is required.");
+  }
+  if (!input.clientId) {
+    throw new Error("clientId is required.");
+  }
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      // Ensure client exists in the same tenant
+      const clientRows = await db
+        .select()
+        .from(schema.clients)
+        .where(
+          and(eq(schema.clients.tenantId, verifiedTenantId), eq(schema.clients.id, input.clientId)),
+        )
+        .limit(1);
+      if (!clientRows[0]) {
+        throw new Error(`Client ${input.clientId} not found in this tenant.`);
+      }
+
+      const rows = await db
+        .insert(schema.projects)
+        .values({
+          tenantId: verifiedTenantId,
+          clientId: input.clientId,
+          name: input.name.trim(),
+          projectManagerMembershipId: input.projectManagerMembershipId || ctx.membership.id,
+          status: input.status ?? "active",
+          budgetHours: String(input.budgetHours ?? 100),
+          billableRate: String(input.billableRate ?? 75),
+          tasksJson:
+            input.tasks && input.tasks.length > 0
+              ? input.tasks
+              : ["Architecture & Engineering", "Testing & Delivery", "Code Review"],
+        })
+        .returning();
+
+      const created = rows[0]!;
+
+      // Automatically add Project Manager membership
+      await db
+        .insert(schema.projectMemberships)
+        .values({
+          tenantId: verifiedTenantId,
+          projectId: created.id,
+          membershipId: created.projectManagerMembershipId,
+          projectRole: "project_manager",
+          canApproveTimesheets: true,
+          canManageAllocations: true,
+        })
+        .onConflictDoNothing();
+
+      await recordAuditLogToDb(
+        ctx,
+        "project",
+        "project.created",
+        "project",
+        created.id,
+        {
+          name: created.name,
+          budgetHours: created.budgetHours,
+          billableRate: created.billableRate,
+        },
+        scopeOptions,
+      );
+
+      return {
+        id: created.id,
+        tenantId: created.tenantId,
+        clientId: created.clientId,
+        name: created.name,
+        projectManagerMembershipId: created.projectManagerMembershipId,
+        budgetHours: Number(created.budgetHours),
+        billableRate: Number(created.billableRate),
+        status: created.status,
+      };
+    },
+    scopeOptions,
+  );
+}
+
+// ============================================================================
+// 12. Tenant Settings Repository Functions
+// ============================================================================
+
+export interface TenantSettingsRecord {
+  id: string;
+  name: string;
+  slug: string;
+  country: string;
+  timezone: string;
+  currency: string;
+  timeFormat: string;
+  weekStart: string;
+  dailyTargetHours: string;
+  lockApprovedSheets: boolean;
+  requireRejectReason: boolean;
+}
+
+export async function getTenantSettingsFromDb(
+  ctx: ResolvedTenantContext,
+  scopeOptions?: ScopeOptions,
+): Promise<TenantSettingsRecord> {
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const rows = await db
+        .select()
+        .from(schema.tenants)
+        .where(eq(schema.tenants.id, verifiedTenantId))
+        .limit(1);
+
+      const t = rows[0];
+      if (!t) {
+        throw new Error(`Tenant ${verifiedTenantId} not found.`);
+      }
+
+      return {
+        id: t.id,
+        name: t.name,
+        slug: t.slug,
+        country: t.country,
+        timezone: t.timezone,
+        currency: t.currency,
+        timeFormat: t.timeFormat,
+        weekStart: t.weekStart,
+        dailyTargetHours: t.dailyTargetHours,
+        lockApprovedSheets: t.lockApprovedSheets,
+        requireRejectReason: t.requireRejectReason,
+      };
+    },
+    scopeOptions,
+  );
+}
+
+export async function updateTenantSettingsInDb(
+  ctx: ResolvedTenantContext,
+  input: Partial<Omit<TenantSettingsRecord, "id" | "slug">>,
+  scopeOptions?: ScopeOptions,
+): Promise<TenantSettingsRecord> {
+  if (!ctx.permissions.has("tenant:settings:manage")) {
+    throw new AuthorizationError("Only administrators can update company settings.");
+  }
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const patch: Record<string, unknown> = {
+        updatedAt: new Date(),
+      };
+      if (input.name !== undefined) patch["name"] = input.name.trim();
+      if (input.country !== undefined) patch["country"] = input.country.trim();
+      if (input.timezone !== undefined) patch["timezone"] = input.timezone.trim();
+      if (input.currency !== undefined) patch["currency"] = input.currency.trim();
+      if (input.timeFormat !== undefined) patch["timeFormat"] = input.timeFormat.trim();
+      if (input.weekStart !== undefined) patch["weekStart"] = input.weekStart.trim();
+      if (input.dailyTargetHours !== undefined)
+        patch["dailyTargetHours"] = String(input.dailyTargetHours);
+      if (input.lockApprovedSheets !== undefined)
+        patch["lockApprovedSheets"] = Boolean(input.lockApprovedSheets);
+      if (input.requireRejectReason !== undefined)
+        patch["requireRejectReason"] = Boolean(input.requireRejectReason);
+
+      const rows = await db
+        .update(schema.tenants)
+        .set(patch)
+        .where(eq(schema.tenants.id, verifiedTenantId))
+        .returning();
+
+      const updated = rows[0];
+      if (!updated) {
+        throw new Error(`Tenant ${verifiedTenantId} not found.`);
+      }
+
+      await recordAuditLogToDb(
+        ctx,
+        "settings",
+        "tenant.settings_updated",
+        "tenant",
+        verifiedTenantId,
+        patch,
+        scopeOptions,
+      );
+
+      return {
+        id: updated.id,
+        name: updated.name,
+        slug: updated.slug,
+        country: updated.country,
+        timezone: updated.timezone,
+        currency: updated.currency,
+        timeFormat: updated.timeFormat,
+        weekStart: updated.weekStart,
+        dailyTargetHours: updated.dailyTargetHours,
+        lockApprovedSheets: updated.lockApprovedSheets,
+        requireRejectReason: updated.requireRejectReason,
+      };
+    },
+    scopeOptions,
+  );
+}
+
+// ============================================================================
+// 13. Real Database-Backed Reports & Analytics
+// ============================================================================
+
+export interface TenantReportsResult {
+  from: string;
+  to: string;
+  totalHours: number;
+  billableHours: number;
+  nonBillableHours: number;
+  utilizationRate: number;
+  totalBillableValue: number;
+  byProject: Array<{
+    projectId: string;
+    projectName: string;
+    clientName: string;
+    billableHours: number;
+    nonBillableHours: number;
+    totalHours: number;
+    billableValue: number;
+  }>;
+  byClient: Array<{
+    clientId: string;
+    clientName: string;
+    billableHours: number;
+    nonBillableHours: number;
+    totalHours: number;
+    billableValue: number;
+  }>;
+  byEmployee: Array<{
+    membershipId: string;
+    employeeName: string;
+    department: string;
+    billableHours: number;
+    nonBillableHours: number;
+    totalHours: number;
+    utilizationRate: number;
+  }>;
+  byMonth: Array<{
+    monthKey: string;
+    monthLabel: string;
+    billableHours: number;
+    nonBillableHours: number;
+    totalHours: number;
+    billableValue: number;
+  }>;
+  entries: Array<{
+    date: string;
+    membershipId: string;
+    employeeName: string;
+    clientId: string;
+    clientName: string;
+    projectId: string;
+    projectName: string;
+    task: string;
+    hours: number;
+    billable: boolean;
+    rate: number;
+    billableValue: number;
+    status: string;
+    notes: string;
+  }>;
+}
+
+export async function getTenantReportsFromDb(
+  ctx: ResolvedTenantContext,
+  options: { from?: string; to?: string; includeDrafts?: boolean },
+  scopeOptions?: ScopeOptions,
+): Promise<TenantReportsResult> {
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      // 1. Fetch all projects and clients for lookups
+      const projectRows = await db
+        .select()
+        .from(schema.projects)
+        .where(eq(schema.projects.tenantId, verifiedTenantId));
+
+      const clientRows = await db
+        .select()
+        .from(schema.clients)
+        .where(eq(schema.clients.tenantId, verifiedTenantId));
+
+      const memberRows = await db
+        .select({
+          membershipId: schema.memberships.id,
+          userId: schema.memberships.userId,
+          departmentId: schema.memberships.departmentId,
+          userName: schema.users.fullName,
+          userEmail: schema.users.email,
+        })
+        .from(schema.memberships)
+        .innerJoin(schema.users, eq(schema.memberships.userId, schema.users.id))
+        .where(eq(schema.memberships.tenantId, verifiedTenantId));
+
+      const clientMap = new Map(clientRows.map((c) => [c.id, c.name]));
+      const projectMap = new Map(
+        projectRows.map((p) => [
+          p.id,
+          {
+            name: p.name,
+            rate: Number(p.billableRate || 0),
+            clientId: p.clientId,
+            clientName: clientMap.get(p.clientId) ?? "Internal",
+          },
+        ]),
+      );
+      const memberMap = new Map(
+        memberRows.map((m) => [
+          m.membershipId,
+          { name: m.userName, email: m.userEmail, departmentId: m.departmentId ?? "" },
+        ]),
+      );
+
+      // 2. Fetch timesheets
+      const statusConditions = options.includeDrafts
+        ? sql`${schema.timesheets.status} IN ('draft', 'submitted', 'approved', 'rejected')`
+        : sql`${schema.timesheets.status} IN ('submitted', 'approved', 'rejected')`;
+
+      const tsRows = await db
+        .select()
+        .from(schema.timesheets)
+        .where(and(eq(schema.timesheets.tenantId, verifiedTenantId), statusConditions));
+
+      const tsIds = tsRows.map((t) => t.id);
+
+      const entryRows =
+        tsIds.length > 0
+          ? await db
+              .select()
+              .from(schema.timesheetEntries)
+              .where(
+                and(
+                  eq(schema.timesheetEntries.tenantId, verifiedTenantId),
+                  inArray(schema.timesheetEntries.timesheetId, tsIds),
+                ),
+              )
+          : [];
+
+      const tsMap = new Map(tsRows.map((t) => [t.id, t]));
+
+      const fromDate = options.from || "2000-01-01";
+      const toDate = options.to || "2099-12-31";
+
+      const entries: TenantReportsResult["entries"] = [];
+      let totalHours = 0;
+      let billableHours = 0;
+      let nonBillableHours = 0;
+      let totalBillableValue = 0;
+
+      const projectAgg = new Map<
+        string,
+        {
+          projectId: string;
+          projectName: string;
+          clientName: string;
+          billableHours: number;
+          nonBillableHours: number;
+          totalHours: number;
+          billableValue: number;
+        }
+      >();
+
+      const clientAgg = new Map<
+        string,
+        {
+          clientId: string;
+          clientName: string;
+          billableHours: number;
+          nonBillableHours: number;
+          totalHours: number;
+          billableValue: number;
+        }
+      >();
+
+      const employeeAgg = new Map<
+        string,
+        {
+          membershipId: string;
+          employeeName: string;
+          department: string;
+          billableHours: number;
+          nonBillableHours: number;
+          totalHours: number;
+        }
+      >();
+
+      const monthAgg = new Map<
+        string,
+        {
+          monthKey: string;
+          monthLabel: string;
+          billableHours: number;
+          nonBillableHours: number;
+          totalHours: number;
+          billableValue: number;
+        }
+      >();
+
+      for (const entry of entryRows) {
+        const ts = tsMap.get(entry.timesheetId);
+        if (!ts) continue;
+
+        const proj = projectMap.get(entry.projectId) ?? {
+          name: "Project",
+          rate: 0,
+          clientId: "general",
+          clientName: "General",
+        };
+        const memb = memberMap.get(ts.membershipId) ?? {
+          name: "Team Member",
+          email: "",
+          departmentId: "",
+        };
+
+        const hoursArray = entry.hoursByDayJson ?? [];
+        for (let i = 0; i < Math.min(7, hoursArray.length); i++) {
+          const h = Number(hoursArray[i] ?? 0);
+          if (h <= 0) continue;
+
+          let entryDate: string;
+          try {
+            entryDate = format(addDays(parseISO(ts.weekStart), i), "yyyy-MM-dd");
+          } catch {
+            entryDate = ts.weekStart;
+          }
+
+          if (entryDate < fromDate || entryDate > toDate) continue;
+
+          const billVal = entry.billable ? h * proj.rate : 0;
+          totalHours += h;
+          if (entry.billable) {
+            billableHours += h;
+            totalBillableValue += billVal;
+          } else {
+            nonBillableHours += h;
+          }
+
+          entries.push({
+            date: entryDate,
+            membershipId: ts.membershipId,
+            employeeName: memb.name,
+            clientId: proj.clientId,
+            clientName: proj.clientName,
+            projectId: entry.projectId,
+            projectName: proj.name,
+            task: entry.taskName,
+            hours: h,
+            billable: entry.billable,
+            rate: proj.rate,
+            billableValue: billVal,
+            status: ts.status,
+            notes: entry.notes || "",
+          });
+
+          // Aggregate by project
+          const pEntry = projectAgg.get(entry.projectId) ?? {
+            projectId: entry.projectId,
+            projectName: proj.name,
+            clientName: proj.clientName,
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+            billableValue: 0,
+          };
+          pEntry.totalHours += h;
+          if (entry.billable) {
+            pEntry.billableHours += h;
+            pEntry.billableValue += billVal;
+          } else {
+            pEntry.nonBillableHours += h;
+          }
+          projectAgg.set(entry.projectId, pEntry);
+
+          // Aggregate by client
+          const cEntry = clientAgg.get(proj.clientId) ?? {
+            clientId: proj.clientId,
+            clientName: proj.clientName,
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+            billableValue: 0,
+          };
+          cEntry.totalHours += h;
+          if (entry.billable) {
+            cEntry.billableHours += h;
+            cEntry.billableValue += billVal;
+          } else {
+            cEntry.nonBillableHours += h;
+          }
+          clientAgg.set(proj.clientId, cEntry);
+
+          // Aggregate by employee
+          const eEntry = employeeAgg.get(ts.membershipId) ?? {
+            membershipId: ts.membershipId,
+            employeeName: memb.name,
+            department: memb.departmentId || "General",
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+          };
+          eEntry.totalHours += h;
+          if (entry.billable) {
+            eEntry.billableHours += h;
+          } else {
+            eEntry.nonBillableHours += h;
+          }
+          employeeAgg.set(ts.membershipId, eEntry);
+
+          // Aggregate by month
+          const monthKey = entryDate.substring(0, 7); // YYYY-MM
+          let monthLabel: string;
+          try {
+            monthLabel = format(parseISO(`${monthKey}-01`), "MMM yyyy");
+          } catch {
+            monthLabel = monthKey;
+          }
+          const mEntry = monthAgg.get(monthKey) ?? {
+            monthKey,
+            monthLabel,
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+            billableValue: 0,
+          };
+          mEntry.totalHours += h;
+          if (entry.billable) {
+            mEntry.billableHours += h;
+            mEntry.billableValue += billVal;
+          } else {
+            mEntry.nonBillableHours += h;
+          }
+          monthAgg.set(monthKey, mEntry);
+        }
+      }
+
+      entries.sort((a, b) => b.date.localeCompare(a.date));
+
+      const utilizationRate =
+        totalHours > 0 ? Number(((billableHours / totalHours) * 100).toFixed(1)) : 0;
+
+      return {
+        from: fromDate,
+        to: toDate,
+        totalHours: Number(totalHours.toFixed(2)),
+        billableHours: Number(billableHours.toFixed(2)),
+        nonBillableHours: Number(nonBillableHours.toFixed(2)),
+        utilizationRate,
+        totalBillableValue: Number(totalBillableValue.toFixed(2)),
+        byProject: Array.from(projectAgg.values()).sort((a, b) => b.totalHours - a.totalHours),
+        byClient: Array.from(clientAgg.values()).sort((a, b) => b.totalHours - a.totalHours),
+        byEmployee: Array.from(employeeAgg.values())
+          .map((e) => ({
+            ...e,
+            utilizationRate:
+              e.totalHours > 0 ? Number(((e.billableHours / e.totalHours) * 100).toFixed(1)) : 0,
+          }))
+          .sort((a, b) => b.totalHours - a.totalHours),
+        byMonth: Array.from(monthAgg.values()).sort((a, b) => b.monthKey.localeCompare(a.monthKey)),
+        entries,
+      };
+    },
+    scopeOptions,
+  );
+}
+
+// ============================================================================
+// 14. Single Member Invitation
+// ============================================================================
+
+export interface InviteMemberInput {
+  email: string;
+  roleKeys: RoleKey[];
+  departmentId?: string | undefined;
+  reportingManagerMembershipId?: string | undefined;
+}
+
+export async function createMemberInvitationInDb(
+  ctx: ResolvedTenantContext,
+  input: InviteMemberInput,
+  options?: {
+    pool?: QueryableTransactionPool | undefined;
+    env?: Record<string, string | undefined> | undefined;
+    emailProvider?: EmailDeliveryProvider | undefined;
+  },
+): Promise<{ invitationId: string; email: string; token: string; expiresAt: string }> {
+  if (!ctx.permissions.has("tenant:members:manage")) {
+    throw new AuthorizationError("Only administrators can invite new members.");
+  }
+  const cleanEmail = input.email.trim().toLowerCase();
+  if (!cleanEmail || !cleanEmail.includes("@")) {
+    throw new Error("A valid email address is required for member invitation.");
+  }
+
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = crypto.createHash("sha256").update(token).digest("hex");
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  return withTenantDatabaseScope(
+    ctx,
+    async (verifiedTenantId, { db }) => {
+      const rows = await db
+        .insert(schema.invitations)
+        .values({
+          tenantId: verifiedTenantId,
+          email: cleanEmail,
+          tokenHash,
+          roleKeysJson: input.roleKeys.map(String),
+          departmentId: input.departmentId || null,
+          reportingManagerMembershipId: input.reportingManagerMembershipId || null,
+          invitedByMembershipId: ctx.membership.id,
+          status: "pending",
+          expiresAt,
+        })
+        .returning();
+
+      const created = rows[0]!;
+
+      // Dispatch invitation email
+      const provider = resolveEmailDeliveryProvider(options?.emailProvider, options?.env);
+      await provider.sendInvitationEmail(cleanEmail, token, {
+        tenantName: ctx.tenant.name,
+        companyName: ctx.tenant.name,
+        invitedByName: ctx.user.fullName,
+      });
+
+      await recordAuditLogToDb(
+        ctx,
+        "team",
+        "member.invited",
+        "invitation",
+        created.id,
+        { email: cleanEmail, roleKeys: input.roleKeys },
+        options,
+      );
+
+      return {
+        invitationId: created.id,
+        email: cleanEmail,
+        token,
+        expiresAt: expiresAt.toISOString(),
+      };
+    },
+    options,
+  );
 }

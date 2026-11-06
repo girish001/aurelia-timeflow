@@ -11,8 +11,14 @@ import {
 import type {
   ApprovalHistoryItem,
   ApprovalItem,
+  ClientRecord,
+  CreateClientInput,
+  CreateProjectInput,
   DetailedTimesheet,
   DetailedTimesheetEntry,
+  InviteMemberInput,
+  TenantReportsResult,
+  TenantSettingsRecord,
   TimesheetEntryInput,
 } from "./postgres-tenant-store";
 import {
@@ -52,6 +58,19 @@ export class MultiTenantDataStore {
   private reportingLines: ReportingLineRecord[] = [];
   private projects = new Map<string, ProjectRecord>();
   private projectMemberships: ProjectMembershipRecord[] = [];
+  private clients = new Map<string, ClientRecord>();
+  private settings = new Map<string, TenantSettingsRecord>();
+  private invitations = new Map<
+    string,
+    {
+      id: string;
+      tenantId: string;
+      email: string;
+      token: string;
+      roleKeys: string[];
+      expiresAt: string;
+    }
+  >();
   private timesheets = new Map<string, TimesheetRecord>();
   private detailedSheets = new Map<string, DetailedTimesheet>();
   private approvalHistory: ApprovalHistoryItem[] = [];
@@ -696,6 +715,389 @@ export class MultiTenantDataStore {
       throw new AuthorizationError("Only authorized administrators can read tenant audit logs.");
     }
     return this.auditLogs.filter((l) => l.tenantId === ctx.tenant.id);
+  }
+
+  public listClients(
+    ctx: ResolvedTenantContext,
+    options?: { search?: string; status?: string; page?: number; limit?: number },
+  ): { clients: ClientRecord[]; total: number } {
+    let list = Array.from(this.clients.values()).filter((c) => c.tenantId === ctx.tenant.id);
+    if (options?.status && options.status !== "all") {
+      list = list.filter((c) => c.status === options.status);
+    }
+    if (options?.search?.trim()) {
+      const q = options.search.trim().toLowerCase();
+      list = list.filter(
+        (c) =>
+          c.name.toLowerCase().includes(q) ||
+          c.contactName.toLowerCase().includes(q) ||
+          c.contactEmail.toLowerCase().includes(q),
+      );
+    }
+    list.sort((a, b) => a.name.localeCompare(b.name));
+    const total = list.length;
+    const page = Math.max(1, options?.page ?? 1);
+    const limit = Math.max(1, Math.min(100, options?.limit ?? 50));
+    const paginated = list.slice((page - 1) * limit, page * limit);
+    return { clients: paginated, total };
+  }
+
+  public createClient(ctx: ResolvedTenantContext, input: CreateClientInput): ClientRecord {
+    if (!ctx.permissions.has("client:write:all")) {
+      throw new AuthorizationError("Only administrators can create client accounts.");
+    }
+    if (!input.name?.trim()) {
+      throw new Error("Client name is required.");
+    }
+    const id = `c_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const client: ClientRecord = {
+      id,
+      tenantId: ctx.tenant.id,
+      name: input.name.trim(),
+      contactName: input.contactName?.trim() || "Contact Representative",
+      contactEmail: input.contactEmail?.trim().toLowerCase() || "",
+      country: input.country?.trim() || "India",
+      billingTerms: input.billingTerms?.trim() || "Net 30",
+      status: input.status === "inactive" ? "inactive" : "active",
+      createdAt: new Date().toISOString(),
+    };
+    this.clients.set(id, client);
+    this.recordAudit(ctx, "client", "client.created", "client", id);
+    return client;
+  }
+
+  public updateClient(
+    ctx: ResolvedTenantContext,
+    clientId: string,
+    input: Partial<CreateClientInput>,
+  ): ClientRecord {
+    if (!ctx.permissions.has("client:write:all")) {
+      throw new AuthorizationError("Only administrators can update client accounts.");
+    }
+    const client = this.clients.get(clientId);
+    if (!client || client.tenantId !== ctx.tenant.id) {
+      throw new Error(`Client ${clientId} not found.`);
+    }
+    if (input.name !== undefined) client.name = input.name.trim();
+    if (input.contactName !== undefined) client.contactName = input.contactName.trim();
+    if (input.contactEmail !== undefined)
+      client.contactEmail = input.contactEmail.trim().toLowerCase();
+    if (input.country !== undefined) client.country = input.country.trim();
+    if (input.billingTerms !== undefined) client.billingTerms = input.billingTerms.trim();
+    if (input.status !== undefined) client.status = input.status;
+    this.recordAudit(ctx, "client", "client.updated", "client", clientId);
+    return client;
+  }
+
+  public registerReportingLine(line: ReportingLineRecord): void {
+    this.addReportingLine(line);
+  }
+
+  public createProjectScoped(ctx: ResolvedTenantContext, input: CreateProjectInput): ProjectRecord {
+    if (!ctx.permissions.has("project:write:all")) {
+      throw new AuthorizationError("Only administrators can create new projects.");
+    }
+    if (!input.name?.trim()) {
+      throw new Error("Project name is required.");
+    }
+    const id = `p_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    const project: ProjectRecord = {
+      id,
+      tenantId: ctx.tenant.id,
+      clientId: input.clientId,
+      name: input.name.trim(),
+      projectManagerMembershipId: input.projectManagerMembershipId || ctx.membership.id,
+      budgetHours: input.budgetHours ?? 100,
+      billableRate: input.billableRate ?? 75,
+      status: input.status ?? "active",
+    };
+    this.projects.set(id, project);
+    this.projectMemberships.push({
+      id: `pm_${id}_${project.projectManagerMembershipId}`,
+      tenantId: ctx.tenant.id,
+      projectId: id,
+      membershipId: project.projectManagerMembershipId,
+      projectRole: "project_manager",
+      canApproveTimesheets: true,
+      canManageAllocations: true,
+    });
+    this.recordAudit(ctx, "project", "project.created", "project", id);
+    return project;
+  }
+
+  public getTenantSettings(ctx: ResolvedTenantContext): TenantSettingsRecord {
+    const existing = this.settings.get(ctx.tenant.id);
+    if (existing) return existing;
+    const defaultSettings: TenantSettingsRecord = {
+      id: ctx.tenant.id,
+      name: ctx.tenant.name,
+      slug: ctx.tenant.slug,
+      country: "India",
+      timezone: "Asia/Kolkata",
+      currency: "INR",
+      timeFormat: "decimal",
+      weekStart: "monday",
+      dailyTargetHours: "8.00",
+      lockApprovedSheets: true,
+      requireRejectReason: true,
+    };
+    this.settings.set(ctx.tenant.id, defaultSettings);
+    return defaultSettings;
+  }
+
+  public updateTenantSettings(
+    ctx: ResolvedTenantContext,
+    input: Partial<Omit<TenantSettingsRecord, "id" | "slug">>,
+  ): TenantSettingsRecord {
+    if (!ctx.permissions.has("tenant:settings:manage")) {
+      throw new AuthorizationError("Only administrators can update company settings.");
+    }
+    const current = this.getTenantSettings(ctx);
+    const updated: TenantSettingsRecord = {
+      ...current,
+      ...input,
+    };
+    this.settings.set(ctx.tenant.id, updated);
+    this.recordAudit(ctx, "settings", "tenant.settings_updated", "tenant", ctx.tenant.id);
+    return updated;
+  }
+
+  public getReports(
+    ctx: ResolvedTenantContext,
+    options: { from?: string; to?: string; includeDrafts?: boolean },
+  ): TenantReportsResult {
+    const fromDate = options.from || "2000-01-01";
+    const toDate = options.to || "2099-12-31";
+
+    const entries: TenantReportsResult["entries"] = [];
+    let totalHours = 0;
+    let billableHours = 0;
+    let nonBillableHours = 0;
+    let totalBillableValue = 0;
+
+    const projectAgg = new Map<
+      string,
+      {
+        projectId: string;
+        projectName: string;
+        clientName: string;
+        billableHours: number;
+        nonBillableHours: number;
+        totalHours: number;
+        billableValue: number;
+      }
+    >();
+
+    const clientAgg = new Map<
+      string,
+      {
+        clientId: string;
+        clientName: string;
+        billableHours: number;
+        nonBillableHours: number;
+        totalHours: number;
+        billableValue: number;
+      }
+    >();
+
+    const employeeAgg = new Map<
+      string,
+      {
+        membershipId: string;
+        employeeName: string;
+        department: string;
+        billableHours: number;
+        nonBillableHours: number;
+        totalHours: number;
+      }
+    >();
+
+    const monthAgg = new Map<
+      string,
+      {
+        monthKey: string;
+        monthLabel: string;
+        billableHours: number;
+        nonBillableHours: number;
+        totalHours: number;
+        billableValue: number;
+      }
+    >();
+
+    for (const sheet of this.detailedSheets.values()) {
+      if (sheet.tenantId !== ctx.tenant.id) continue;
+      if (!options.includeDrafts && sheet.status === "draft") continue;
+
+      const member = this.memberships.get(sheet.membershipId);
+      const user = member ? this.users.get(member.userId) : undefined;
+      const empName = user?.fullName ?? "Team Member";
+
+      for (const entry of sheet.entries) {
+        const proj = this.projects.get(entry.projectId);
+        const client = proj ? this.clients.get(proj.clientId) : undefined;
+        const projName = proj?.name ?? entry.projectName;
+        const rate = proj?.billableRate ?? 75;
+        const clientId = proj?.clientId ?? "c_internal";
+        const clientName = client?.name ?? "Internal";
+
+        for (let i = 0; i < Math.min(7, entry.hoursByDay.length); i++) {
+          const h = Number(entry.hoursByDay[i] ?? 0);
+          if (h <= 0) continue;
+
+          // Simple day calculation: ISO week date offset
+          const dateObj = new Date(sheet.weekStart);
+          dateObj.setDate(dateObj.getDate() + i);
+          const entryDate = dateObj.toISOString().substring(0, 10);
+
+          if (entryDate < fromDate || entryDate > toDate) continue;
+
+          const billVal = entry.billable ? h * rate : 0;
+          totalHours += h;
+          if (entry.billable) {
+            billableHours += h;
+            totalBillableValue += billVal;
+          } else {
+            nonBillableHours += h;
+          }
+
+          entries.push({
+            date: entryDate,
+            membershipId: sheet.membershipId,
+            employeeName: empName,
+            clientId,
+            clientName,
+            projectId: entry.projectId,
+            projectName: projName,
+            task: entry.taskName,
+            hours: h,
+            billable: entry.billable,
+            rate,
+            billableValue: billVal,
+            status: sheet.status,
+            notes: entry.notes || "",
+          });
+
+          // Aggregate by project
+          const p = projectAgg.get(entry.projectId) ?? {
+            projectId: entry.projectId,
+            projectName: projName,
+            clientName,
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+            billableValue: 0,
+          };
+          p.totalHours += h;
+          if (entry.billable) {
+            p.billableHours += h;
+            p.billableValue += billVal;
+          } else {
+            p.nonBillableHours += h;
+          }
+          projectAgg.set(entry.projectId, p);
+
+          // Aggregate by client
+          const c = clientAgg.get(clientId) ?? {
+            clientId,
+            clientName,
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+            billableValue: 0,
+          };
+          c.totalHours += h;
+          if (entry.billable) {
+            c.billableHours += h;
+            c.billableValue += billVal;
+          } else {
+            c.nonBillableHours += h;
+          }
+          clientAgg.set(clientId, c);
+
+          // Aggregate by employee
+          const e = employeeAgg.get(sheet.membershipId) ?? {
+            membershipId: sheet.membershipId,
+            employeeName: empName,
+            department: member?.departmentId || "General",
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+          };
+          e.totalHours += h;
+          if (entry.billable) {
+            e.billableHours += h;
+          } else {
+            e.nonBillableHours += h;
+          }
+          employeeAgg.set(sheet.membershipId, e);
+
+          // Aggregate by month
+          const monthKey = entryDate.substring(0, 7);
+          const m = monthAgg.get(monthKey) ?? {
+            monthKey,
+            monthLabel: monthKey,
+            billableHours: 0,
+            nonBillableHours: 0,
+            totalHours: 0,
+            billableValue: 0,
+          };
+          m.totalHours += h;
+          if (entry.billable) {
+            m.billableHours += h;
+            m.billableValue += billVal;
+          } else {
+            m.nonBillableHours += h;
+          }
+          monthAgg.set(monthKey, m);
+        }
+      }
+    }
+
+    entries.sort((a, b) => b.date.localeCompare(a.date));
+
+    return {
+      from: fromDate,
+      to: toDate,
+      totalHours: Number(totalHours.toFixed(2)),
+      billableHours: Number(billableHours.toFixed(2)),
+      nonBillableHours: Number(nonBillableHours.toFixed(2)),
+      utilizationRate: totalHours > 0 ? Number(((billableHours / totalHours) * 100).toFixed(1)) : 0,
+      totalBillableValue: Number(totalBillableValue.toFixed(2)),
+      byProject: Array.from(projectAgg.values()).sort((a, b) => b.totalHours - a.totalHours),
+      byClient: Array.from(clientAgg.values()).sort((a, b) => b.totalHours - a.totalHours),
+      byEmployee: Array.from(employeeAgg.values())
+        .map((e) => ({
+          ...e,
+          utilizationRate:
+            e.totalHours > 0 ? Number(((e.billableHours / e.totalHours) * 100).toFixed(1)) : 0,
+        }))
+        .sort((a, b) => b.totalHours - a.totalHours),
+      byMonth: Array.from(monthAgg.values()).sort((a, b) => b.monthKey.localeCompare(a.monthKey)),
+      entries,
+    };
+  }
+
+  public createInvitation(
+    ctx: ResolvedTenantContext,
+    input: InviteMemberInput,
+  ): { invitationId: string; email: string; token: string; expiresAt: string } {
+    if (!ctx.permissions.has("tenant:members:manage")) {
+      throw new AuthorizationError("Only administrators can invite new members.");
+    }
+    const cleanEmail = input.email.trim().toLowerCase();
+    const token = `inv_${Math.random().toString(36).substring(2, 10)}`;
+    const id = `inv_${Date.now()}`;
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+    this.invitations.set(id, {
+      id,
+      tenantId: ctx.tenant.id,
+      email: cleanEmail,
+      token,
+      roleKeys: input.roleKeys.map(String),
+      expiresAt,
+    });
+    this.recordAudit(ctx, "team", "member.invited", "invitation", id);
+    return { invitationId: id, email: cleanEmail, token, expiresAt };
   }
 
   private recordAudit(

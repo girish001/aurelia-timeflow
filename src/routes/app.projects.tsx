@@ -34,6 +34,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyState, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
+import { apiCreateProject } from "@/lib/timesheet-api";
 import {
   loggedHours,
   uid,
@@ -337,8 +338,29 @@ function ProjectEditor({
       .filter(Boolean);
 
     const isNew = !project;
+    let projId = project?.id ?? uid("p");
+
+    if (isNew && r.data.clientId) {
+      void (async () => {
+        try {
+          const created = await apiCreateProject({
+            clientId: r.data.clientId,
+            name: r.data.name,
+            projectManagerMembershipId: r.data.managerId,
+            budgetHours: r.data.budgetHours,
+            billableRate: r.data.rate,
+            tasks: tasks.length ? tasks : ["General"],
+            status: r.data.status,
+          });
+          if (created?.id) projId = created.id;
+        } catch (err) {
+          console.warn("Backend project creation notice:", err);
+        }
+      })();
+    }
+
     upsertProject({
-      id: project?.id ?? uid("p"),
+      id: projId,
       ...r.data,
       tasks: tasks.length ? tasks : ["General"],
     });

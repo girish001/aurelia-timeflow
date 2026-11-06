@@ -1,5 +1,5 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { z } from "zod";
 import {
   Plus,
@@ -34,6 +34,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { EmptyState, PageHeader, StatCard, StatusBadge } from "@/components/app/common";
+import { apiCreateClient, apiFetchClients, apiUpdateClient } from "@/lib/timesheet-api";
 import {
   loggedHours,
   uid,
@@ -66,6 +67,31 @@ export function Clients() {
   const [editing, setEditing] = useState<Client | "new" | null>(null);
   const [q, setQ] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
+
+  useEffect(() => {
+    let mounted = true;
+    apiFetchClients()
+      .then((res) => {
+        if (!mounted || !res.clients) return;
+        res.clients.forEach((c) => {
+          upsertClient({
+            id: c.id,
+            name: c.name,
+            contact: c.contactName,
+            email: c.contactEmail,
+            country: c.country,
+            billingTerms: c.billingTerms,
+            status: c.status === "inactive" ? "inactive" : "active",
+          });
+        });
+      })
+      .catch((err) => {
+        console.warn("Backend clients fetch notice:", err);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const cur = s.settings.currency;
   const fmt = s.settings.timeFormat;
@@ -279,16 +305,46 @@ function ClientDialog({ client, onClose }: { client: Client | null; onClose: () 
   });
   const [errors, setErrors] = useState<Record<string, string>>({});
 
-  const save = (e: React.FormEvent) => {
+  const [isSaving, setIsSaving] = useState(false);
+
+  const save = async (e: React.FormEvent) => {
     e.preventDefault();
     const r = schema.safeParse(f);
     if (!r.success) {
       return setErrors(Object.fromEntries(r.error.issues.map((i) => [i.path[0], i.message])));
     }
 
+    setIsSaving(true);
     const isNew = !client;
+    let clientId = client?.id ?? uid("c");
+
+    try {
+      if (isNew) {
+        const created = await apiCreateClient({
+          name: r.data.name,
+          contactName: r.data.contact,
+          contactEmail: r.data.email,
+          country: r.data.country,
+          billingTerms: r.data.billingTerms || "Net 30",
+          status: r.data.status,
+        });
+        if (created?.id) clientId = created.id;
+      } else {
+        await apiUpdateClient(clientId, {
+          name: r.data.name,
+          contactName: r.data.contact,
+          contactEmail: r.data.email,
+          country: r.data.country,
+          billingTerms: r.data.billingTerms || "Net 30",
+          status: r.data.status,
+        });
+      }
+    } catch (err) {
+      console.warn("Backend client sync notice:", err);
+    }
+
     upsertClient({
-      id: client?.id ?? uid("c"),
+      id: clientId,
       ...r.data,
       phone: r.data.phone || undefined,
       billingTerms: r.data.billingTerms || "Net 30",
@@ -302,6 +358,7 @@ function ClientDialog({ client, onClose }: { client: Client | null; onClose: () 
       details: `${isNew ? "Added" : "Updated"} client "${r.data.name}" (${r.data.contact}, ${r.data.billingTerms})`,
     });
 
+    setIsSaving(false);
     toast.success(client ? "Client updated" : "Client profile added");
     onClose();
   };

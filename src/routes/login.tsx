@@ -153,8 +153,7 @@ export function LoginPage() {
             Demo role preview
           </h1>
           <p className="mt-1.5 max-w-2xl text-sm text-muted-foreground">
-            Sign in with your enterprise credentials or preview Aurelia TimeFlow with pre-populated
-            demo personas.
+            Sign in with your enterprise credentials or preview Aurelia TimeFlow with demo roles.
           </p>
         </div>
 
